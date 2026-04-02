@@ -764,10 +764,12 @@ export function usePathname(): string {
   }
   const renderSnapshot = useClientNavigationRenderSnapshot();
   // Client-side: use the hook system for reactivity
+  // Use client snapshot for server snapshot too — during hydration,
+  // _getServerContext() is null and falls back to "/", causing mismatch.
   const pathname = React.useSyncExternalStore(
     subscribeToNavigation,
     getPathnameSnapshot,
-    () => _getServerContext()?.pathname ?? "/",
+    getPathnameSnapshot,
   );
   // Prefer the render snapshot during an active navigation transition so
   // hooks return the pending URL, not the stale committed one. After commit,
@@ -794,7 +796,7 @@ export function useSearchParams(): ReadonlyURLSearchParams {
   const searchParams = React.useSyncExternalStore(
     subscribeToNavigation,
     getSearchParamsSnapshot,
-    getServerSearchParamsSnapshot,
+    getSearchParamsSnapshot,
   );
   if (renderSnapshot && (getClientNavigationState()?.navigationSnapshotActiveCount ?? 0) > 0) {
     return renderSnapshot.searchParams;
@@ -818,7 +820,7 @@ export function useParams<
   const params = React.useSyncExternalStore(
     subscribeToNavigation,
     getClientParamsSnapshot as () => T,
-    getServerParamsSnapshot as () => T,
+    getClientParamsSnapshot as () => T,
   );
   if (renderSnapshot && (getClientNavigationState()?.navigationSnapshotActiveCount ?? 0) > 0) {
     return renderSnapshot.params as T;

@@ -6,6 +6,9 @@ settings:
 
 catalogs:
   default:
+    '@capsizecss/metrics':
+      specifier: ^3.4.0
+      version: 3.7.0
     '@cloudflare/kumo':
       specifier: ^1.6.0
       version: 1.6.0
@@ -765,6 +768,9 @@ importers:
 
   packages/vinext:
     dependencies:
+      '@capsizecss/metrics':
+        specifier: 'catalog:'
+        version: 3.7.0
       '@unpic/react':
         specifier: 'catalog:'
         version: 1.0.2(next@16.1.7(@playwright/test@1.58.2)(react-dom@19.2.4(react@19.2.4))(react@19.2.4))(react-dom@19.2.4(react@19.2.4))(react@19.2.4)
@@ -1226,6 +1232,9 @@ packages:
 
   '@better-fetch/fetch@1.1.21':
     resolution: {integrity: sha512-/ImESw0sskqlVR94jB+5+Pxjf+xBwDZF/N5+y2/q4EqD7IARUTSpPfIo8uf39SYpCxyOCtbyYpUrZ3F/k0zT4A==}
+
+  '@capsizecss/metrics@3.7.0':
+    resolution: {integrity: sha512-NHdEMrl/zd2XgiSv2xHRF/FxGc2OTBKjhPzr9SgbHzqmoTVn8BbRK88Dtq0m65idX/RMD7ptyVdbGHFcvlErSw==}
 
   '@cloudflare/kumo@1.6.0':
     resolution: {integrity: sha512-1Sy8kgfHNkze+NEfu/6cNzwOb0hemGm1mUNGU9GVmAnHemLOaXixosslM/o38TbUTEEs48yTRrDy0WFGgSTFWg==}
@@ -5369,6 +5378,8 @@ snapshots:
   '@better-auth/utils@0.3.0': {}
 
   '@better-fetch/fetch@1.1.21': {}
+
+  '@capsizecss/metrics@3.7.0': {}
 
   '@cloudflare/kumo@1.6.0(@phosphor-icons/react@2.1.10(react-dom@19.2.4(react@19.2.4))(react@19.2.4))(@types/react@19.2.14)(react-dom@19.2.4(react@19.2.4))(react@19.2.4)(zod@4.3.6)':
     dependencies:

@@ -11,7 +11,7 @@ permissions: {}
 jobs:
   publish:
     # Skip for forks — they don't have write access needed by pkg-pr-new.
-    if: github.repository_owner == 'cloudflare'
+    if: github.repository_owner == 'cloudflare' || github.repository_owner == 'streamloop'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

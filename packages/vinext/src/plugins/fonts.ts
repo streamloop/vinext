@@ -24,6 +24,7 @@
 
 import type { Plugin } from "vite";
 import { parseAst } from "vite";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import fs from "node:fs";
 import MagicString from "magic-string";
@@ -361,8 +362,10 @@ async function fetchAndCacheFont(
     }
   }
 
-  // Download font files
+  // Download font files and copy to public/fonts/ for web access
   fs.mkdirSync(fontDir, { recursive: true });
+  const publicFontsDir = path.join(path.dirname(path.dirname(cacheDir)), "public", "fonts");
+  fs.mkdirSync(publicFontsDir, { recursive: true });
   for (const [fontUrl, filename] of urls) {
     const filePath = path.join(fontDir, filename);
     if (!fs.existsSync(filePath)) {
@@ -372,8 +375,13 @@ async function fetchAndCacheFont(
         fs.writeFileSync(filePath, buffer);
       }
     }
-    // Rewrite CSS to use absolute path (Vite will resolve /@fs/ for dev, or asset for build)
-    css = css.split(fontUrl).join(filePath);
+    // Copy to public/fonts/ so they're served as static assets
+    const publicPath = path.join(publicFontsDir, filename);
+    if (fs.existsSync(filePath) && !fs.existsSync(publicPath)) {
+      fs.copyFileSync(filePath, publicPath);
+    }
+    // Rewrite CSS to use /fonts/<filename> web path
+    css = css.split(fontUrl).join(`/fonts/${filename}`);
   }
 
   // Cache the rewritten CSS
@@ -564,7 +572,7 @@ export function createGoogleFontsPlugin(fontGoogleShimPath: string, shimsDir: st
         const fontLocals = new Map<string, string>();
         const proxyObjectLocals = new Set<string>();
 
-        const importRe = /^[ \t]*import\s+([^;]+?)\s+from\s*(["'])next\/font\/google\2\s*;?/gm;
+        const importRe = /^[ \t]*import\s+([^;\n]+?)\s+from\s*(["'])next\/font\/google\2\s*;?/gm;
         let importMatch;
         while ((importMatch = importRe.exec(code)) !== null) {
           const [fullMatch, clause] = importMatch;
@@ -664,7 +672,7 @@ export function createGoogleFontsPlugin(fontGoogleShimPath: string, shimsDir: st
             return; // Can't parse options statically, skip
           }
 
-          // Build the Google Fonts CSS URL
+          // Build the Google Fonts CSS URL (manual to avoid URLSearchParams encoding issues)
           const weights = options.weight
             ? Array.isArray(options.weight)
               ? options.weight
@@ -691,14 +699,9 @@ export function createGoogleFontsPlugin(fontGoogleShimPath: string, shimsDir: st
               spec += `:wght@${weights.join(";")}`;
             }
           } else if (styles.length === 0) {
-            // Request full variable weight range when no weight specified.
-            // Without this, Google Fonts returns only weight 400.
             spec += `:wght@100..900`;
           }
-          const params = new URLSearchParams();
-          params.set("family", spec);
-          params.set("display", display);
-          const cssUrl = `https://fonts.googleapis.com/css2?${params.toString()}`;
+          const cssUrl = `https://fonts.googleapis.com/css2?family=${spec}&display=${display}`;
 
           // Check cache
           let localCSS = fontCache.get(cssUrl);
@@ -706,25 +709,44 @@ export function createGoogleFontsPlugin(fontGoogleShimPath: string, shimsDir: st
             try {
               localCSS = await fetchAndCacheFont(cssUrl, family, cacheDir);
               fontCache.set(cssUrl, localCSS);
-            } catch {
-              // Fetch failed (offline?) — fall back to CDN mode
+            } catch (e) {
+              console.warn(`[vinext:google-fonts] Failed to self-host "${family}":`, e);
               return;
             }
           }
 
-          // Inject _selfHostedCSS into the options object
-          const escapedCSS = JSON.stringify(localCSS);
+          // Generate scoped hashed family name (like Next.js __FontName_hash)
+          const hashedFamily = `__${family.replace(/\s+/g, "_")}_${createHash("md5").update(family).digest("hex").slice(0, 6)}`;
+          const hashedCSS = localCSS.replace(
+            new RegExp(`font-family:\\s*'${family.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}'`, "g"),
+            `font-family: '${hashedFamily}'`,
+          );
+
+          // Generate fallback font with size-adjust metrics
+          let fallbackProps = "";
+          try {
+            const { getGoogleFontMetrics, generateFallbackFontFace } = await import("../font-metrics.js");
+            const metrics = await getGoogleFontMetrics(family);
+            if (metrics) {
+              const fallbackResult = await generateFallbackFontFace(metrics, hashedFamily);
+              if (fallbackResult) {
+                fallbackProps = `, _fallbackCSS: ${JSON.stringify(fallbackResult.css)}, _fallbackFamily: ${JSON.stringify(fallbackResult.fallbackFamily)}`;
+              }
+            }
+          } catch {
+            // font-metrics not available — skip fallback generation
+          }
+
+          // Inject _selfHostedCSS, _hashedFamily, and fallback props
+          const escapedCSS = JSON.stringify(hashedCSS);
+          const escapedHashedFamily = JSON.stringify(hashedFamily);
           const closingBrace = optionsStr.lastIndexOf("}");
           const beforeBrace = optionsStr.slice(0, closingBrace).trim();
-          // Determine the separator to insert before the new property:
-          //   - Empty string if the object is empty ({ is the last non-whitespace char)
-          //   - Empty string if there's already a trailing comma (avoid double comma)
-          //   - ", " otherwise (before the new property)
           const separator = beforeBrace.endsWith("{") || beforeBrace.endsWith(",") ? "" : ", ";
           const optionsWithCSS =
             optionsStr.slice(0, closingBrace) +
             separator +
-            `_selfHostedCSS: ${escapedCSS}` +
+            `_selfHostedCSS: ${escapedCSS}, _hashedFamily: ${escapedHashedFamily}${fallbackProps}` +
             optionsStr.slice(closingBrace);
 
           const replacement = `${calleeSource}(${optionsWithCSS})`;
@@ -732,7 +754,32 @@ export function createGoogleFontsPlugin(fontGoogleShimPath: string, shimsDir: st
           hasChanges = true;
         }
 
-        if (isBuild) {
+        // Detect destructured properties from proxy/default imports:
+        //   const { Gabarito } = googleFonts;
+        //   const { Instrument_Serif: InstrumentSerif } = googleFonts;
+        if (proxyObjectLocals.size > 0) {
+          const proxyNames = Array.from(proxyObjectLocals)
+            .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+            .join("|");
+          const destructureRe = new RegExp(
+            `(?:const|let|var)\\s*\\{([^}]+)\\}\\s*=\\s*(?:${proxyNames})\\s*;?`,
+            "g",
+          );
+          let destructureMatch;
+          while ((destructureMatch = destructureRe.exec(code)) !== null) {
+            const specifiers = destructureMatch[1];
+            for (const spec of specifiers.split(",")) {
+              const parts = spec.trim().split(/\s*:\s*/);
+              const imported = parts[0].trim();
+              const local = parts.length > 1 ? parts[1].trim() : imported;
+              if (imported && !GOOGLE_FONT_UTILITY_EXPORTS.has(imported)) {
+                fontLocals.set(local, imported);
+              }
+            }
+          }
+        }
+
+        {
           // Match: Identifier( — where the argument starts with {
           // The regex intentionally does NOT capture the options object; we use
           // _findBalancedObject() to handle nested braces correctly.

@@ -364,27 +364,50 @@ function injectSelfHostedCSS(css: string): void {
   document.head.appendChild(style);
 }
 
-export type FontLoader = (options?: FontOptions & { _selfHostedCSS?: string }) => FontResult;
+interface BuildInjectedOptions {
+  _selfHostedCSS?: string;
+  _hashedFamily?: string;
+  _fallbackCSS?: string;
+  _fallbackFamily?: string;
+}
+
+export type FontLoader = (options?: FontOptions & BuildInjectedOptions) => FontResult;
 
 export function createFontLoader(family: string): FontLoader {
-  return function fontLoader(options: FontOptions & { _selfHostedCSS?: string } = {}): FontResult {
+  return function fontLoader(options: FontOptions & BuildInjectedOptions = {}): FontResult {
     const id = classCounter++;
-    const className = `__font_${family.toLowerCase().replace(/\s+/g, "_")}_${id}`;
     const fallback = options.fallback ?? ["sans-serif"];
-    // Sanitize each fallback name to prevent CSS injection via crafted values
-    const fontFamily = `'${escapeCSSString(family)}', ${fallback.map(sanitizeFallback).join(", ")}`;
-    // Validate CSS variable name — reject anything that could inject CSS.
-    // Fall back to auto-generated name if invalid.
     const defaultVarName = toVarName(family);
     const cssVarName = options.variable
       ? (sanitizeCSSVarName(options.variable) ?? defaultVarName)
       : defaultVarName;
-    // In Next.js, `variable` returns a CLASS NAME that sets the CSS variable.
-    // Users apply this class to set the CSS variable on that element.
+
+    // Self-hosted mode with hashed family (Next.js parity)
+    if (options._selfHostedCSS && options._hashedFamily) {
+      const hashedFamily = options._hashedFamily;
+      const fallbackFamily = options._fallbackFamily;
+      const className = `__font_${family.toLowerCase().replace(/\s+/g, "_")}_${id}`;
+      const variableClassName = `__variable_${family.toLowerCase().replace(/\s+/g, "_")}_${id}`;
+
+      const parts: string[] = [`'${escapeCSSString(hashedFamily)}'`];
+      if (fallbackFamily) parts.push(`'${escapeCSSString(fallbackFamily)}'`);
+      parts.push(...fallback.map(sanitizeFallback));
+      const fontFamily = parts.join(", ");
+
+      injectSelfHostedCSS(options._selfHostedCSS);
+      if (options._fallbackCSS) injectSelfHostedCSS(options._fallbackCSS);
+      injectClassNameRule(className, fontFamily);
+      injectVariableClassRule(variableClassName, cssVarName, fontFamily);
+
+      return { className, style: { fontFamily }, variable: variableClassName };
+    }
+
+    const className = `__font_${family.toLowerCase().replace(/\s+/g, "_")}_${id}`;
+    const fontFamily = `'${escapeCSSString(family)}', ${fallback.map(sanitizeFallback).join(", ")}`;
     const variableClassName = `__variable_${family.toLowerCase().replace(/\s+/g, "_")}_${id}`;
 
+    // Self-hosted mode without hashing (legacy/dev)
     if (options._selfHostedCSS) {
-      // Self-hosted mode: inject local @font-face CSS instead of CDN link
       injectSelfHostedCSS(options._selfHostedCSS);
     } else {
       // CDN mode: inject <link> to Google Fonts
