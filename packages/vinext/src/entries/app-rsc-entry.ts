@@ -1699,7 +1699,9 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
     const __imgResult = validateImageUrl(url.searchParams.get("url"), request.url);
     if (__imgResult instanceof Response) return __imgResult;
     // In dev, redirect to the original asset URL so Vite's static serving handles it.
-    return Response.redirect(new URL(__imgResult, url.origin).href, 302);
+    // Use a relative Location header so the current scheme is preserved behind
+    // HTTPS-terminating proxies during local development.
+    return new Response(null, { status: 302, headers: { Location: __imgResult } });
   }
 
   // Handle metadata routes (sitemap.xml, robots.txt, manifest.webmanifest, etc.)

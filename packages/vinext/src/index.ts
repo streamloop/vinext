@@ -2397,8 +2397,24 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   return;
                 }
                 // Validate the constructed URL's origin hasn't changed (defense in depth).
-                const resolvedImg = new URL(imgUrl, `http://${req.headers.host || "localhost"}`);
-                if (resolvedImg.origin !== `http://${req.headers.host || "localhost"}`) {
+                // When the dev server is behind a trusted proxy (e.g. Traefik terminating
+                // HTTPS), preserve the forwarded proto so redirects stay same-scheme.
+                const imageTrustProxy =
+                  process.env.VINEXT_TRUST_PROXY === "1" ||
+                  (process.env.VINEXT_TRUSTED_HOSTS ?? "").split(",").some((h) => h.trim());
+                const rawImageProto = imageTrustProxy
+                  ? String(req.headers["x-forwarded-proto"] || "")
+                      .split(",")[0]
+                      .trim()
+                  : "";
+                const imageProto =
+                  rawImageProto === "https" || rawImageProto === "http"
+                    ? rawImageProto
+                    : "http";
+                console.log({ imageProto, imageTrustProxy, rawImageProto, headers: req.headers })
+                const imageOrigin = `${imageProto}://${req.headers.host || "localhost"}`;
+                const resolvedImg = new URL(imgUrl, imageOrigin);
+                if (resolvedImg.origin !== imageOrigin) {
                   res.writeHead(400);
                   res.end("Only relative URLs allowed");
                   return;
@@ -2510,7 +2526,19 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 ),
               );
 
-              const requestOrigin = `http://${req.headers.host || "localhost"}`;
+              const requestTrustProxy =
+                process.env.VINEXT_TRUST_PROXY === "1" ||
+                (process.env.VINEXT_TRUSTED_HOSTS ?? "").split(",").some((h) => h.trim());
+              const rawRequestProto = requestTrustProxy
+                ? String(req.headers["x-forwarded-proto"] || "")
+                    .split(",")[0]
+                    .trim()
+                : "";
+              const requestProto =
+                rawRequestProto === "https" || rawRequestProto === "http"
+                  ? rawRequestProto
+                  : "http";
+              const requestOrigin = `${requestProto}://${req.headers.host || "localhost"}`;
               const preMiddlewareReqUrl = new URL(url, requestOrigin);
               const preMiddlewareReqCtx: RequestContext = requestContextFromRequest(
                 new Request(preMiddlewareReqUrl, { headers: nodeRequestHeaders }),
