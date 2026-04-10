@@ -535,7 +535,6 @@ export function _findCallEnd(code: string, objEnd: number): number | null {
 export function createGoogleFontsPlugin(fontGoogleShimPath: string, shimsDir: string): Plugin {
   // Vite does not bind `this` to the plugin object when calling hooks, so
   // plugin state must be held in closure variables rather than as properties.
-  let isBuild = false;
   const fontCache = new Map<string, string>(); // url -> local @font-face CSS
   let cacheDir = "";
 
@@ -544,7 +543,6 @@ export function createGoogleFontsPlugin(fontGoogleShimPath: string, shimsDir: st
     enforce: "pre",
 
     configResolved(config) {
-      isBuild = config.command === "build";
       cacheDir = path.join(config.root, ".vinext", "fonts");
     },
 
@@ -725,7 +723,8 @@ export function createGoogleFontsPlugin(fontGoogleShimPath: string, shimsDir: st
           // Generate fallback font with size-adjust metrics
           let fallbackProps = "";
           try {
-            const { getGoogleFontMetrics, generateFallbackFontFace } = await import("../font-metrics.js");
+            const { getGoogleFontMetrics, generateFallbackFontFace } =
+              await import("../font-metrics.js");
             const metrics = await getGoogleFontMetrics(family);
             if (metrics) {
               const fallbackResult = await generateFallbackFontFace(metrics, hashedFamily);
@@ -751,6 +750,7 @@ export function createGoogleFontsPlugin(fontGoogleShimPath: string, shimsDir: st
 
           const replacement = `${calleeSource}(${optionsWithCSS})`;
           s.overwrite(callStart, callEnd, replacement);
+          overwrittenRanges.push([callStart, callEnd]);
           hasChanges = true;
         }
 

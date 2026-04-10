@@ -1,3 +1,5 @@
+import { mergeMiddlewareResponseHeaders } from "./middleware-response-headers.js";
+
 export type AppPageMiddlewareContext = {
   headers: Headers | null;
   status: number | null;
@@ -29,6 +31,7 @@ export type ResolveAppPageRscResponsePolicyOptions = {
 
 export type ResolveAppPageHtmlResponsePolicyOptions = {
   dynamicUsedDuringRender: boolean;
+  hasScriptNonce: boolean;
 } & ResolveAppPageResponsePolicyBaseOptions;
 
 export type AppPageHtmlResponsePolicy = {
@@ -82,6 +85,14 @@ export function resolveAppPageRscResponsePolicy(
     return { cacheControl: NO_STORE_CACHE_CONTROL };
   }
 
+  // revalidate = 0 means "always dynamic, never cache" — equivalent to
+  // force-dynamic for caching purposes. Must be checked before the
+  // isForceStatic/isDynamicError branch below, which uses !revalidateSeconds
+  // and would incorrectly catch 0 as a falsy value.
+  if (options.revalidateSeconds === 0) {
+    return { cacheControl: NO_STORE_CACHE_CONTROL };
+  }
+
   if (
     ((options.isForceStatic || options.isDynamicError) && !options.revalidateSeconds) ||
     options.revalidateSeconds === Infinity
@@ -116,10 +127,25 @@ export function resolveAppPageHtmlResponsePolicy(
     };
   }
 
-  if (
-    (options.isForceStatic || options.isDynamicError) &&
-    (options.revalidateSeconds === null || options.revalidateSeconds === 0)
-  ) {
+  if (options.hasScriptNonce) {
+    return {
+      cacheControl: NO_STORE_CACHE_CONTROL,
+      shouldWriteToCache: false,
+    };
+  }
+
+  // revalidate = 0 means "always dynamic, never cache" — equivalent to
+  // force-dynamic for caching purposes. Must be checked before the
+  // isForceStatic/isDynamicError branch below, which matches revalidateSeconds
+  // === 0 and would incorrectly return a static Cache-Control.
+  if (options.revalidateSeconds === 0) {
+    return {
+      cacheControl: NO_STORE_CACHE_CONTROL,
+      shouldWriteToCache: false,
+    };
+  }
+
+  if ((options.isForceStatic || options.isDynamicError) && options.revalidateSeconds === null) {
     return {
       cacheControl: STATIC_CACHE_CONTROL,
       cacheState: "STATIC",
@@ -157,6 +183,8 @@ export function resolveAppPageHtmlResponsePolicy(
   return { shouldWriteToCache: false };
 }
 
+export { mergeMiddlewareResponseHeaders };
+
 export function buildAppPageRscResponse(
   body: ReadableStream,
   options: BuildAppPageRscResponseOptions,
@@ -178,20 +206,7 @@ export function buildAppPageRscResponse(
     headers.set("X-Vinext-Cache", options.policy.cacheState);
   }
 
-  if (options.middlewareContext.headers) {
-    for (const [key, value] of options.middlewareContext.headers) {
-      const lowerKey = key.toLowerCase();
-      if (lowerKey === "set-cookie" || lowerKey === "vary") {
-        headers.append(key, value);
-      } else {
-        // Keep parity with the old inline RSC path: middleware owns singular
-        // response headers like Cache-Control here, while Set-Cookie and Vary
-        // are accumulated. The HTML helper intentionally keeps its legacy
-        // append-for-everything behavior below.
-        headers.set(key, value);
-      }
-    }
-  }
+  mergeMiddlewareResponseHeaders(headers, options.middlewareContext.headers);
 
   applyTimingHeader(headers, options.timing);
 
@@ -223,11 +238,7 @@ export function buildAppPageHtmlResponse(
     headers.set("Link", options.fontLinkHeader);
   }
 
-  if (options.middlewareContext.headers) {
-    for (const [key, value] of options.middlewareContext.headers) {
-      headers.append(key, value);
-    }
-  }
+  mergeMiddlewareResponseHeaders(headers, options.middlewareContext.headers);
 
   applyTimingHeader(headers, options.timing);
 

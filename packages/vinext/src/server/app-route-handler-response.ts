@@ -1,4 +1,5 @@
 import type { CachedRouteValue } from "../shims/cache.js";
+import { mergeMiddlewareResponseHeaders } from "./middleware-response-headers.js";
 
 export type RouteHandlerMiddlewareContext = {
   headers: Headers | null;
@@ -37,11 +38,7 @@ export function applyRouteHandlerMiddlewareContext(
   }
 
   const responseHeaders = new Headers(response.headers);
-  if (middlewareContext.headers) {
-    for (const [key, value] of middlewareContext.headers) {
-      responseHeaders.append(key, value);
-    }
-  }
+  mergeMiddlewareResponseHeaders(responseHeaders, middlewareContext.headers);
 
   return new Response(response.body, {
     status: middlewareContext.status ?? response.status,
@@ -92,10 +89,13 @@ export async function buildAppRouteCacheValue(response: Response): Promise<Cache
   const headers: CachedRouteValue["headers"] = {};
 
   response.headers.forEach((value, key) => {
-    if (key !== "x-vinext-cache" && key !== "cache-control") {
-      headers[key] = value;
-    }
+    if (key === "set-cookie" || key === "x-vinext-cache" || key === "cache-control") return;
+    headers[key] = value;
   });
+  const setCookies = response.headers.getSetCookie?.() ?? [];
+  if (setCookies.length > 0) {
+    headers["set-cookie"] = setCookies;
+  }
 
   return {
     kind: "APP_ROUTE",

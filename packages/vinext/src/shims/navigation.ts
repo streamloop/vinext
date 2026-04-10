@@ -733,10 +733,6 @@ function getClientParamsSnapshot(): Record<string, string | string[]> {
   return getClientNavigationState()?.clientParams ?? _EMPTY_PARAMS;
 }
 
-function getServerParamsSnapshot(): Record<string, string | string[]> {
-  return _getServerContext()?.params ?? _EMPTY_PARAMS;
-}
-
 function subscribeToNavigation(cb: () => void): () => void {
   const state = getClientNavigationState();
   if (!state) return () => {};
@@ -1294,21 +1290,39 @@ class VinextNavigationError extends Error {
 
 /**
  * Throw a redirect. Caught by the framework to send a redirect response.
+ *
+ * When `type` is omitted, the digest carries an empty sentinel so the
+ * catch site can resolve the default based on context:
+ * - Server Action context → "push"  (Back button works after form submission)
+ * - SSR render context    → "replace"
+ *
+ * This matches Next.js behavior where `redirect()` checks
+ * `actionAsyncStorage.getStore()?.isAction` at call time.
+ *
+ * @see https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/redirect.ts
  */
 export function redirect(url: string, type?: "replace" | "push" | RedirectType): never {
   throw new VinextNavigationError(
     `NEXT_REDIRECT:${url}`,
-    `NEXT_REDIRECT;${type ?? "replace"};${encodeURIComponent(url)}`,
+    `NEXT_REDIRECT;${type ?? ""};${encodeURIComponent(url)}`,
   );
 }
 
 /**
  * Trigger a permanent redirect (308).
+ *
+ * Accepts an optional `type` parameter matching Next.js's signature.
+ * Defaults to "replace" (not context-dependent like `redirect()`).
+ *
+ * @see https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/redirect.ts
  */
-export function permanentRedirect(url: string): never {
+export function permanentRedirect(
+  url: string,
+  type: "replace" | "push" | RedirectType = "replace",
+): never {
   throw new VinextNavigationError(
     `NEXT_REDIRECT:${url}`,
-    `NEXT_REDIRECT;replace;${encodeURIComponent(url)};308`,
+    `NEXT_REDIRECT;${type};${encodeURIComponent(url)};308`,
   );
 }
 
