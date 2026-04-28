@@ -24,16 +24,64 @@ import { hasBasePath, stripBasePath } from "../utils/base-path.js";
  * Next.js returns 404 for these paths. We check the RAW pathname before
  * normalization so the guard fires before normalizePath collapses `//`.
  *
+ * Percent-encoded variants are also blocked because:
+ *   - `%5C` decodes to `\` (browsers treat `/\evil.com` as `//evil.com`).
+ *   - `%2F` decodes to `/` (so `/%2F/evil.com` effectively becomes `//evil.com`).
+ * These forms survive segment-wise decoding that re-encodes path delimiters
+ * (e.g. `normalizePathnameForRouteMatchStrict`), so a later trailing-slash
+ * redirect would still echo the encoded form in its `Location` header. See
+ * `isOpenRedirectShaped` for the full list of rejected leading-segment forms.
+ *
  * @param rawPathname - The raw pathname from the URL, before any normalization
  * @returns A 404 Response if the path is protocol-relative, or null to continue
  */
 export function guardProtocolRelativeUrl(rawPathname: string): Response | null {
-  // Normalize backslashes: browsers and the URL constructor treat
-  // /\evil.com as protocol-relative (//evil.com), bypassing the // check.
-  if (rawPathname.replaceAll("\\", "/").startsWith("//")) {
+  if (isOpenRedirectShaped(rawPathname)) {
     return new Response("404 Not Found", { status: 404 });
   }
   return null;
+}
+
+/**
+ * Returns true if a request pathname looks like a protocol-relative open
+ * redirect, in either literal or percent-encoded form.
+ *
+ * Exported for call sites that need to replicate the guard inline (Pages
+ * Router worker codegen, Node production server) and for defense-in-depth
+ * checks inside redirect emitters.
+ *
+ * A pathname is considered "open redirect shaped" when its first segment,
+ * after decoding backslashes and encoded delimiters, would cause a browser
+ * to resolve a `Location` containing the pathname as protocol-relative:
+ *
+ *   - literal   `//evil.com`
+ *   - literal   `/\evil.com`             (browsers normalize `\` to `/`)
+ *   - encoded   `/%5Cevil.com`           (`%5C` decodes to `\` in Location)
+ *   - encoded   `/%2F/evil.com`          (`%2F` decodes to `/` → `//`)
+ *   - mixed     `/%5C%2F`, `/%5C%5C`     (and other combinations)
+ *
+ * We explicitly do not require a valid percent sequence elsewhere in the
+ * pathname — we only examine the leading bytes (up to the second real or
+ * encoded delimiter) so malformed suffixes can still reach the normal
+ * "400 Bad Request" decode path instead of being masked as "404".
+ */
+export function isOpenRedirectShaped(rawPathname: string): boolean {
+  if (!rawPathname.startsWith("/")) return false;
+
+  // Fast path: literal `//...` or `/\...`. Browsers treat `\` as `/` in
+  // URL paths, so `/\evil.com` is equivalent to `//evil.com`.
+  const afterSlash = rawPathname.slice(1);
+  if (afterSlash.startsWith("/") || afterSlash.startsWith("\\")) return true;
+
+  // Slow path: percent-encoded leading delimiter. We only need to consider
+  // `%5C` (backslash) and `%2F` (forward slash) at position 1. Case-insensitive
+  // per RFC 3986 §2.1.
+  if (afterSlash.length >= 3 && afterSlash[0] === "%") {
+    const encoded = afterSlash.slice(0, 3).toLowerCase();
+    if (encoded === "%5c" || encoded === "%2f") return true;
+  }
+
+  return false;
 }
 
 /**
@@ -73,6 +121,13 @@ export function normalizeTrailingSlash(
 ): Response | null {
   if (pathname === "/" || pathname === "/api" || pathname.startsWith("/api/")) {
     return null;
+  }
+  // Defense-in-depth: `guardProtocolRelativeUrl` runs earlier and should
+  // have rejected these shapes. Refuse to emit a Location header that the
+  // browser would resolve as protocol-relative, even if a caller somehow
+  // bypassed the upstream guard.
+  if (isOpenRedirectShaped(pathname)) {
+    return new Response("404 Not Found", { status: 404 });
   }
   const hasTrailing = pathname.endsWith("/");
   // RSC (client-side navigation) requests arrive as /path.rsc — don't
@@ -244,13 +299,54 @@ export async function validateServerActionPayload(
  * Check if an origin matches any pattern in the allowed origins list.
  * Supports wildcard subdomains (e.g. `*.example.com`).
  */
-function isOriginAllowed(origin: string, allowed: string[]): boolean {
+/**
+ * Segment-by-segment domain matching for wildcard origin patterns.
+ * `*` matches exactly one DNS label; `**` matches one or more labels.
+ *
+ * Ported from Next.js: packages/next/src/server/app-render/csrf-protection.ts
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/csrf-protection.ts
+ */
+function matchWildcardDomain(domain: string, pattern: string): boolean {
+  const normalizedDomain = domain.replace(/[A-Z]/g, (c) => c.toLowerCase());
+  const normalizedPattern = pattern.replace(/[A-Z]/g, (c) => c.toLowerCase());
+
+  const domainParts = normalizedDomain.split(".");
+  const patternParts = normalizedPattern.split(".");
+
+  if (patternParts.length < 1) return false;
+  if (domainParts.length < patternParts.length) return false;
+
+  // Prevent wildcards from matching entire domains (e.g. '**' or '*.com')
+  if (patternParts.length === 1 && (patternParts[0] === "*" || patternParts[0] === "**")) {
+    return false;
+  }
+
+  while (patternParts.length) {
+    const patternPart = patternParts.pop();
+    const domainPart = domainParts.pop();
+
+    switch (patternPart) {
+      case "":
+        return false;
+      case "*":
+        if (domainPart) continue;
+        else return false;
+      case "**":
+        if (patternParts.length > 0) return false;
+        return domainPart !== undefined;
+      default:
+        if (patternPart !== domainPart) return false;
+    }
+  }
+
+  return domainParts.length === 0;
+}
+
+export function isOriginAllowed(origin: string, allowed: string[]): boolean {
   for (const pattern of allowed) {
-    if (pattern.startsWith("*.")) {
-      // Wildcard: *.example.com matches sub.example.com, a.b.example.com
-      const suffix = pattern.slice(1); // ".example.com"
-      if (origin === pattern.slice(2) || origin.endsWith(suffix)) return true;
-    } else if (origin === pattern) {
+    if (pattern.includes("*")) {
+      if (matchWildcardDomain(origin, pattern)) return true;
+    } else if (origin.toLowerCase() === pattern.toLowerCase()) {
       return true;
     }
   }

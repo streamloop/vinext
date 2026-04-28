@@ -12,9 +12,11 @@
 // bindings are just `undefined` on the namespace object and we can guard at runtime.
 import * as React from "react";
 import { notifyAppRouterTransitionStart } from "../client/instrumentation-client-state.js";
+import { createAppPayloadCacheKey } from "../server/app-elements.js";
 import { toBrowserNavigationHref, toSameOriginAppPath } from "./url-utils.js";
 import { stripBasePath } from "../utils/base-path.js";
 import { ReadonlyURLSearchParams } from "./readonly-url-search-params.js";
+import { assertSafeNavigationUrl } from "./url-safety.js";
 
 // ─── Layout segment context ───────────────────────────────────────────────────
 // Stores the child segments below the current layout. Each layout wraps its
@@ -162,8 +164,29 @@ export const GLOBAL_ACCESSORS_KEY = Symbol.for("vinext.navigation.globalAccessor
 const _GLOBAL_ACCESSORS_KEY = GLOBAL_ACCESSORS_KEY;
 type _GlobalWithAccessors = typeof globalThis & { [_GLOBAL_ACCESSORS_KEY]?: _StateAccessors };
 
+// Browser hydration has the same module-split shape as SSR in Vite dev:
+// the browser entry seeds the snapshot before hydrateRoot(), but client
+// components can import a different module instance of this shim.
+const GLOBAL_HYDRATION_CONTEXT_KEY = Symbol.for("vinext.navigation.clientHydrationContext");
+const _GLOBAL_HYDRATION_CONTEXT_KEY = GLOBAL_HYDRATION_CONTEXT_KEY;
+type _GlobalWithHydrationContext = typeof globalThis & {
+  [_GLOBAL_HYDRATION_CONTEXT_KEY]?: NavigationContext | null;
+};
+
 function _getGlobalAccessors(): _StateAccessors | undefined {
   return (globalThis as _GlobalWithAccessors)[_GLOBAL_ACCESSORS_KEY];
+}
+
+function _getClientHydrationContext(): NavigationContext | null | undefined {
+  const globalState = globalThis as _GlobalWithHydrationContext;
+  if (Object.prototype.hasOwnProperty.call(globalState, _GLOBAL_HYDRATION_CONTEXT_KEY)) {
+    return globalState[_GLOBAL_HYDRATION_CONTEXT_KEY] ?? null;
+  }
+  return undefined;
+}
+
+function _setClientHydrationContext(ctx: NavigationContext | null): void {
+  (globalThis as _GlobalWithHydrationContext)[_GLOBAL_HYDRATION_CONTEXT_KEY] = ctx;
 }
 
 let _serverContext: NavigationContext | null = null;
@@ -172,10 +195,19 @@ let _serverInsertedHTMLCallbacks: Array<() => unknown> = [];
 // These are overridden by navigation-state.ts on the server to use ALS.
 // The defaults check globalThis for cross-module-instance access (issue #688).
 let _getServerContext = (): NavigationContext | null => {
+  if (typeof window !== "undefined") {
+    const hydrationContext = _getClientHydrationContext();
+    return hydrationContext !== undefined ? hydrationContext : _serverContext;
+  }
   const g = _getGlobalAccessors();
   return g ? g.getServerContext() : _serverContext;
 };
 let _setServerContext = (ctx: NavigationContext | null): void => {
+  if (typeof window !== "undefined") {
+    _serverContext = ctx;
+    _setClientHydrationContext(ctx);
+    return;
+  }
   const g = _getGlobalAccessors();
   if (g) {
     g.setServerContext(ctx);
@@ -247,6 +279,7 @@ export const PREFETCH_CACHE_TTL = 30_000;
 export type CachedRscResponse = {
   buffer: ArrayBuffer;
   contentType: string;
+  mountedSlotsHeader?: string | null;
   paramsHeader: string | null;
   url: string;
 };
@@ -273,6 +306,22 @@ export function toRscUrl(href: string): string {
   return normalizedPath + ".rsc" + query;
 }
 
+export function getCurrentInterceptionContext(): string | null {
+  if (isServer) {
+    return null;
+  }
+
+  return stripBasePath(window.location.pathname, __basePath);
+}
+
+export function getCurrentNextUrl(): string {
+  if (isServer) {
+    return "/";
+  }
+
+  return window.location.pathname + window.location.search;
+}
+
 /** Get or create the shared in-memory RSC prefetch cache on window. */
 export function getPrefetchCache(): Map<string, PrefetchCacheEntry> {
   if (isServer) return new Map();
@@ -284,7 +333,7 @@ export function getPrefetchCache(): Map<string, PrefetchCacheEntry> {
 
 /**
  * Get or create the shared set of already-prefetched RSC URLs on window.
- * Keyed by rscUrl so that the browser entry can clear entries when consumed.
+ * Keyed by interception-aware cache key so distinct source routes do not alias.
  */
 export function getPrefetchedUrls(): Set<string> {
   if (isServer) return new Set();
@@ -330,13 +379,21 @@ function evictPrefetchCacheIfNeeded(): void {
  * (the caller falls back to a fresh fetch, which is acceptable).
  *
  * Prefer prefetchRscResponse() for new call-sites — it handles the full
- * prefetch lifecycle including dedup.  storePrefetchResponse() is kept for
- * backward compatibility and test helpers.
+ * prefetch lifecycle including dedup and explicit slot context.
+ * storePrefetchResponse() is kept for backward compatibility and test
+ * helpers. It is slot-unaware: the snapshot's mountedSlotsHeader comes
+ * from the response headers, not the caller, so consumePrefetchResponse
+ * may reject the entry if the caller's slot context differs.
  *
  * NB: Caller is responsible for managing getPrefetchedUrls() — this
  * function only stores the response in the prefetch cache.
  */
-export function storePrefetchResponse(rscUrl: string, response: Response): void {
+export function storePrefetchResponse(
+  rscUrl: string,
+  response: Response,
+  interceptionContext: string | null = null,
+): void {
+  const cacheKey = createAppPayloadCacheKey(rscUrl, interceptionContext);
   evictPrefetchCacheIfNeeded();
   const entry: PrefetchCacheEntry = { timestamp: Date.now() };
   entry.pending = snapshotRscResponse(response)
@@ -344,12 +401,12 @@ export function storePrefetchResponse(rscUrl: string, response: Response): void 
       entry.snapshot = snapshot;
     })
     .catch(() => {
-      getPrefetchCache().delete(rscUrl);
+      getPrefetchCache().delete(cacheKey);
     })
     .finally(() => {
       entry.pending = undefined;
     });
-  getPrefetchCache().set(rscUrl, entry);
+  getPrefetchCache().set(cacheKey, entry);
 }
 
 /**
@@ -361,6 +418,7 @@ export async function snapshotRscResponse(response: Response): Promise<CachedRsc
   return {
     buffer,
     contentType: response.headers.get("content-type") ?? "text/x-component",
+    mountedSlotsHeader: response.headers.get("X-Vinext-Mounted-Slots"),
     paramsHeader: response.headers.get("X-Vinext-Params"),
     url: response.url,
   };
@@ -383,6 +441,9 @@ export async function snapshotRscResponse(response: Response): Promise<CachedRsc
  */
 export function restoreRscResponse(cached: CachedRscResponse, copy = true): Response {
   const headers = new Headers({ "content-type": cached.contentType });
+  if (cached.mountedSlotsHeader != null) {
+    headers.set("X-Vinext-Mounted-Slots", cached.mountedSlotsHeader);
+  }
   if (cached.paramsHeader != null) {
     headers.set("X-Vinext-Params", cached.paramsHeader);
   }
@@ -400,7 +461,13 @@ export function restoreRscResponse(cached: CachedRscResponse, copy = true): Resp
  * Enforces a maximum cache size to prevent unbounded memory growth on
  * link-heavy pages.
  */
-export function prefetchRscResponse(rscUrl: string, fetchPromise: Promise<Response>): void {
+export function prefetchRscResponse(
+  rscUrl: string,
+  fetchPromise: Promise<Response>,
+  interceptionContext: string | null = null,
+  mountedSlotsHeader: string | null = null,
+): void {
+  const cacheKey = createAppPayloadCacheKey(rscUrl, interceptionContext);
   const cache = getPrefetchCache();
   const prefetched = getPrefetchedUrls();
   const now = Date.now();
@@ -410,15 +477,20 @@ export function prefetchRscResponse(rscUrl: string, fetchPromise: Promise<Respon
   entry.pending = fetchPromise
     .then(async (response) => {
       if (response.ok) {
-        entry.snapshot = await snapshotRscResponse(response);
+        entry.snapshot = {
+          ...(await snapshotRscResponse(response)),
+          // Prefetch compatibility is defined by the slot context at fetch
+          // time, not by whatever header a reused response happens to carry.
+          mountedSlotsHeader,
+        };
       } else {
-        prefetched.delete(rscUrl);
-        cache.delete(rscUrl);
+        prefetched.delete(cacheKey);
+        cache.delete(cacheKey);
       }
     })
     .catch(() => {
-      prefetched.delete(rscUrl);
-      cache.delete(rscUrl);
+      prefetched.delete(cacheKey);
+      cache.delete(cacheKey);
     })
     .finally(() => {
       entry.pending = undefined;
@@ -427,7 +499,7 @@ export function prefetchRscResponse(rscUrl: string, fetchPromise: Promise<Respon
   // Insert the new entry before evicting. FIFO evicts from the front of the
   // Map (oldest insertion order), so the just-appended entry is safe — only
   // entries inserted before it are candidates for removal.
-  cache.set(rscUrl, entry);
+  cache.set(cacheKey, entry);
   evictPrefetchCacheIfNeeded();
 }
 
@@ -436,18 +508,28 @@ export function prefetchRscResponse(rscUrl: string, fetchPromise: Promise<Respon
  * Only returns settled (non-pending) snapshots synchronously.
  * Returns null if the entry is still in flight or doesn't exist.
  */
-export function consumePrefetchResponse(rscUrl: string): CachedRscResponse | null {
+export function consumePrefetchResponse(
+  rscUrl: string,
+  interceptionContext: string | null = null,
+  mountedSlotsHeader: string | null = null,
+): CachedRscResponse | null {
+  const cacheKey = createAppPayloadCacheKey(rscUrl, interceptionContext);
   const cache = getPrefetchCache();
-  const entry = cache.get(rscUrl);
+  const entry = cache.get(cacheKey);
   if (!entry) return null;
 
   // Don't consume pending entries — let the navigation fetch independently.
   if (entry.pending) return null;
 
-  cache.delete(rscUrl);
-  getPrefetchedUrls().delete(rscUrl);
+  cache.delete(cacheKey);
+  getPrefetchedUrls().delete(cacheKey);
 
   if (entry.snapshot) {
+    if ((entry.snapshot.mountedSlotsHeader ?? null) !== mountedSlotsHeader) {
+      // Entry was already removed above. Slot mismatch means the prefetch
+      // used stale slot context and cannot be safely reused.
+      return null;
+    }
     if (Date.now() - entry.timestamp >= PREFETCH_CACHE_TTL) {
       return null;
     }
@@ -464,6 +546,7 @@ export function consumePrefetchResponse(rscUrl: string): CachedRscResponse | nul
 
 type NavigationListener = () => void;
 const _CLIENT_NAV_STATE_KEY = Symbol.for("vinext.clientNavigationState");
+const _MOUNTED_SLOTS_HEADER_KEY = Symbol.for("vinext.mountedSlotsHeader");
 
 type ClientNavigationState = {
   listeners: Set<NavigationListener>;
@@ -474,6 +557,8 @@ type ClientNavigationState = {
   clientParamsJson: string;
   pendingClientParams: Record<string, string | string[]> | null;
   pendingClientParamsJson: string | null;
+  pendingPathname: string | null;
+  pendingPathnameNavId: number | null;
   originalPushState: typeof window.history.pushState;
   originalReplaceState: typeof window.history.replaceState;
   patchInstalled: boolean;
@@ -482,11 +567,28 @@ type ClientNavigationState = {
   navigationSnapshotActiveCount: number;
 };
 
-type ClientNavigationGlobal = typeof globalThis & {
-  [_CLIENT_NAV_STATE_KEY]?: ClientNavigationState;
+type CommitClientNavigationStateOptions = {
+  releaseSnapshot?: boolean;
 };
 
-function getClientNavigationState(): ClientNavigationState | null {
+type ClientNavigationGlobal = typeof globalThis & {
+  [_CLIENT_NAV_STATE_KEY]?: ClientNavigationState;
+  [_MOUNTED_SLOTS_HEADER_KEY]?: string | null;
+};
+
+export function setMountedSlotsHeader(header: string | null): void {
+  if (isServer) return;
+  const globalState = window as ClientNavigationGlobal;
+  globalState[_MOUNTED_SLOTS_HEADER_KEY] = header;
+}
+
+export function getMountedSlotsHeader(): string | null {
+  if (isServer) return null;
+  const globalState = window as ClientNavigationGlobal;
+  return globalState[_MOUNTED_SLOTS_HEADER_KEY] ?? null;
+}
+
+export function getClientNavigationState(): ClientNavigationState | null {
   if (isServer) return null;
 
   const globalState = window as ClientNavigationGlobal;
@@ -499,6 +601,8 @@ function getClientNavigationState(): ClientNavigationState | null {
     clientParamsJson: "{}",
     pendingClientParams: null,
     pendingClientParamsJson: null,
+    pendingPathname: null,
+    pendingPathnameNavId: null,
     // NB: These capture the currently installed history methods, not guaranteed
     // native ones. If a third-party library (analytics, router) has already patched
     // history methods before this module loads, we intentionally preserve that
@@ -729,6 +833,34 @@ export function getClientParams(): Record<string, string | string[]> {
   return getClientNavigationState()?.clientParams ?? _fallbackClientParams;
 }
 
+/**
+ * Set the pending pathname for client-side navigation.
+ * Strips the base path before storing. Associates the pathname with the given navId
+ * so only that navigation (or a newer one) can clear it.
+ */
+export function setPendingPathname(pathname: string, navId: number): void {
+  const state = getClientNavigationState();
+  if (!state) return;
+  state.pendingPathname = stripBasePath(pathname, __basePath);
+  state.pendingPathnameNavId = navId;
+}
+
+/**
+ * Clear the pending pathname, but only if the given navId matches the one
+ * that set it, or if pendingPathnameNavId is null (no active owner).
+ * This prevents superseded navigations from clearing state belonging to newer navigations.
+ */
+export function clearPendingPathname(navId: number): void {
+  const state = getClientNavigationState();
+  if (!state) return;
+  // Only clear if this navId is the one that set the pendingPathname,
+  // or if pendingPathnameNavId is null (no owner)
+  if (state.pendingPathnameNavId === null || state.pendingPathnameNavId === navId) {
+    state.pendingPathname = null;
+    state.pendingPathnameNavId = null;
+  }
+}
+
 function getClientParamsSnapshot(): Record<string, string | string[]> {
   return getClientNavigationState()?.clientParams ?? _EMPTY_PARAMS;
 }
@@ -742,10 +874,6 @@ function subscribeToNavigation(cb: () => void): () => void {
     state.listeners.delete(cb);
   };
 }
-
-// ---------------------------------------------------------------------------
-// Hooks
-// ---------------------------------------------------------------------------
 
 /* oxlint-disable eslint-plugin-react-hooks/rules-of-hooks */
 /**
@@ -886,16 +1014,27 @@ function withSuppressedUrlNotifications<T>(fn: () => T): T {
   }
 }
 
-export function commitClientNavigationState(): void {
+/**
+ * Commit pending client navigation state to committed snapshots.
+ *
+ * navId is optional: callers that don't own pendingPathname (for example,
+ * superseded pre-paint cleanup) may pass undefined to flush URL/params state
+ * without clearing pendingPathname owned by the active navigation. Such callers
+ * must opt in explicitly if they also own an activated render snapshot.
+ */
+export function commitClientNavigationState(
+  navId?: number,
+  options?: CommitClientNavigationStateOptions,
+): void {
   if (isServer) return;
   const state = getClientNavigationState();
   if (!state) return;
 
-  // Only decrement the snapshot counter if a snapshot was previously activated.
-  // Several code paths call commit without a prior activateNavigationSnapshot()
-  // — hash-only changes (navigateClientSide), Pages Router popstate, and
-  // patched history.pushState/replaceState — which legitimately have count == 0.
-  if (state.navigationSnapshotActiveCount > 0) {
+  // Only navigation-owned commits may release a render snapshot. Ownerless URL
+  // syncs still update committed pathname/search state, but must not consume
+  // the active snapshot for an in-flight App Router transition.
+  const shouldReleaseSnapshot = navId !== undefined || options?.releaseSnapshot === true;
+  if (shouldReleaseSnapshot && state.navigationSnapshotActiveCount > 0) {
     state.navigationSnapshotActiveCount -= 1;
   }
 
@@ -905,6 +1044,18 @@ export function commitClientNavigationState(): void {
     state.clientParamsJson = state.pendingClientParamsJson;
     state.pendingClientParams = null;
     state.pendingClientParamsJson = null;
+  }
+  // Clear pending pathname when navigation commits, but only if:
+  // - The navId matches the one that set pendingPathname
+  // - No newer navigation has overwritten pendingPathname (pendingPathnameNavId === null or matches)
+  // - navId is undefined only for non-owning callers, which must not clear
+  //   pendingPathname for an active navigation.
+  const canClearPendingPathname =
+    state.pendingPathnameNavId === null ||
+    (navId !== undefined && state.pendingPathnameNavId === navId);
+  if (canClearPendingPathname) {
+    state.pendingPathname = null;
+    state.pendingPathnameNavId = null;
   }
   const shouldNotify = urlChanged || state.hasPendingNavigationUpdate;
   state.hasPendingNavigationUpdate = false;
@@ -1003,6 +1154,7 @@ export async function navigateClientSide(
   href: string,
   mode: "push" | "replace",
   scroll: boolean,
+  programmaticTransition = false,
 ): Promise<void> {
   // Normalize same-origin absolute URLs to local paths for SPA navigation
   let normalizedHref = href;
@@ -1058,7 +1210,14 @@ export async function navigateClientSide(
   // double-push and ensures window.location still reflects the *current* URL
   // when navigateRsc computes isSameRoute (cross-route vs same-route).
   if (typeof window.__VINEXT_RSC_NAVIGATE__ === "function") {
-    await window.__VINEXT_RSC_NAVIGATE__(fullHref, 0, "navigate", mode);
+    await window.__VINEXT_RSC_NAVIGATE__(
+      fullHref,
+      0,
+      "navigate",
+      mode,
+      undefined,
+      programmaticTransition,
+    );
   } else {
     if (mode === "replace") {
       replaceHistoryStateWithoutNotify(null, "", fullHref);
@@ -1089,12 +1248,18 @@ export async function navigateClientSide(
 
 const _appRouter = {
   push(href: string, options?: { scroll?: boolean }): void {
+    assertSafeNavigationUrl(href);
     if (isServer) return;
-    void navigateClientSide(href, "push", options?.scroll !== false);
+    React.startTransition(() => {
+      void navigateClientSide(href, "push", options?.scroll !== false, true);
+    });
   },
   replace(href: string, options?: { scroll?: boolean }): void {
+    assertSafeNavigationUrl(href);
     if (isServer) return;
-    void navigateClientSide(href, "replace", options?.scroll !== false);
+    React.startTransition(() => {
+      void navigateClientSide(href, "replace", options?.scroll !== false, true);
+    });
   },
   back(): void {
     if (isServer) return;
@@ -1107,27 +1272,44 @@ const _appRouter = {
   refresh(): void {
     if (isServer) return;
     // Re-fetch the current page's RSC stream
-    if (typeof window.__VINEXT_RSC_NAVIGATE__ === "function") {
-      void window.__VINEXT_RSC_NAVIGATE__(window.location.href, 0, "refresh");
+    const rscNavigate = window.__VINEXT_RSC_NAVIGATE__;
+    if (typeof rscNavigate === "function") {
+      const navigate = () => {
+        void rscNavigate(window.location.href, 0, "refresh", undefined, undefined, true);
+      };
+      React.startTransition(navigate);
     }
   },
   prefetch(href: string): void {
+    assertSafeNavigationUrl(href);
     if (isServer) return;
     // Prefetch the RSC payload for the target route and store in cache.
     // We must add to prefetchedUrls manually for deduplication.
     // prefetchRscResponse only manages the cache Map, not the URL set.
     const fullHref = toBrowserNavigationHref(href, window.location.href, __basePath);
     const rscUrl = toRscUrl(fullHref);
+    const interceptionContext = getCurrentInterceptionContext();
+    const cacheKey = createAppPayloadCacheKey(rscUrl, interceptionContext);
     const prefetched = getPrefetchedUrls();
-    if (prefetched.has(rscUrl)) return;
-    prefetched.add(rscUrl);
+    if (prefetched.has(cacheKey)) return;
+    prefetched.add(cacheKey);
+    const mountedSlotsHeader = getMountedSlotsHeader();
+    const headers = new Headers({ Accept: "text/x-component" });
+    if (mountedSlotsHeader) {
+      headers.set("X-Vinext-Mounted-Slots", mountedSlotsHeader);
+    }
+    if (interceptionContext !== null) {
+      headers.set("X-Vinext-Interception-Context", interceptionContext);
+    }
     prefetchRscResponse(
       rscUrl,
       fetch(rscUrl, {
-        headers: { Accept: "text/x-component" },
+        headers,
         credentials: "include",
         priority: "low" as RequestInit["priority"],
       }),
+      interceptionContext,
+      mountedSlotsHeader,
     );
   },
 };
@@ -1155,7 +1337,11 @@ export function useRouter() {
  */
 export function useSelectedLayoutSegment(parallelRoutesKey?: string): string | null {
   const segments = useSelectedLayoutSegments(parallelRoutesKey);
-  return segments.length > 0 ? segments[0] : null;
+  if (segments.length === 0) return null;
+
+  return parallelRoutesKey === undefined || parallelRoutesKey === "children"
+    ? segments[0]
+    : segments[segments.length - 1];
 }
 
 /**

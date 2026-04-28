@@ -15,6 +15,33 @@ import {
   startFixtureServer,
 } from "./helpers.js";
 
+function decodeHtmlText(text: string): string {
+  return text
+    .replaceAll("&quot;", '"')
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&");
+}
+
+function textContentByTestId(html: string, testId: string): string {
+  const attrIndex = html.indexOf(`data-testid="${testId}"`);
+  if (attrIndex === -1) {
+    throw new Error(`Missing data-testid="${testId}"`);
+  }
+
+  const contentStart = html.indexOf(">", attrIndex);
+  if (contentStart === -1) {
+    throw new Error(`Missing opening tag end for data-testid="${testId}"`);
+  }
+
+  const contentEnd = html.indexOf("</", contentStart);
+  if (contentEnd === -1) {
+    throw new Error(`Missing closing tag for data-testid="${testId}"`);
+  }
+
+  return decodeHtmlText(html.slice(contentStart + 1, contentEnd));
+}
+
 describe("App Router integration", () => {
   let server: ViteDevServer;
   let baseUrl: string;
@@ -363,10 +390,8 @@ describe("App Router integration", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
 
-    // The SegmentDisplay renders: <span data-testid="segments">["settings"]</span>
-    expect(html).toContain('data-testid="segments"');
     // Verify it returns ["settings"], not ["dashboard", "settings"]
-    expect(html).toMatch(/data-testid="segments"[^>]*>\[&quot;settings&quot;\]/);
+    expect(JSON.parse(textContentByTestId(html, "segments"))).toEqual(["settings"]);
   });
 
   it("useSelectedLayoutSegment returns first segment relative to dashboard layout", async () => {
@@ -374,9 +399,7 @@ describe("App Router integration", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
 
-    // The SegmentDisplay renders: <span data-testid="segment">settings</span>
-    expect(html).toContain('data-testid="segment"');
-    expect(html).toMatch(/data-testid="segment"[^>]*>settings</);
+    expect(textContentByTestId(html, "segment")).toBe("settings");
   });
 
   it("useSelectedLayoutSegments returns empty array at leaf route", async () => {
@@ -385,8 +408,7 @@ describe("App Router integration", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
 
-    // Should render: <span data-testid="segments">[]</span>
-    expect(html).toMatch(/data-testid="segments"[^>]*>\[\]/);
+    expect(JSON.parse(textContentByTestId(html, "segments"))).toEqual([]);
   });
 
   it("useSelectedLayoutSegment returns null at leaf route", async () => {
@@ -394,8 +416,7 @@ describe("App Router integration", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
 
-    // Should render: <span data-testid="segment">null</span>
-    expect(html).toMatch(/data-testid="segment"[^>]*>null</);
+    expect(textContentByTestId(html, "segment")).toBe("null");
   });
 
   // --- parallelRoutesKey support ---
@@ -408,8 +429,8 @@ describe("App Router integration", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
 
-    expect(html).toMatch(/data-testid="team-segments"[^>]*>\[\]/);
-    expect(html).toMatch(/data-testid="team-segment"[^>]*>null</);
+    expect(JSON.parse(textContentByTestId(html, "team-segments"))).toEqual([]);
+    expect(textContentByTestId(html, "team-segment")).toBe("null");
   });
 
   it("useSelectedLayoutSegments('analytics') returns [] when slot page is at root", async () => {
@@ -417,7 +438,7 @@ describe("App Router integration", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
 
-    expect(html).toMatch(/data-testid="analytics-segments"[^>]*>\[\]/);
+    expect(JSON.parse(textContentByTestId(html, "analytics-segments"))).toEqual([]);
   });
 
   it("useSelectedLayoutSegments('team') returns slot sub-route segments", async () => {
@@ -427,8 +448,21 @@ describe("App Router integration", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
 
-    expect(html).toMatch(/data-testid="team-segments"[^>]*>\[&quot;members&quot;\]/);
-    expect(html).toMatch(/data-testid="team-segment"[^>]*>members</);
+    expect(JSON.parse(textContentByTestId(html, "team-segments"))).toEqual(["members"]);
+    expect(textContentByTestId(html, "team-segment")).toBe("members");
+  });
+
+  it("useSelectedLayoutSegment('team') returns the leaf segment for nested slot routes", async () => {
+    // Mirrors Next.js @auth/reset/withEmail coverage:
+    // useSelectedLayoutSegments("team") should return ["members", "profile"],
+    // while useSelectedLayoutSegment("team") should return "profile".
+    const res = await fetch(`${baseUrl}/dashboard/members/profile`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+
+    expect(html).toContain('data-testid="team-member-profile-page"');
+    expect(JSON.parse(textContentByTestId(html, "team-segments"))).toEqual(["members", "profile"]);
+    expect(textContentByTestId(html, "team-segment")).toBe("profile");
   });
 
   it("useSelectedLayoutSegments('analytics') returns [] when slot shows default on sub-route", async () => {
@@ -438,7 +472,7 @@ describe("App Router integration", () => {
     expect(res.status).toBe(200);
     const html = await res.text();
 
-    expect(html).toMatch(/data-testid="analytics-segments"[^>]*>\[\]/);
+    expect(JSON.parse(textContentByTestId(html, "analytics-segments"))).toEqual([]);
   });
 
   it("useSelectedLayoutSegments() (default children) still returns correct segments after migration", async () => {
@@ -447,7 +481,7 @@ describe("App Router integration", () => {
     const html = await res.text();
 
     // children segments below the dashboard layout should include "settings"
-    expect(html).toMatch(/data-testid="segments"[^>]*>\[&quot;settings&quot;\]/);
+    expect(JSON.parse(textContentByTestId(html, "segments"))).toEqual(["settings"]);
   });
 
   // --- Intercepting routes ---
@@ -480,7 +514,10 @@ describe("App Router integration", () => {
   it("renders intercepted photo modal on RSC navigation from feed", async () => {
     // RSC request simulates client-side navigation
     const res = await fetch(`${baseUrl}/photos/42.rsc`, {
-      headers: { Accept: "text/x-component" },
+      headers: {
+        Accept: "text/x-component",
+        "X-Vinext-Interception-Context": "/feed",
+      },
     });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/x-component");
@@ -492,6 +529,13 @@ describe("App Router integration", () => {
     // It should also contain the feed page content (the source route)
     expect(rscPayload).toContain("Photo Feed");
     expect(rscPayload).toContain("feed-page");
+    expect(rscPayload).toContain("__interceptionContext");
+    expect(rscPayload).toContain("/feed");
+    const nul = String.fromCharCode(0);
+    expect(
+      rscPayload.includes("route:/photos/42\\u0000/feed") ||
+        rscPayload.includes(`route:/photos/42${nul}/feed`),
+    ).toBe(true);
   });
 
   // --- Intercepting routes with dynamic source route ---
@@ -717,6 +761,32 @@ describe("App Router integration", () => {
     expect(html).toContain('content="noindex"');
   });
 
+  // ── Client hook usage without "use client" (#834) ──
+  // When a Server Component imports a client-only hook from next/navigation
+  // without the "use client" directive, vinext should surface a clear error
+  // instead of silently returning a fallback value.
+  it("errors when client hook is used in a Server Component without 'use client' (#834)", async () => {
+    const { res, html } = await fetchHtml(baseUrl, "/missing-use-client-test");
+    expect(res.status).toBe(200); // error boundary renders, not a 500
+    // The error message should be clear and actionable
+    expect(html).toContain("usePathname()");
+    expect(html).toContain("Client Components");
+    expect(html).toContain("use client");
+    // Should NOT contain the actual page content (it errored before rendering)
+    expect(html).not.toContain("Missing use client test");
+  });
+
+  it("errors when React client hook is used in a Server Component without 'use client' (#834)", async () => {
+    const { res, html } = await fetchHtml(baseUrl, "/missing-use-client-react-hook");
+    expect(res.status).toBe(200); // error boundary renders, not a 500
+    // The error message should be clear and actionable
+    expect(html).toContain("useState()");
+    expect(html).toContain("Client Components");
+    expect(html).toContain("use client");
+    // Should NOT contain the actual page content (it errored before rendering)
+    expect(html).not.toContain("Missing use client react hook test");
+  });
+
   it("redirect() from Server Component returns redirect response", async () => {
     const res = await fetch(`${baseUrl}/redirect-test`, { redirect: "manual" });
     expect(res.status).toBeGreaterThanOrEqual(300);
@@ -875,6 +945,20 @@ describe("App Router integration", () => {
     // Title from generateMetadata should use the dynamic slug
     expect(html).toContain("<title>Blog: my-post</title>");
     expect(html).toMatch(/name="description".*content="Read about my-post"/);
+  });
+
+  it("layout generateMetadata() does not receive searchParams (Next.js parity)", async () => {
+    // Parity test: In Next.js, layout generateMetadata() does NOT receive
+    // searchParams — only page generateMetadata() does. The layout should
+    // always see undefined and fall back to "home", even when the URL has
+    // a query string.
+    // See: next.js resolve-metadata.ts — `isPage ? { params, searchParams } : { params }`
+    const res = await fetch(`${baseUrl}/layout-metadata-search?tab=settings`);
+    expect(res.status).toBe(200);
+
+    const html = await res.text();
+    // Layout falls back to "home" because it never receives searchParams.
+    expect(html).toContain("<title>Layout Section: home</title>");
   });
 
   it("renders catch-all routes with multiple segments", async () => {
@@ -1739,6 +1823,24 @@ describe("App Router Production server (startProdServer)", () => {
     expect(nestedRes.headers.get("e2e-headers")).toBe("middleware");
   });
 
+  it("applies middleware request header overrides before App->Pages fallback rendering in production", async () => {
+    const res = await fetch(`${baseUrl}/pages-header-override-delete`, {
+      headers: {
+        authorization: "Bearer secret",
+        cookie: "a=1; b=2",
+      },
+    });
+
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("Pages Header Override Delete");
+    expect(html).toContain('<p id="authorization"></p>');
+    expect(html).toContain('<p id="cookie"></p>');
+    expect(html).toContain('id="middleware-header">hello-from-middleware<');
+    expect(html).toContain('"authorization":null');
+    expect(html).toContain('"cookie":null');
+  });
+
   it("serves dynamic routes", async () => {
     const res = await fetch(`${baseUrl}/blog/test-post`);
     expect(res.status).toBe(200);
@@ -2146,6 +2248,50 @@ describe("App Router Production server (startProdServer)", () => {
     const body = await headRes.text();
     expect(body).toBe("");
   });
+
+  it("middleware request header overrides still apply after middleware calls headers() first", async () => {
+    // Regression for a bug where a middleware that reads `next/headers` →
+    // `headers()` *before* returning `NextResponse.next({ request: { headers } })`
+    // leaked the pre-override snapshot into the Server Component.
+    //
+    // The `headers()` call cached the sealed read-only Headers view on the
+    // shared HeadersContext (`ctx.readonlyHeaders = _sealHeaders(ctx.headers)`).
+    // `applyMiddlewareRequestHeaders()` then replaced `ctx.headers` with the
+    // override view but did not invalidate the cached sealed snapshot, so the
+    // Server Component's subsequent `headers()` call returned the original
+    // pre-override request headers.
+    //
+    // Discovered with @clerk/nextjs, whose `clerkClient()` calls
+    // `await headers()` via its internal `buildRequestLike()` helper during
+    // middleware execution. Clerk's `auth()` in a Server Component then threw
+    //
+    //   "auth() was called but Clerk can't detect usage of clerkMiddleware()"
+    //
+    // because Clerk's own x-clerk-auth-* request header overrides never
+    // reached the render. The fixture middleware reproduces the same prime-
+    // then-override sequence without a Clerk dependency by calling
+    // `await headers()` first and then returning the override response.
+    //
+    // The test runs against the production server (startProdServer) because
+    // the bug only manifests on the inline RSC entry path that wraps the
+    // entire request — including middleware execution — in the headers
+    // context. The dev-mode middleware path runs middleware before the
+    // headers context exists, so calling `headers()` from middleware is
+    // instead an immediate error there.
+    const res = await fetch(`${baseUrl}/header-override-after-prior-access`, {
+      headers: {
+        authorization: "Bearer secret",
+        cookie: "a=1; b=2",
+      },
+    });
+
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('id="authorization">null<');
+    expect(html).toContain('id="cookie">null<');
+    expect(html).toContain('id="middleware-header">hello-from-middleware<');
+    expect(html).toContain('id="cookie-count">0<');
+  });
 });
 
 describe("App Router Production server worker entry compatibility", () => {
@@ -2218,6 +2364,202 @@ export default {
       exitSpy.mockRestore();
       fs.rmSync(outDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("App Router Production server self-hosted next/font/google headers", () => {
+  // Regression for a bug where vinext's `next/font/google` self-hosting
+  // pipeline emitted the dev-machine absolute filesystem path into the
+  // HTTP `Link:` response header, the HTML body's `<link rel="preload">`
+  // tags, and the `<style data-vinext-fonts>` `@font-face src: url(...)`
+  // block. `fetchAndCacheFont` in `packages/vinext/src/plugins/fonts.ts`
+  // downloaded Google Fonts `.woff2` files into `<root>/.vinext/fonts/`
+  // and wrote `path.join(fontDir, filename)` — an absolute filesystem
+  // path — into the cached `@font-face` CSS's `src: url(...)`. The CSS
+  // was then embedded verbatim as `_selfHostedCSS` in the server bundle
+  // and every downstream consumer (the body preload tags, the Link
+  // response header, and the injected style block) read the same
+  // leaked filesystem path. In production this produced high-priority
+  // 404s (`<origin>/home/user/project/.vinext/fonts/...`) on every
+  // request and fell back to the real font only via the browser's
+  // unrelated runtime retry of the stylesheet CDN.
+  //
+  // The fix uses a separate fixture (`tests/fixtures/font-google-multiple`)
+  // rather than `app-basic` because `app-basic` is shared by many other
+  // tests — adding `next/font/google` to its root layout would force a
+  // real Google Fonts network fetch into every test run in this file.
+  // The mocked fetch below stands in for the Google Fonts CDN so the
+  // build is hermetic.
+  const FONT_FIXTURE_DIR = path.resolve(import.meta.dirname, "./fixtures/font-google-multiple");
+  const fontOutDir = path.resolve(FONT_FIXTURE_DIR, "dist");
+  const fontCacheDir = path.resolve(FONT_FIXTURE_DIR, ".vinext");
+  const nodeModulesLink = path.join(FONT_FIXTURE_DIR, "node_modules");
+  let fontServer: import("node:http").Server | undefined;
+  let fontBaseUrl: string;
+
+  beforeAll(async () => {
+    // Start from a clean slate so the test deterministically exercises
+    // `fetchAndCacheFont`'s fresh-fetch path and the writeBundle copy.
+    fs.rmSync(fontOutDir, { recursive: true, force: true });
+    fs.rmSync(fontCacheDir, { recursive: true, force: true });
+
+    // The font fixture has no installed node_modules of its own — mirror
+    // `font-google-build.test.ts` and symlink the repo-level node_modules
+    // so `vinext` resolves as a workspace package during the in-process
+    // build below.
+    const projectNodeModules = path.resolve(import.meta.dirname, "../node_modules");
+    fs.rmSync(nodeModulesLink, { recursive: true, force: true });
+    fs.symlinkSync(projectNodeModules, nodeModulesLink);
+
+    // Mock the Google Fonts CDN so the build is hermetic and
+    // `fetchAndCacheFont` exercises its real URL-rewrite code path
+    // (which used to bake the filesystem path into the cached CSS).
+    // The mocked CSS MUST contain `https://fonts.gstatic.com/...` URLs
+    // so `fetchAndCacheFont`'s regex extracts them and triggers the
+    // `css.split(fontUrl).join(filePath)` rewrite that was the source
+    // of the bug. Returning CSS with already-relative URLs would sidestep
+    // the failure mode.
+    const originalFetch = globalThis.fetch;
+    // Normalize every `fetch()` input shape to a plain URL string so the
+    // mock can match by substring. The build plugin currently always
+    // passes string URLs, but `globalThis.fetch` accepts `RequestInfo |
+    // URL` and a future change (or test helper) passing a `Request` or
+    // `URL` instance would otherwise be coerced to `[object Request]`
+    // by `String()` and silently skip the mock branches, falling through
+    // to a real network request for Google Fonts.
+    const resolveFetchUrl = (input: unknown): string => {
+      if (typeof input === "string") return input;
+      if (input instanceof URL) return input.toString();
+      if (typeof Request !== "undefined" && input instanceof Request) return input.url;
+      return String(input);
+    };
+    // Preserve `globalThis.fetch`'s full `(input, init)` signature so the
+    // fallback path forwards request options verbatim to the real fetch.
+    // The build plugin only issues plain GETs for Google Fonts today, so
+    // the `init` argument is never populated for the mock branches — but
+    // dropping it from the fallback signature would silently strip
+    // headers/method/body from any unrelated request that happens to run
+    // during the test and fall through.
+    globalThis.fetch = async (input: unknown, init?: RequestInit) => {
+      const url = resolveFetchUrl(input);
+      if (url.includes("fonts.googleapis.com")) {
+        const isMono = url.includes("Geist+Mono") || url.includes("Geist%20Mono");
+        const family = isMono ? "Geist Mono" : "Geist";
+        const gstaticUrl = `https://fonts.gstatic.com/s/${isMono ? "geistmono" : "geist"}/v1/${isMono ? "geistmono" : "geist"}-latin.woff2`;
+        const css = [
+          "@font-face {",
+          `  font-family: '${family}';`,
+          "  font-style: normal;",
+          "  font-weight: 400;",
+          "  font-display: swap;",
+          `  src: url(${gstaticUrl}) format('woff2');`,
+          "  unicode-range: U+0000-00FF;",
+          "}",
+        ].join("\n");
+        return new Response(css, {
+          status: 200,
+          headers: { "content-type": "text/css" },
+        });
+      }
+      if (url.includes("fonts.gstatic.com")) {
+        // 16 bytes is plenty — the plugin writes whatever it gets to disk
+        // under `.vinext/fonts/<family>/<hash>.woff2`. The test never reads
+        // the contents back, it only asserts the file exists and serves
+        // with the right content-type.
+        return new Response(
+          new Uint8Array([0x77, 0x4f, 0x46, 0x32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+          { status: 200, headers: { "content-type": "font/woff2" } },
+        );
+      }
+      return originalFetch(input as RequestInfo, init);
+    };
+
+    try {
+      const builder = await createBuilder({
+        root: FONT_FIXTURE_DIR,
+        configFile: false,
+        plugins: [vinext({ appDir: FONT_FIXTURE_DIR })],
+        logLevel: "silent",
+      });
+      await builder.buildApp();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
+    ({ server: fontServer } = await startProdServer({
+      port: 0,
+      outDir: fontOutDir,
+      noCompression: true,
+    }));
+    const addr = fontServer!.address();
+    const port = typeof addr === "object" && addr ? addr.port : 4212;
+    fontBaseUrl = `http://localhost:${port}`;
+  }, 60000);
+
+  afterAll(() => {
+    fontServer?.close();
+    fs.rmSync(fontOutDir, { recursive: true, force: true });
+    fs.rmSync(fontCacheDir, { recursive: true, force: true });
+    fs.rmSync(nodeModulesLink, { recursive: true, force: true });
+  });
+
+  it("emits served URLs in the HTTP Link response header (not filesystem paths)", async () => {
+    const res = await fetch(`${fontBaseUrl}/`);
+    expect(res.status).toBe(200);
+    const link = res.headers.get("link");
+    expect(link).toBeTruthy();
+    // Every preload in the Link header must reference the served URL
+    // namespace created by the fix. Before the fix, the header value was
+    // `</home/user/project/.vinext/fonts/geist-<hash>/geist-<hash>.woff2>`.
+    expect(link).toContain("/assets/_vinext_fonts/");
+    expect(link).toMatch(/rel=preload/);
+    expect(link).toMatch(/as=font/);
+    expect(link).toMatch(/type=font\/woff2/);
+    // Both the absolute dev-machine prefix and the relative cache dir
+    // name must be absent — the leaked path always contained both.
+    expect(link).not.toContain(FONT_FIXTURE_DIR);
+    expect(link).not.toContain(".vinext/fonts");
+  });
+
+  it("emits served URLs in the body <link rel=preload> tags", async () => {
+    const res = await fetch(`${fontBaseUrl}/`);
+    const html = await res.text();
+    expect(html).toMatch(
+      /<link rel="preload"[^>]*href="\/assets\/_vinext_fonts\/[^"]+\.woff2"[^>]*as="font"/,
+    );
+    expect(html).not.toContain(FONT_FIXTURE_DIR);
+    expect(html).not.toContain(".vinext/fonts");
+  });
+
+  it("emits served URLs in the injected <style data-vinext-fonts> block", async () => {
+    // The injected @font-face CSS is the upstream source of truth the body
+    // `<link>` tags and HTTP `Link:` header are both derived from — a
+    // regression here would reproduce the bug across all three emission
+    // paths at once.
+    const res = await fetch(`${fontBaseUrl}/`);
+    const html = await res.text();
+    const styleMatch = html.match(/<style data-vinext-fonts[^>]*>([\s\S]*?)<\/style>/);
+    expect(styleMatch).not.toBeNull();
+    const styleContent = styleMatch![1];
+    expect(styleContent).toMatch(/url\(\/assets\/_vinext_fonts\/[^)]+\.woff2\)/);
+    expect(styleContent).not.toContain(FONT_FIXTURE_DIR);
+    expect(styleContent).not.toContain(".vinext/fonts");
+  });
+
+  it("serves the cached font files copied into the client output", async () => {
+    // Regression guard for the writeBundle copy hook: without it, the
+    // rewritten URLs would be syntactically correct but 404 at request
+    // time because the font files never leave `<root>/.vinext/fonts/`.
+    const res = await fetch(`${fontBaseUrl}/`);
+    const html = await res.text();
+    const match = html.match(/\/assets\/_vinext_fonts\/[^"]+\.woff2/);
+    expect(match).not.toBeNull();
+    const fontPath = match![0];
+    const fontRes = await fetch(`${fontBaseUrl}${fontPath}`);
+    expect(fontRes.status).toBe(200);
+    expect(fontRes.headers.get("content-type")).toBe("font/woff2");
+    expect(fontRes.headers.get("cache-control")).toContain("immutable");
   });
 });
 
@@ -3337,6 +3679,27 @@ describe("App Router next.config.js features (generateRscEntry)", () => {
       });
     });
   });
+
+  describe("build-time classification dispatch stub", () => {
+    it("declares a __VINEXT_CLASS dispatch function", () => {
+      const code = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false);
+      expect(code).toContain("function __VINEXT_CLASS(routeIdx)");
+    });
+
+    it("threads a numeric route index into each route's classification wiring", () => {
+      const code = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false);
+      // minimalRoutes has three routes, so the generator should emit calls
+      // __VINEXT_CLASS(0), __VINEXT_CLASS(1), __VINEXT_CLASS(2).
+      for (let i = 0; i < minimalRoutes.length; i++) {
+        expect(code).toContain(`__VINEXT_CLASS(${i})`);
+      }
+    });
+
+    it("no longer hardcodes buildTimeClassifications to null", () => {
+      const code = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false);
+      expect(code).not.toContain("buildTimeClassifications: null");
+    });
+  });
 });
 
 describe("App Router middleware with NextRequest", () => {
@@ -4080,6 +4443,58 @@ describe("generateRscEntry ISR code generation", () => {
     expect(code).toContain("const __pageBuildResult = await __buildAppPageElement({");
   });
 
+  it("generated code threads intercept layout modules through slot overrides", () => {
+    const routeWithInterceptLayouts: AppRoute = {
+      errorPath: null,
+      forbiddenPath: null,
+      isDynamic: false,
+      layoutErrorPaths: [null],
+      layouts: ["/tmp/test/app/layout.tsx"],
+      layoutTreePositions: [0],
+      loadingPath: null,
+      notFoundPath: null,
+      notFoundPaths: [null],
+      pagePath: "/tmp/test/app/page.tsx",
+      parallelSlots: [
+        {
+          defaultPath: "/tmp/test/app/@modal/default.tsx",
+          errorPath: null,
+          interceptingRoutes: [
+            {
+              convention: ".",
+              layoutPaths: ["/tmp/test/app/@modal/(.)explicit-layout/layout.tsx"],
+              pagePath: "/tmp/test/app/@modal/(.)explicit-layout/deeper/page.tsx",
+              params: [],
+              targetPattern: "/explicit-layout/deeper",
+            },
+          ],
+          key: "modal@@modal",
+          layoutIndex: 0,
+          layoutPath: "/tmp/test/app/@modal/layout.tsx",
+          loadingPath: null,
+          name: "modal",
+          ownerDir: "/tmp/test/app/@modal",
+          pagePath: null,
+          routeSegments: null,
+        },
+      ],
+      params: [],
+      pattern: "/",
+      patternParts: [],
+      routePath: null,
+      routeSegments: [],
+      templates: [],
+      templateTreePositions: [],
+      unauthorizedPath: null,
+    };
+
+    const code = generateRscEntry("/tmp/test/app", [routeWithInterceptLayouts]);
+
+    expect(code).toContain("interceptLayouts: [mod_");
+    expect(code).toContain("interceptLayouts: intercept.interceptLayouts");
+    expect(code).toContain("layoutModules: opts.interceptLayouts || null");
+  });
+
   it("generated code delegates page boundary rendering to typed helpers", () => {
     const code = generateRscEntry("/tmp/test/app", minimalRoutes);
     expect(code).toContain("renderAppPageErrorBoundary as __renderAppPageErrorBoundary");
@@ -4089,6 +4504,24 @@ describe("generateRscEntry ISR code generation", () => {
     );
     expect(code).toContain("return __renderAppPageHttpAccessFallback({");
     expect(code).toContain("return __renderAppPageErrorBoundary({");
+  });
+
+  it("generated code threads middleware headers into page boundary and special-error responses", () => {
+    const code = generateRscEntry("/tmp/test/app", minimalRoutes);
+
+    expect(code).toContain("const __APP_PAGE_EMPTY_MW_CTX = { headers: null, status: null };");
+    expect(code).toContain("middlewareContext: middlewareContext ?? __APP_PAGE_EMPTY_MW_CTX");
+    expect(code).toContain("middlewareContext: _mwCtx");
+    expect(code).toContain("__mergeMiddlewareResponseHeaders(notFoundHeaders, _mwCtx.headers)");
+
+    const specialErrorStart = code.indexOf("renderSpecialError(__buildSpecialError)");
+    const specialErrorEnd = code.indexOf("resolveSpecialError:", specialErrorStart);
+    const specialErrorBody = code.slice(specialErrorStart, specialErrorEnd);
+    expect(specialErrorBody).toContain("middlewareContext: _mwCtx");
+    expect(specialErrorBody).toContain(
+      "additive headers like Set-Cookie and Vary are not duplicated.",
+    );
+    expect(specialErrorBody).toContain("null,");
   });
 
   it("generated code delegates page cache HIT handling to a typed helper", () => {
@@ -4231,6 +4664,13 @@ describe("generateRscEntry ISR code generation", () => {
     const actionCatchIdx = code.indexOf("} catch (err)", actionHeadersIdx);
     const actionResponseBody = code.slice(actionHeadersIdx, actionCatchIdx);
     expect(actionResponseBody).toContain("mergeMiddlewareResponseHeaders");
+  });
+
+  it("generated code accepts both vinext and Next.js action header names", () => {
+    const code = generateRscEntry("/tmp/test/app", minimalRoutes);
+    expect(code).toContain(
+      'request.headers.get("x-rsc-action") ?? request.headers.get("next-action")',
+    );
   });
 
   it("generated code merges middleware headers into server action redirect responses", () => {

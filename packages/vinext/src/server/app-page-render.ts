@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import type { CachedAppPageValue } from "../shims/cache.js";
+import { buildOutgoingAppPayload, type AppOutgoingElements } from "./app-elements.js";
 import {
   finalizeAppPageHtmlCacheResponse,
   scheduleAppPageRscCacheWrite,
@@ -10,6 +11,7 @@ import {
   teeAppPageRscStreamForCapture,
   type AppPageFontPreload,
   type AppPageSpecialError,
+  type LayoutClassificationOptions,
 } from "./app-page-execution.js";
 import { probeAppPageBeforeRender } from "./app-page-probe.js";
 import {
@@ -47,7 +49,7 @@ type AppPageRequestCacheLife = {
   revalidate?: number;
 };
 
-export type RenderAppPageLifecycleOptions = {
+type RenderAppPageLifecycleOptions = {
   cleanPathname: string;
   clearRequestContext: () => void;
   consumeDynamicUsage: () => boolean;
@@ -68,7 +70,7 @@ export type RenderAppPageLifecycleOptions = {
   isRscRequest: boolean;
   isrDebug?: AppPageDebugLogger;
   isrHtmlKey: (pathname: string) => string;
-  isrRscKey: (pathname: string) => string;
+  isrRscKey: (pathname: string, mountedSlotsHeader?: string | null) => string;
   isrSet: AppPageCacheSetter;
   layoutCount: number;
   loadSsrHandler: () => Promise<AppPageSsrHandler>;
@@ -84,15 +86,17 @@ export type RenderAppPageLifecycleOptions = {
   ) => Promise<Response>;
   renderPageSpecialError: (specialError: AppPageSpecialError) => Promise<Response>;
   renderToReadableStream: (
-    element: ReactNode | Record<string, ReactNode>,
+    element: ReactNode | AppOutgoingElements,
     options: { onError: AppPageBoundaryOnError },
   ) => ReadableStream<Uint8Array>;
   routeHasLocalBoundary: boolean;
   routePattern: string;
   runWithSuppressedHookWarning<T>(probe: () => Promise<T>): Promise<T>;
   scriptNonce?: string;
+  mountedSlotsHeader?: string | null;
   waitUntil?: (promise: Promise<void>) => void;
-  element: ReactNode | Record<string, ReactNode>;
+  element: ReactNode | Readonly<Record<string, ReactNode>>;
+  classification?: LayoutClassificationOptions | null;
 };
 
 function buildResponseTiming(
@@ -117,7 +121,7 @@ function buildResponseTiming(
 export async function renderAppPageLifecycle(
   options: RenderAppPageLifecycleOptions,
 ): Promise<Response> {
-  const preRenderResponse = await probeAppPageBeforeRender({
+  const preRenderResult = await probeAppPageBeforeRender({
     hasLoadingBoundary: options.hasLoadingBoundary,
     layoutCount: options.layoutCount,
     probeLayoutAt(layoutIndex) {
@@ -136,15 +140,26 @@ export async function renderAppPageLifecycle(
     runWithSuppressedHookWarning(probe) {
       return options.runWithSuppressedHookWarning(probe);
     },
+    classification: options.classification,
   });
-  if (preRenderResponse) {
-    return preRenderResponse;
+  if (preRenderResult.response) {
+    return preRenderResult.response;
   }
+
+  const layoutFlags = preRenderResult.layoutFlags;
+
+  // Render the CANONICAL element. The outgoing payload carries per-layout
+  // static/dynamic flags under `__layoutFlags` so the client can later tell
+  // which layouts are safe to skip on subsequent navigations.
+  const outgoingElement = buildOutgoingAppPayload({
+    element: options.element,
+    layoutFlags,
+  });
 
   const compileEnd = options.isProduction ? undefined : performance.now();
   const baseOnError = options.createRscOnErrorHandler(options.cleanPathname, options.routePattern);
   const rscErrorTracker = createAppPageRscErrorTracker(baseOnError);
-  const rscStream = options.renderToReadableStream(options.element, {
+  const rscStream = options.renderToReadableStream(outgoingElement, {
     onError: rscErrorTracker.onRenderError,
   });
 
@@ -172,6 +187,7 @@ export async function renderAppPageLifecycle(
     });
     const rscResponse = buildAppPageRscResponse(rscForResponse, {
       middlewareContext: options.middlewareContext,
+      mountedSlotsHeader: options.mountedSlotsHeader,
       params: options.params,
       policy: rscResponsePolicy,
       timing: buildResponseTiming({
@@ -193,6 +209,7 @@ export async function renderAppPageLifecycle(
       isrDebug: options.isrDebug,
       isrRscKey: options.isrRscKey,
       isrSet: options.isrSet,
+      mountedSlotsHeader: options.mountedSlotsHeader,
       revalidateSeconds: revalidateSeconds ?? 0,
       waitUntil(promise) {
         options.waitUntil?.(promise);

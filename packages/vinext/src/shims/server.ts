@@ -12,6 +12,7 @@
 import { encodeMiddlewareRequestHeaders } from "../server/middleware-request-headers.js";
 import { parseCookieHeader } from "./internal/parse-cookie-header.js";
 import { getRequestExecutionContext } from "./request-context.js";
+import { assertSafeNavigationUrl } from "./url-safety.js";
 
 // ---------------------------------------------------------------------------
 // Inlined cache-scope guard for after()
@@ -57,6 +58,7 @@ function _throwIfInsideCacheScope(apiName: string): void {
 
 export class NextRequest extends Request {
   private _nextUrl: NextURL;
+  private _url: string;
   private _cookies: RequestCookies;
 
   constructor(
@@ -96,11 +98,18 @@ export class NextRequest extends Request {
       ? { basePath: _nextConfig.basePath, nextConfig: { i18n: _nextConfig.i18n } }
       : undefined;
     this._nextUrl = new NextURL(url, undefined, urlConfig);
+    this._url = process.env.__NEXT_NO_MIDDLEWARE_URL_NORMALIZE
+      ? url.toString()
+      : this._nextUrl.toString();
     this._cookies = new RequestCookies(this.headers);
   }
 
   get nextUrl(): NextURL {
     return this._nextUrl;
+  }
+
+  get url(): string {
+    return this._url;
   }
 
   get cookies(): RequestCookies {
@@ -164,6 +173,20 @@ export class NextRequest extends Request {
 /** Valid HTTP redirect status codes, matching Next.js's REDIRECTS set. */
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
+function validateURL(url: string | URL): string {
+  assertSafeNavigationUrl(String(url));
+  try {
+    return String(new URL(String(url)));
+  } catch (error) {
+    throw new Error(
+      `URL is malformed "${String(
+        url,
+      )}". Please use only absolute URLs - https://nextjs.org/docs/messages/middleware-relative-urls`,
+      { cause: error },
+    );
+  }
+}
+
 export class NextResponse<_Body = unknown> extends Response {
   private _cookies: ResponseCookies;
 
@@ -198,9 +221,8 @@ export class NextResponse<_Body = unknown> extends Response {
     if (!REDIRECT_STATUSES.has(status)) {
       throw new RangeError(`Failed to execute "redirect" on "response": Invalid status code`);
     }
-    const destination = typeof url === "string" ? url : url.toString();
     const headers = new Headers(typeof init === "object" ? init?.headers : undefined);
-    headers.set("Location", destination);
+    headers.set("Location", validateURL(url));
     return new NextResponse(null, { status, headers });
   }
 
@@ -209,9 +231,8 @@ export class NextResponse<_Body = unknown> extends Response {
    * Sets the x-middleware-rewrite header.
    */
   static rewrite(destination: string | URL, init?: MiddlewareResponseInit): NextResponse {
-    const url = typeof destination === "string" ? destination : destination.toString();
     const headers = new Headers(init?.headers);
-    headers.set("x-middleware-rewrite", url);
+    headers.set("x-middleware-rewrite", validateURL(destination));
     if (init?.request?.headers) {
       encodeMiddlewareRequestHeaders(headers, init.request.headers);
     }

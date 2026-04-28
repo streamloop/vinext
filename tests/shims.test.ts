@@ -5,6 +5,11 @@ import { isExternalUrl, isHashOnlyChange } from "../packages/vinext/src/shims/ro
 import { isValidModulePath } from "../packages/vinext/src/client/validate-module-path.js";
 import vinext from "../packages/vinext/src/index.js";
 import type { Plugin } from "vite-plus";
+import type {
+  CacheHandler,
+  CacheHandlerValue,
+  IncrementalCacheValue,
+} from "../packages/vinext/src/shims/cache.js";
 
 const FIXTURE_DIR = PAGES_FIXTURE_DIR;
 
@@ -41,6 +46,92 @@ describe("next/navigation shim", () => {
     expect(typeof router.forward).toBe("function");
     expect(typeof router.refresh).toBe("function");
     expect(typeof router.prefetch).toBe("function");
+  });
+
+  it("keeps pending render snapshot active when external history.pushState syncs the URL", async () => {
+    const previousWindow = (globalThis as any).window;
+    const win = {
+      location: {
+        pathname: "/current",
+        search: "?from=committed",
+        hash: "",
+        href: "http://localhost/current?from=committed",
+        origin: "http://localhost",
+      },
+      history: {
+        state: null,
+        pushState(_data: unknown, _unused: string, url?: string | URL | null) {
+          if (!url) return;
+          const parsed = new URL(url, win.location.href);
+          win.location.pathname = parsed.pathname;
+          win.location.search = parsed.search;
+          win.location.hash = parsed.hash;
+          win.location.href = parsed.href;
+        },
+        replaceState(_data: unknown, _unused: string, url?: string | URL | null) {
+          if (!url) return;
+          const parsed = new URL(url, win.location.href);
+          win.location.pathname = parsed.pathname;
+          win.location.search = parsed.search;
+          win.location.hash = parsed.hash;
+          win.location.href = parsed.href;
+        },
+      },
+      addEventListener: vi.fn(),
+    };
+    (globalThis as any).window = win;
+
+    try {
+      vi.resetModules();
+      const React = await import("react");
+      const { renderToStaticMarkup } = await import("react-dom/server");
+      const navigation = await import("../packages/vinext/src/shims/navigation.js");
+      const Context = navigation.getClientNavigationRenderContext();
+      if (!Context) {
+        throw new Error("Expected client navigation render context");
+      }
+
+      navigation.activateNavigationSnapshot();
+      const snapshot = navigation.createClientNavigationRenderSnapshot(
+        "http://localhost/pending?from=snapshot",
+        {},
+      );
+
+      const readHookValues = () => {
+        let pathname = "";
+        let search = "";
+        function Probe() {
+          pathname = navigation.usePathname();
+          search = navigation.useSearchParams().toString();
+          return React.createElement("span", null, pathname);
+        }
+
+        renderToStaticMarkup(
+          React.createElement(Context.Provider, { value: snapshot }, React.createElement(Probe)),
+        );
+
+        return { pathname, search };
+      };
+
+      expect(readHookValues()).toEqual({
+        pathname: "/pending",
+        search: "from=snapshot",
+      });
+
+      win.history.pushState(null, "", "/ownerless?from=history");
+
+      expect(readHookValues()).toEqual({
+        pathname: "/pending",
+        search: "from=snapshot",
+      });
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+    }
   });
 
   it("exports redirect, notFound, permanentRedirect", async () => {
@@ -227,6 +318,90 @@ describe("next/navigation shim", () => {
     const params = useParams();
     expect(params).toEqual({ slug: "test" });
     setNavigationContext(null);
+  });
+
+  it("shares the hydrated navigation snapshot across browser module instances", async () => {
+    // Next.js derives usePathname/useSearchParams from PathnameContext in
+    // packages/next/src/client/components/app-router.tsx, so hydration does
+    // not have a per-module fallback to "/" for the first client snapshot.
+    const React = await import("react");
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const previousWindow = globalThis.window;
+    const accessorsKey = Symbol.for("vinext.navigation.globalAccessors");
+    const hydrationKey = Symbol.for("vinext.navigation.clientHydrationContext");
+    const globalRecord = globalThis as Record<PropertyKey, unknown>;
+    const previousAccessors = globalRecord[accessorsKey];
+    const previousHydration = globalRecord[hydrationKey];
+
+    try {
+      delete globalRecord[accessorsKey];
+      delete globalRecord[hydrationKey];
+      (globalThis as any).window = {
+        addEventListener() {},
+        dispatchEvent() {
+          return true;
+        },
+        history: {
+          pushState() {},
+          replaceState() {},
+        },
+        location: {
+          href: "http://localhost/split-hydration?q=hello",
+          origin: "http://localhost",
+          pathname: "/split-hydration",
+          search: "?q=hello",
+        },
+        removeEventListener() {},
+      };
+
+      const setterPath = "../packages/vinext/src/shims/navigation.js?hydration-setter=issue-871";
+      const hookPath = "../packages/vinext/src/shims/navigation.js?hydration-hook=issue-871";
+      const setterMod = (await import(
+        setterPath
+      )) as typeof import("../packages/vinext/src/shims/navigation.js");
+      const hookMod = (await import(
+        hookPath
+      )) as typeof import("../packages/vinext/src/shims/navigation.js");
+
+      setterMod.setNavigationContext({
+        pathname: "/split-hydration",
+        searchParams: new URLSearchParams("q=hello"),
+        params: { slug: "hello" },
+      });
+
+      function Probe() {
+        const pathname = hookMod.usePathname();
+        const searchParams = hookMod.useSearchParams();
+        const params = hookMod.useParams<{ slug: string }>();
+        return React.createElement(
+          "span",
+          null,
+          `${pathname}|${searchParams.get("q") ?? ""}|${params.slug ?? ""}`,
+        );
+      }
+
+      expect(renderToStaticMarkup(React.createElement(Probe))).toBe(
+        "<span>/split-hydration|hello|hello</span>",
+      );
+
+      setterMod.setNavigationContext(null);
+    } finally {
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+      if (previousAccessors === undefined) {
+        delete globalRecord[accessorsKey];
+      } else {
+        globalRecord[accessorsKey] = previousAccessors;
+      }
+      if (previousHydration === undefined) {
+        delete globalRecord[hydrationKey];
+      } else {
+        globalRecord[hydrationKey] = previousHydration;
+      }
+    }
   });
 
   it("setClientParams provides referential stability for identical params", async () => {
@@ -1255,11 +1430,27 @@ describe("next/server shim", () => {
     expect(res.headers.get("Location")).toBe("https://example.com/new");
   });
 
+  // Ported from Next.js: test/e2e/middleware-general/test/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/middleware-general/test/index.test.ts
+  it("NextResponse.redirect() throws when using a relative URL", async () => {
+    const { NextResponse } = await import("../packages/vinext/src/shims/server.js");
+
+    expect(() => NextResponse.redirect("/urls-b")).toThrow("URL is malformed");
+  });
+
   it("NextResponse.rewrite() sets x-middleware-rewrite header", async () => {
     const { NextResponse } = await import("../packages/vinext/src/shims/server.js");
     const res = NextResponse.rewrite("https://example.com/internal");
 
     expect(res.headers.get("x-middleware-rewrite")).toBe("https://example.com/internal");
+  });
+
+  // Ported from Next.js: test/e2e/middleware-general/test/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/middleware-general/test/index.test.ts
+  it("NextResponse.rewrite() throws when using a relative URL", async () => {
+    const { NextResponse } = await import("../packages/vinext/src/shims/server.js");
+
+    expect(() => NextResponse.rewrite("/urls-b")).toThrow("URL is malformed");
   });
 
   it("NextResponse.rewrite() forwards request header overrides", async () => {
@@ -1820,6 +2011,140 @@ describe("next/cache shim", () => {
     setCacheHandler(new MemoryCacheHandler());
   });
 
+  it("unstable_cache serves stale entries and refreshes them in the background during App Router requests", async () => {
+    const { unstable_cache, setCacheHandler, MemoryCacheHandler } =
+      await import("../packages/vinext/src/shims/cache.js");
+    const { createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
+
+    const waitUntilPromises: Promise<unknown>[] = [];
+    const setBodies: string[] = [];
+    let callCount = 0;
+
+    const handler: CacheHandler = {
+      async get(): Promise<CacheHandlerValue> {
+        return {
+          lastModified: Date.now() - 2_000,
+          cacheState: "stale",
+          value: {
+            kind: "FETCH",
+            data: {
+              headers: {},
+              body: JSON.stringify({ v: "stale-value" }),
+              url: "unstable_cache:stale-swr-test:[]",
+            },
+            tags: ["stale-swr"],
+            revalidate: 1,
+          },
+        };
+      },
+      async set(_key: string, data: IncrementalCacheValue | null) {
+        if (data?.kind === "FETCH") {
+          setBodies.push(data.data.body);
+        }
+      },
+      async revalidateTag(_tags: string | string[]) {},
+    };
+
+    setCacheHandler(handler);
+
+    const cached = unstable_cache(
+      async () => {
+        callCount++;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return "fresh-value";
+      },
+      ["stale-swr-test"],
+      { tags: ["stale-swr"], revalidate: 1 },
+    );
+
+    // Matches Next.js App Router semantics: stale entries schedule a
+    // pending revalidate and return the stale response immediately.
+    // Source: https://github.com/vercel/next.js/blob/canary/packages/next/src/server/web/spec-extension/unstable-cache.ts
+    const requestContext = createRequestContext({
+      unstableCacheRevalidation: "background",
+      executionContext: {
+        waitUntil(promise) {
+          waitUntilPromises.push(promise);
+        },
+      },
+    });
+
+    try {
+      const result = await Promise.race([
+        runWithRequestContext(requestContext, () => cached()),
+        new Promise((resolve) => setTimeout(() => resolve("blocked"), 10)),
+      ]);
+
+      expect(result).toBe("stale-value");
+      expect(callCount).toBe(1);
+      expect(waitUntilPromises).toHaveLength(1);
+      expect(setBodies).toEqual([]);
+
+      await Promise.all(waitUntilPromises);
+
+      expect(setBodies).toEqual([JSON.stringify({ v: "fresh-value" })]);
+    } finally {
+      setCacheHandler(new MemoryCacheHandler());
+    }
+  });
+
+  it("unstable_cache blocks on stale entries inside revalidation scopes", async () => {
+    const { unstable_cache, setCacheHandler, MemoryCacheHandler } =
+      await import("../packages/vinext/src/shims/cache.js");
+    const { createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
+
+    let callCount = 0;
+    const handler: CacheHandler = {
+      async get(): Promise<CacheHandlerValue> {
+        return {
+          lastModified: Date.now() - 2_000,
+          cacheState: "stale",
+          value: {
+            kind: "FETCH",
+            data: {
+              headers: {},
+              body: JSON.stringify({ v: "stale-value" }),
+              url: "unstable_cache:foreground-test:[]",
+            },
+            tags: ["foreground"],
+            revalidate: 1,
+          },
+        };
+      },
+      async set() {},
+      async revalidateTag(_tags: string | string[]) {},
+    };
+
+    setCacheHandler(handler);
+
+    const cached = unstable_cache(
+      async () => {
+        callCount++;
+        return "fresh-value";
+      },
+      ["foreground-test"],
+      { tags: ["foreground"], revalidate: 1 },
+    );
+
+    // Next.js foreground-revalidates stale unstable_cache entries while
+    // regenerating a static/ISR page so the regenerated page stores fresh data.
+    // Source test: https://github.com/vercel/next.js/blob/canary/test/production/app-dir/unstable-cache-foreground-revalidate/unstable-cache-foreground-revalidate.test.ts
+    const requestContext = createRequestContext({
+      unstableCacheRevalidation: "foreground",
+    });
+
+    try {
+      await expect(runWithRequestContext(requestContext, () => cached())).resolves.toBe(
+        "fresh-value",
+      );
+      expect(callCount).toBe(1);
+    } finally {
+      setCacheHandler(new MemoryCacheHandler());
+    }
+  });
+
   it("unstable_cache with no revalidate option caches indefinitely", async () => {
     const { unstable_cache, setCacheHandler, MemoryCacheHandler } =
       await import("../packages/vinext/src/shims/cache.js");
@@ -1890,6 +2215,43 @@ describe('"use cache" runtime', () => {
     const r3 = await cached(7);
     expect(r3).toEqual({ result: 14 });
     expect(callCount).toBe(2);
+  });
+
+  it("scopes shared cache entries by build ID", async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const { setCacheHandler, MemoryCacheHandler } =
+      await import("../packages/vinext/src/shims/cache.js");
+    setCacheHandler(new MemoryCacheHandler());
+
+    const previousBuildId = process.env.__VINEXT_BUILD_ID;
+    try {
+      let callCount = 0;
+
+      process.env.__VINEXT_BUILD_ID = "build-one";
+      const firstBuild = registerCachedFunction(async () => {
+        callCount++;
+        return { version: "old" };
+      }, "test:same-id");
+
+      expect(await firstBuild()).toEqual({ version: "old" });
+      expect(callCount).toBe(1);
+
+      process.env.__VINEXT_BUILD_ID = "build-two";
+      const secondBuild = registerCachedFunction(async () => {
+        callCount++;
+        return { version: "new" };
+      }, "test:same-id");
+
+      expect(await secondBuild()).toEqual({ version: "new" });
+      expect(callCount).toBe(2);
+    } finally {
+      if (previousBuildId === undefined) {
+        delete process.env.__VINEXT_BUILD_ID;
+      } else {
+        process.env.__VINEXT_BUILD_ID = previousBuildId;
+      }
+    }
   });
 
   it("registerCachedFunction respects cacheLife inside cached function", async () => {
@@ -3496,7 +3858,9 @@ describe("double-encoded path handling in middleware", () => {
     // (the RSC handler is the single decode point)
     expect(entryCode).not.toMatch(/normalizedRequest\s*=\s*new Request\(normalizedUrl/);
     // It should still validate malformed encoding (return 400)
-    expect(entryCode).toContain("decodeURIComponent(rawPathname)");
+    expect(entryCode).toMatch(
+      /decodeURIComponent\(\s*(?:raw)?[pP]athname|decodeURIComponent\(url\.pathname\)/,
+    );
     // The delegate call should pass the original request object through,
     // without reconstructing a normalized Request before delegation.
     expect(entryCode).toMatch(/rscHandler\(request(?:,\s*ctx)?\)/);
@@ -4865,6 +5229,42 @@ describe("NextURL basePath and locale properties", () => {
     expect(req.nextUrl.href).toBe("http://localhost/app/fr/dashboard");
   });
 
+  it("NextRequest.url reflects the normalized nextUrl href", async () => {
+    const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
+    const req = new NextRequest("http://localhost/fr/dashboard?tab=settings", {
+      nextConfig: {
+        basePath: "/app",
+        i18n: { locales: ["en", "fr"], defaultLocale: "en" },
+      },
+    });
+
+    expect(req.nextUrl.href).toBe("http://localhost/app/fr/dashboard?tab=settings");
+    expect(req.url).toBe(req.nextUrl.href);
+  });
+
+  it("NextRequest.url preserves raw input when middleware URL normalization is disabled", async () => {
+    const previous = process.env.__NEXT_NO_MIDDLEWARE_URL_NORMALIZE;
+    process.env.__NEXT_NO_MIDDLEWARE_URL_NORMALIZE = "1";
+    try {
+      const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
+      const req = new NextRequest("http://localhost/fr/dashboard?tab=settings", {
+        nextConfig: {
+          basePath: "/app",
+          i18n: { locales: ["en", "fr"], defaultLocale: "en" },
+        },
+      });
+
+      expect(req.nextUrl.href).toBe("http://localhost/app/fr/dashboard?tab=settings");
+      expect(req.url).toBe("http://localhost/fr/dashboard?tab=settings");
+    } finally {
+      if (previous === undefined) {
+        delete process.env.__NEXT_NO_MIDDLEWARE_URL_NORMALIZE;
+      } else {
+        process.env.__NEXT_NO_MIDDLEWARE_URL_NORMALIZE = previous;
+      }
+    }
+  });
+
   it("NextRequest passes config when input is a Request object", async () => {
     const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
     const raw = new Request("http://localhost/app/fr/dashboard");
@@ -4878,6 +5278,20 @@ describe("NextURL basePath and locale properties", () => {
     expect(req.nextUrl.locale).toBe("fr");
     expect(req.nextUrl.pathname).toBe("/dashboard");
     expect(req.nextUrl.href).toBe("http://localhost/app/fr/dashboard");
+  });
+
+  it("NextRequest.url normalizes Request input through nextUrl", async () => {
+    const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
+    const raw = new Request("http://localhost/fr/dashboard?tab=settings");
+    const req = new NextRequest(raw, {
+      nextConfig: {
+        basePath: "/app",
+        i18n: { locales: ["en", "fr"], defaultLocale: "en" },
+      },
+    });
+
+    expect(req.nextUrl.href).toBe("http://localhost/app/fr/dashboard?tab=settings");
+    expect(req.url).toBe(req.nextUrl.href);
   });
 });
 
@@ -5031,6 +5445,66 @@ describe("middleware request header overrides", () => {
       expect(liveCookies.getAll()).toEqual([]);
     });
   });
+
+  it("next/headers applyMiddlewareRequestHeaders invalidates headers() snapshot taken before the override", async () => {
+    // Regression: a middleware that reads `headers()` (or `cookies()`) before
+    // applying a request-header override would prime a sealed read-only
+    // snapshot built from the *pre*-override request. Discovered with
+    // @clerk/nextjs whose `clerkClient()` reads `headers()` via
+    // `buildRequestLike()` during middleware execution; before the fix, the
+    // Server Component subsequently received the stale snapshot and saw the
+    // pre-override credentials and missing middleware-injected headers.
+    const {
+      applyMiddlewareRequestHeaders,
+      cookies,
+      headers,
+      headersContextFromRequest,
+      runWithHeadersContext,
+    } = await import("../packages/vinext/src/shims/headers.js");
+
+    const request = new Request("http://localhost/test", {
+      headers: {
+        authorization: "Bearer secret",
+        cookie: "a=1; b=2",
+        "x-keep": "original",
+      },
+    });
+
+    await runWithHeadersContext(headersContextFromRequest(request), async () => {
+      // 1. Prime the sealed snapshot — this is exactly what
+      //    `clerkMiddleware()` does internally via `buildRequestLike()`.
+      const preHeaders = await headers();
+      const preCookies = await cookies();
+      expect(preHeaders.get("authorization")).toBe("Bearer secret");
+      expect(preHeaders.get("x-keep")).toBe("original");
+      expect(preCookies.getAll()).toEqual([
+        { name: "a", value: "1" },
+        { name: "b", value: "2" },
+      ]);
+
+      // 2. Apply the override — drops `authorization`/`cookie`, adds `x-added`,
+      //    and updates `x-keep`.
+      applyMiddlewareRequestHeaders(
+        new Headers({
+          "x-middleware-override-headers": "x-keep,x-added",
+          "x-middleware-request-x-keep": "updated",
+          "x-middleware-request-x-added": "1",
+        }),
+      );
+
+      // 3. A subsequent `headers()` call — for example from the Server
+      //    Component's render — must observe the override, not the snapshot
+      //    captured in step 1.
+      const postHeaders = await headers();
+      const postCookies = await cookies();
+
+      expect(postHeaders.get("authorization")).toBeNull();
+      expect(postHeaders.get("cookie")).toBeNull();
+      expect(postHeaders.get("x-keep")).toBe("updated");
+      expect(postHeaders.get("x-added")).toBe("1");
+      expect(postCookies.getAll()).toEqual([]);
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -5047,7 +5521,8 @@ describe("NextResponse.redirect() status codes", () => {
     const { NextResponse } = await import("../packages/vinext/src/shims/server.js");
     const res = NextResponse.redirect("https://example.com", 301);
     expect(res.status).toBe(301);
-    expect(res.headers.get("Location")).toBe("https://example.com");
+    // validateURL() normalizes via `new URL()`, adding a trailing slash for origin-only URLs.
+    expect(res.headers.get("Location")).toBe("https://example.com/");
   });
 
   it("supports 302 Found", async () => {
@@ -5100,32 +5575,32 @@ describe("NextResponse.redirect() status codes", () => {
 
 describe("matchConfigPattern", () => {
   it("matches exact paths", async () => {
-    const { matchConfigPattern } = await import("../packages/vinext/src/index.js");
+    const { matchConfigPattern } = await import("../packages/vinext/src/config/config-matchers.js");
     expect(matchConfigPattern("/about", "/about")).toEqual({});
     expect(matchConfigPattern("/", "/")).toEqual({});
     expect(matchConfigPattern("/about", "/other")).toBeNull();
   });
 
   it("matches single :param segments", async () => {
-    const { matchConfigPattern } = await import("../packages/vinext/src/index.js");
+    const { matchConfigPattern } = await import("../packages/vinext/src/config/config-matchers.js");
     const result = matchConfigPattern("/blog/hello-world", "/blog/:slug");
     expect(result).toEqual({ slug: "hello-world" });
   });
 
   it("matches multiple :param segments", async () => {
-    const { matchConfigPattern } = await import("../packages/vinext/src/index.js");
+    const { matchConfigPattern } = await import("../packages/vinext/src/config/config-matchers.js");
     const result = matchConfigPattern("/blog/2024/my-post", "/blog/:year/:slug");
     expect(result).toEqual({ year: "2024", slug: "my-post" });
   });
 
   it("rejects when segment count differs for non-wildcard patterns", async () => {
-    const { matchConfigPattern } = await import("../packages/vinext/src/index.js");
+    const { matchConfigPattern } = await import("../packages/vinext/src/config/config-matchers.js");
     expect(matchConfigPattern("/blog/a/b", "/blog/:slug")).toBeNull();
     expect(matchConfigPattern("/blog", "/blog/:slug")).toBeNull();
   });
 
   it("matches :path* catch-all (zero or more segments)", async () => {
-    const { matchConfigPattern } = await import("../packages/vinext/src/index.js");
+    const { matchConfigPattern } = await import("../packages/vinext/src/config/config-matchers.js");
     // Zero segments
     expect(matchConfigPattern("/docs", "/docs/:path*")).toEqual({ path: "" });
     // One segment
@@ -5137,7 +5612,7 @@ describe("matchConfigPattern", () => {
   });
 
   it("matches :path+ catch-all (one or more segments)", async () => {
-    const { matchConfigPattern } = await import("../packages/vinext/src/index.js");
+    const { matchConfigPattern } = await import("../packages/vinext/src/config/config-matchers.js");
     // One segment
     expect(matchConfigPattern("/api/users", "/api/:path+")).toEqual({ path: "users" });
     // Multiple segments
@@ -5147,7 +5622,7 @@ describe("matchConfigPattern", () => {
   });
 
   it("matches regex group patterns", async () => {
-    const { matchConfigPattern } = await import("../packages/vinext/src/index.js");
+    const { matchConfigPattern } = await import("../packages/vinext/src/config/config-matchers.js");
     // Common Next.js pattern: /:path(\\d+) for numeric paths
     const result = matchConfigPattern("/123", "/:id(\\d+)");
     if (result) {
@@ -5158,14 +5633,14 @@ describe("matchConfigPattern", () => {
   });
 
   it("handles dots in patterns", async () => {
-    const { matchConfigPattern } = await import("../packages/vinext/src/index.js");
+    const { matchConfigPattern } = await import("../packages/vinext/src/config/config-matchers.js");
     expect(matchConfigPattern("/feed.xml", "/feed.xml")).toEqual({});
     // Dot should not match any character
     expect(matchConfigPattern("/feedXxml", "/feed.xml")).toBeNull();
   });
 
   it("matches :path* with literal suffix (e.g. /:path*.md)", async () => {
-    const { matchConfigPattern } = await import("../packages/vinext/src/index.js");
+    const { matchConfigPattern } = await import("../packages/vinext/src/config/config-matchers.js");
     // Should match URLs ending in .md
     expect(matchConfigPattern("/article.md", "/:path*.md")).toEqual({ path: "article" });
     expect(matchConfigPattern("/news/my-article.md", "/:path*.md")).toEqual({
@@ -5182,7 +5657,7 @@ describe("matchConfigPattern", () => {
   });
 
   it("matches :path+ with literal suffix (e.g. /:path+.json)", async () => {
-    const { matchConfigPattern } = await import("../packages/vinext/src/index.js");
+    const { matchConfigPattern } = await import("../packages/vinext/src/config/config-matchers.js");
     // Should match URLs ending in .json with at least one path segment
     expect(matchConfigPattern("/data.json", "/:path+.json")).toEqual({ path: "data" });
     expect(matchConfigPattern("/api/users.json", "/:path+.json")).toEqual({ path: "api/users" });
@@ -5194,7 +5669,7 @@ describe("matchConfigPattern", () => {
   });
 
   it("matches :path* with prefix and suffix (e.g. /docs/:path*.md)", async () => {
-    const { matchConfigPattern } = await import("../packages/vinext/src/index.js");
+    const { matchConfigPattern } = await import("../packages/vinext/src/config/config-matchers.js");
     expect(matchConfigPattern("/docs/intro.md", "/docs/:path*.md")).toEqual({ path: "intro" });
     expect(matchConfigPattern("/docs/guide/getting-started.md", "/docs/:path*.md")).toEqual({
       path: "guide/getting-started",
@@ -5206,7 +5681,7 @@ describe("matchConfigPattern", () => {
   });
 
   it("matches :param with literal suffix (e.g. /:slug.md)", async () => {
-    const { matchConfigPattern } = await import("../packages/vinext/src/index.js");
+    const { matchConfigPattern } = await import("../packages/vinext/src/config/config-matchers.js");
     // Should match URLs with the .md suffix and extract the param
     expect(matchConfigPattern("/hello-world.md", "/:slug.md")).toEqual({ slug: "hello-world" });
     expect(matchConfigPattern("/my-post.md", "/:slug.md")).toEqual({ slug: "my-post" });
@@ -5226,7 +5701,7 @@ describe("matchConfigPattern", () => {
   });
 
   it("still matches plain :path* catch-all (no suffix) correctly", async () => {
-    const { matchConfigPattern } = await import("../packages/vinext/src/index.js");
+    const { matchConfigPattern } = await import("../packages/vinext/src/config/config-matchers.js");
     // Ensure the fix doesn't regress existing catch-all behavior
     expect(matchConfigPattern("/docs", "/docs/:path*")).toEqual({ path: "" });
     expect(matchConfigPattern("/docs/intro", "/docs/:path*")).toEqual({ path: "intro" });
@@ -5240,7 +5715,7 @@ describe("matchConfigPattern", () => {
   // passed without checking for a segment boundary after the prefix.
   // https://github.com/cloudflare/vinext/pull/368
   it("regression: does not overmatch catch-all when pathname shares a prefix but not a segment boundary", async () => {
-    const { matchConfigPattern } = await import("../packages/vinext/src/index.js");
+    const { matchConfigPattern } = await import("../packages/vinext/src/config/config-matchers.js");
     // Core regression case: /foobar must NOT match /foo/:path*
     expect(matchConfigPattern("/foobar", "/foo/:path*")).toBeNull();
     // Similarly for :path+
@@ -12150,5 +12625,81 @@ describe("checkHasConditions value anchoring", () => {
       ctx,
     );
     expect(result).toBe(true);
+  });
+});
+
+// ── CSRF origin wildcard matching ─────────────────────────────────────────
+// Ported from Next.js: packages/next/src/server/app-render/csrf-protection.test.ts
+// https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/csrf-protection.test.ts
+
+describe("isOriginAllowed", () => {
+  let isOriginAllowed: (origin: string, allowed: string[]) => boolean;
+
+  beforeEach(async () => {
+    const mod = await import("../packages/vinext/src/server/request-pipeline.js");
+    isOriginAllowed = mod.isOriginAllowed;
+  });
+
+  it("exact match", () => {
+    expect(isOriginAllowed("vercel.com", ["vercel.com"])).toBe(true);
+    expect(isOriginAllowed("www.vercel.com", ["www.vercel.com"])).toBe(true);
+  });
+
+  it("single-level wildcard matches one subdomain", () => {
+    expect(isOriginAllowed("asdf.vercel.com", ["*.vercel.com"])).toBe(true);
+  });
+
+  it("single-level wildcard does NOT match multiple subdomains", () => {
+    expect(isOriginAllowed("asdf.jkl.vercel.com", ["*.vercel.com"])).toBe(false);
+  });
+
+  it("double wildcard matches one or more subdomains", () => {
+    expect(isOriginAllowed("asdf.vercel.com", ["**.vercel.com"])).toBe(true);
+    expect(isOriginAllowed("asdf.jkl.vercel.com", ["**.vercel.com"])).toBe(true);
+  });
+
+  it("does not match different TLD", () => {
+    expect(isOriginAllowed("asdf.vercel.com", ["*.vercel.app"])).toBe(false);
+    expect(isOriginAllowed("asdf.jkl.vercel.app", ["**.vercel.com"])).toBe(false);
+  });
+
+  it("does not match unrelated domain", () => {
+    expect(isOriginAllowed("vercel.com", ["nextjs.org"])).toBe(false);
+  });
+
+  it("returns false for undefined/empty allowed list", () => {
+    expect(isOriginAllowed("vercel.com", [])).toBe(false);
+  });
+
+  it("returns false for empty string pattern", () => {
+    expect(isOriginAllowed("vercel.com", [""])).toBe(false);
+  });
+
+  it("wildcards only match below the domain level", () => {
+    expect(isOriginAllowed("vercel.com", ["*"])).toBe(false);
+    expect(isOriginAllowed("vercel.com", ["**"])).toBe(false);
+  });
+
+  it("matches case-insensitively (RFC 1035)", () => {
+    expect(isOriginAllowed("sub.VERCEL.com", ["*.vercel.com"])).toBe(true);
+    expect(isOriginAllowed("SUB.vercel.COM", ["*.vercel.com"])).toBe(true);
+    expect(isOriginAllowed("VERCEL.COM", ["vercel.com"])).toBe(true);
+    expect(isOriginAllowed("vercel.com", ["VERCEL.COM"])).toBe(true);
+  });
+
+  it("localhost patterns", () => {
+    expect(isOriginAllowed("subdomain.localhost", ["*.localhost"])).toBe(true);
+    expect(isOriginAllowed("localhost", ["*.localhost"])).toBe(false);
+    expect(isOriginAllowed("subdomain.localhost", ["**.localhost"])).toBe(true);
+    expect(isOriginAllowed("a.b.localhost", ["**.localhost"])).toBe(true);
+    expect(isOriginAllowed("localhost", ["**.localhost"])).toBe(false);
+    expect(isOriginAllowed("localhost", ["localhost"])).toBe(true);
+  });
+
+  it("does NOT match attacker-controlled suffix domains", () => {
+    // This was the original vulnerability: endsWith(".example.com") matching
+    // evil.example.com.attacker.com
+    expect(isOriginAllowed("evil.example.com.attacker.com", ["*.example.com"])).toBe(false);
+    expect(isOriginAllowed("evil.example.com.attacker.com", ["**.example.com"])).toBe(false);
   });
 });

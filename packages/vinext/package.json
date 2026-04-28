@@ -60,7 +60,6 @@
     "dev": "vp pack --watch"
   },
   "dependencies": {
-    "@capsizecss/metrics": "catalog:",
     "@unpic/react": "catalog:",
     "@vercel/og": "catalog:",
     "magic-string": "catalog:",

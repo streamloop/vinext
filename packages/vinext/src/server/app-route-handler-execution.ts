@@ -3,6 +3,7 @@ import type { HeadersAccessPhase } from "../shims/headers.js";
 import type { ExecutionContextLike } from "../shims/request-context.js";
 import type { CachedRouteValue } from "../shims/cache.js";
 import {
+  isPossibleAppRouteActionRequest,
   resolveAppRouteHandlerSpecialError,
   shouldApplyAppRouteHandlerRevalidateHeader,
   shouldWriteAppRouteHandlerCache,
@@ -41,7 +42,7 @@ type AppRouteErrorReporter = (
 ) => void;
 export type AppRouteDebugLogger = (event: string, detail: string) => void;
 
-export type RunAppRouteHandlerOptions = {
+type RunAppRouteHandlerOptions = {
   basePath?: string;
   consumeDynamicUsage: AppRouteDynamicUsageFn;
   handlerFn: AppRouteHandlerFunction;
@@ -52,12 +53,12 @@ export type RunAppRouteHandlerOptions = {
   request: Request;
 };
 
-export type RunAppRouteHandlerResult = {
+type RunAppRouteHandlerResult = {
   dynamicUsedInHandler: boolean;
   response: Response;
 };
 
-export type ExecuteAppRouteHandlerOptions = {
+type ExecuteAppRouteHandlerOptions = {
   buildPageCacheTags: (pathname: string, extraTags: string[]) => string[];
   clearRequestContext: () => void;
   cleanPathname: string;
@@ -177,17 +178,27 @@ export async function executeAppRouteHandler(
       options.middlewareContext,
     );
   } catch (error) {
-    options.getAndClearPendingCookies();
-    const specialError = resolveAppRouteHandlerSpecialError(error, options.request.url);
+    const pendingCookies = options.getAndClearPendingCookies();
+    const draftCookie = options.getDraftModeCookieHeader();
+    const specialError = resolveAppRouteHandlerSpecialError(error, options.request.url, {
+      isAction: isPossibleAppRouteActionRequest(options.request),
+    });
     options.clearRequestContext();
 
     if (specialError) {
       if (specialError.kind === "redirect") {
         return applyRouteHandlerMiddlewareContext(
-          new Response(null, {
-            status: specialError.statusCode,
-            headers: { Location: specialError.location },
-          }),
+          finalizeRouteHandlerResponse(
+            new Response(null, {
+              status: specialError.statusCode,
+              headers: { Location: specialError.location },
+            }),
+            {
+              pendingCookies,
+              draftCookie,
+              isHead: options.isAutoHead,
+            },
+          ),
           options.middlewareContext,
         );
       }

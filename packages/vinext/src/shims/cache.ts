@@ -176,6 +176,12 @@ type MemoryEntry = {
   revalidateAt: number | null;
 };
 
+function readStringArrayField(ctx: Record<string, unknown> | undefined, field: string): string[] {
+  const value = ctx?.[field];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
+}
+
 /**
  * Shape of the optional `ctx` argument passed to `CacheHandler.set()`.
  * Covers both the older `{ revalidate: number }` shape and the newer
@@ -204,6 +210,13 @@ export class MemoryCacheHandler implements CacheHandler {
       const revalidatedAt = this.tagRevalidatedAt.get(tag);
       if (revalidatedAt && revalidatedAt >= entry.lastModified) {
         this.store.delete(key);
+        return null;
+      }
+    }
+
+    for (const tag of readStringArrayField(_ctx, "softTags")) {
+      const revalidatedAt = this.tagRevalidatedAt.get(tag);
+      if (revalidatedAt && revalidatedAt >= entry.lastModified) {
         return null;
       }
     }
@@ -430,8 +443,11 @@ export { unstable_noStore as noStore };
 //
 // Uses AsyncLocalStorage for request isolation on concurrent workers.
 // ---------------------------------------------------------------------------
+export type UnstableCacheRevalidationMode = "foreground" | "background";
+
 export type CacheState = {
   requestScopedCacheLife: CacheLifeConfig | null;
+  unstableCacheRevalidation: UnstableCacheRevalidationMode;
 };
 
 const _ALS_KEY = Symbol.for("vinext.cache.als");
@@ -442,6 +458,7 @@ const _cacheAls = (_g[_ALS_KEY] ??=
 
 const _cacheFallbackState = (_g[_FALLBACK_KEY] ??= {
   requestScopedCacheLife: null,
+  unstableCacheRevalidation: "foreground",
 } satisfies CacheState) as CacheState;
 
 function _getCacheState(): CacheState {
@@ -457,14 +474,18 @@ function _getCacheState(): CacheState {
  * on concurrent runtimes.
  * @internal
  */
+export function _runWithCacheState<T>(fn: () => Promise<T>): Promise<T>;
+export function _runWithCacheState<T>(fn: () => T | Promise<T>): T | Promise<T>;
 export function _runWithCacheState<T>(fn: () => T | Promise<T>): T | Promise<T> {
   if (isInsideUnifiedScope()) {
     return runWithUnifiedStateMutation((uCtx) => {
       uCtx.requestScopedCacheLife = null;
+      uCtx.unstableCacheRevalidation = "foreground";
     }, fn);
   }
   const state: CacheState = {
     requestScopedCacheLife: null,
+    unstableCacheRevalidation: "foreground",
   };
   return _cacheAls.run(state, fn);
 }
@@ -657,6 +678,16 @@ function deserializeUnstableCacheResult(body: string): unknown {
   return "undef" in wrapper ? undefined : wrapper.v;
 }
 
+type UnstableCacheReadResult = { ok: true; value: unknown } | { ok: false };
+
+function tryDeserializeUnstableCacheResult(body: string): UnstableCacheReadResult {
+  try {
+    return { ok: true, value: deserializeUnstableCacheResult(body) };
+  } catch {
+    return { ok: false };
+  }
+}
+
 /**
  * Check if the current execution context is inside an unstable_cache() callback.
  * Used by headers(), cookies(), and connection() to throw errors when
@@ -670,6 +701,83 @@ type UnstableCacheOptions = {
   revalidate?: number | false;
   tags?: string[];
 };
+
+const _UNSTABLE_CACHE_PENDING_REVALIDATIONS_KEY = Symbol.for(
+  "vinext.unstableCache.pendingRevalidations",
+);
+
+function getPendingUnstableCacheRevalidations(): Map<string, Promise<void>> {
+  const existing = _g[_UNSTABLE_CACHE_PENDING_REVALIDATIONS_KEY];
+  if (existing instanceof Map) return existing;
+
+  const pending = new Map<string, Promise<void>>();
+  _g[_UNSTABLE_CACHE_PENDING_REVALIDATIONS_KEY] = pending;
+  return pending;
+}
+
+function shouldServeStaleUnstableCacheEntry(): boolean {
+  return _getCacheState().unstableCacheRevalidation === "background";
+}
+
+function waitUntilUnstableCacheRevalidation(promise: Promise<void>): void {
+  if (!isInsideUnifiedScope()) return;
+  getRequestContext().executionContext?.waitUntil(promise);
+}
+
+function scheduleUnstableCacheBackgroundRevalidation(
+  cacheKey: string,
+  refresh: () => Promise<unknown>,
+): void {
+  const pending = getPendingUnstableCacheRevalidations();
+  if (pending.has(cacheKey)) return;
+
+  const revalidation = refresh()
+    .then(() => undefined)
+    .catch((err) => {
+      console.error(`[vinext] unstable_cache background revalidation failed for ${cacheKey}:`, err);
+    });
+  const trackedRevalidation = revalidation.finally(() => {
+    if (pending.get(cacheKey) === trackedRevalidation) {
+      pending.delete(cacheKey);
+    }
+  });
+
+  pending.set(cacheKey, trackedRevalidation);
+  waitUntilUnstableCacheRevalidation(trackedRevalidation);
+}
+
+async function refreshUnstableCacheResult<Args extends unknown[], Result>(
+  fn: (...args: Args) => Promise<Result>,
+  args: Args,
+  cacheKey: string,
+  tags: string[],
+  revalidateSeconds: number | false | undefined,
+): Promise<Result> {
+  const result = await _unstableCacheAls.run(true, () => fn(...args));
+
+  const cacheValue: CachedFetchValue = {
+    kind: "FETCH",
+    data: {
+      headers: {},
+      body: serializeUnstableCacheResult(result),
+      url: cacheKey,
+    },
+    tags,
+    // revalidate: false means "cache indefinitely" (no time-based expiry).
+    // A positive number means time-based revalidation in seconds.
+    // When unset (undefined), default to false (indefinite) matching
+    // Next.js behavior for unstable_cache without explicit revalidate.
+    revalidate: typeof revalidateSeconds === "number" ? revalidateSeconds : false,
+  };
+
+  await _getActiveHandler().set(cacheKey, cacheValue, {
+    fetchCache: true,
+    tags,
+    revalidate: revalidateSeconds,
+  });
+
+  return result;
+}
 
 /**
  * Wrap an async function with caching.
@@ -692,52 +800,38 @@ export function unstable_cache<T extends (...args: any[]) => Promise<any>>(
   const tags = options?.tags ?? [];
   const revalidateSeconds = options?.revalidate;
 
-  const cachedFn = async (...args: Parameters<T>): Promise<Awaited<ReturnType<T>>> => {
+  const cachedFn = async (...args: Parameters<T>) => {
     const argsKey = JSON.stringify(args);
     const cacheKey = `unstable_cache:${baseKey}:${argsKey}`;
 
-    // Try to get from cache. Check cacheState so time-expired entries
-    // trigger a re-fetch instead of being served indefinitely.
+    // Try to get from cache. Stale entries are usable in normal App Router
+    // requests, but foreground-refresh inside revalidation scopes so the
+    // regenerated page/route stores fresh data.
     const existing = await _getActiveHandler().get(cacheKey, {
       kind: "FETCH",
       tags,
     });
-    if (existing?.value && existing.value.kind === "FETCH" && existing.cacheState !== "stale") {
-      try {
-        return deserializeUnstableCacheResult(existing.value.data.body) as Awaited<ReturnType<T>>;
-      } catch {
-        // Corrupted entry, fall through to re-fetch
+    if (existing?.value && existing.value.kind === "FETCH") {
+      const cached = tryDeserializeUnstableCacheResult(existing.value.data.body);
+      if (cached.ok) {
+        if (existing.cacheState === "stale") {
+          if (shouldServeStaleUnstableCacheEntry()) {
+            scheduleUnstableCacheBackgroundRevalidation(cacheKey, () =>
+              refreshUnstableCacheResult(fn, args, cacheKey, tags, revalidateSeconds),
+            );
+            return cached.value;
+          }
+        } else {
+          return cached.value;
+        }
       }
+      // Corrupted entries fall through to a foreground refresh.
     }
 
     // Cache miss — call the function inside the unstable_cache ALS scope
     // so that headers()/cookies()/connection() can detect they're in a
     // cache scope and throw an appropriate error.
-    const result = await _unstableCacheAls.run(true, () => fn(...args));
-
-    // Store in cache using the FETCH kind
-    const cacheValue: CachedFetchValue = {
-      kind: "FETCH",
-      data: {
-        headers: {},
-        body: serializeUnstableCacheResult(result),
-        url: cacheKey,
-      },
-      tags,
-      // revalidate: false means "cache indefinitely" (no time-based expiry).
-      // A positive number means time-based revalidation in seconds.
-      // When unset (undefined), default to false (indefinite) matching
-      // Next.js behavior for unstable_cache without explicit revalidate.
-      revalidate: typeof revalidateSeconds === "number" ? revalidateSeconds : false,
-    };
-
-    await _getActiveHandler().set(cacheKey, cacheValue, {
-      fetchCache: true,
-      tags,
-      revalidate: revalidateSeconds,
-    });
-
-    return result;
+    return await refreshUnstableCacheResult(fn, args, cacheKey, tags, revalidateSeconds);
   };
 
   return cachedFn as T;

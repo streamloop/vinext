@@ -31,6 +31,8 @@ export type InterceptingRoute = {
   targetPattern: string;
   /** Absolute path to the intercepting page component */
   pagePath: string;
+  /** Absolute layout paths inside the intercepting route tree, outermost to innermost */
+  layoutPaths: string[];
   /** Parameter names for dynamic segments */
   params: string[];
 };
@@ -143,6 +145,16 @@ export function invalidateAppRouteCache(): void {
   cachedPageExtensionsKey = null;
 }
 
+function hasParallelSlotDirectory(dir: string): boolean {
+  try {
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .some((entry) => entry.isDirectory() && entry.name.startsWith("@"));
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Scan the app/ directory and return a list of routes.
  */
@@ -175,6 +187,28 @@ export async function appRouter(
   for await (const file of scanWithExtensions("**/route", appDir, matcher.extensions, excludeDir)) {
     const route = fileToAppRoute(file, appDir, "route", matcher);
     if (route) routes.push(route);
+  }
+
+  // Layouts with parallel slot pages are valid route entries even when the
+  // segment has no children page. Next.js uses this for modal/feed patterns
+  // like app/user/[id]/layout + @feed/page + @modal/default.
+  const routePatterns = new Set(routes.map((route) => route.pattern));
+  for await (const file of scanWithExtensions(
+    "**/layout",
+    appDir,
+    matcher.extensions,
+    excludeDir,
+  )) {
+    const dir = path.dirname(file);
+    const routeDir = dir === "." ? appDir : path.join(appDir, dir);
+    if (!hasParallelSlotDirectory(routeDir)) continue;
+    if (discoverParallelSlots(routeDir, appDir, matcher).length === 0) continue;
+
+    const route = directoryToAppRoute(dir, appDir, matcher, null, null);
+    if (!route || routePatterns.has(route.pattern)) continue;
+
+    routes.push(route);
+    routePatterns.add(route.pattern);
   }
 
   // Discover sub-routes created by nested pages within parallel slots.
@@ -417,6 +451,22 @@ function fileToAppRoute(
 ): AppRoute | null {
   // Remove the filename (page.tsx or route.ts)
   const dir = path.dirname(file);
+  return directoryToAppRoute(
+    dir,
+    appDir,
+    matcher,
+    type === "page" ? path.join(appDir, file) : null,
+    type === "route" ? path.join(appDir, file) : null,
+  );
+}
+
+function directoryToAppRoute(
+  dir: string,
+  appDir: string,
+  matcher: ValidFileMatcher,
+  pagePath: string | null,
+  routePath: string | null,
+): AppRoute | null {
   const segments = dir === "." ? [] : dir.split(path.sep);
 
   const params: string[] = [];
@@ -466,8 +516,8 @@ function fileToAppRoute(
 
   return {
     pattern: pattern === "/" ? "/" : pattern,
-    pagePath: type === "page" ? path.join(appDir, file) : null,
-    routePath: type === "route" ? path.join(appDir, file) : null,
+    pagePath,
+    routePath,
     layouts,
     templates,
     parallelSlots,
@@ -661,24 +711,32 @@ function discoverInheritedParallelSlots(
   let currentDir = appDir;
   const dirsToCheck: { dir: string; layoutIdx: number }[] = [];
   let layoutIdx = findFile(appDir, "layout", matcher) ? 0 : -1;
-  dirsToCheck.push({ dir: appDir, layoutIdx: Math.max(layoutIdx, 0) });
+  dirsToCheck.push({ dir: appDir, layoutIdx });
 
   for (const segment of segments) {
     currentDir = path.join(currentDir, segment);
     if (findFile(currentDir, "layout", matcher)) {
       layoutIdx++;
     }
-    dirsToCheck.push({ dir: currentDir, layoutIdx: Math.max(layoutIdx, 0) });
+    dirsToCheck.push({ dir: currentDir, layoutIdx });
   }
 
+  const routeHasLayout = layoutIdx >= 0;
+
   for (const { dir, layoutIdx: lvlLayoutIdx } of dirsToCheck) {
+    // Once a route has a root layout below app/, slots discovered before that
+    // layout are above the root and cannot be owned by any layout in this route.
+    // Layout-less routes keep their legacy slot metadata here; validation is separate.
+    if (lvlLayoutIdx < 0 && routeHasLayout) continue;
+
     const isOwnDir = dir === routeDir;
+    const slotLayoutIdx = Math.max(lvlLayoutIdx, 0);
     const slotsAtLevel = discoverParallelSlots(dir, appDir, matcher);
 
     for (const slot of slotsAtLevel) {
       if (isOwnDir) {
         // At the route's own directory: use page.tsx (normal behavior)
-        slot.layoutIndex = lvlLayoutIdx;
+        slot.layoutIndex = slotLayoutIdx;
         slotMap.set(slot.key, slot);
       } else {
         // At an ancestor directory: use default.tsx as the page, not page.tsx
@@ -686,7 +744,7 @@ function discoverInheritedParallelSlots(
         const inheritedSlot: ParallelSlot = {
           ...slot,
           pagePath: null, // Don't use ancestor's page.tsx
-          layoutIndex: lvlLayoutIdx,
+          layoutIndex: slotLayoutIdx,
           routeSegments: null,
           // defaultPath, loadingPath, errorPath, interceptingRoutes remain
         };
@@ -858,7 +916,13 @@ function collectInterceptingPages(
   appDir: string,
   results: InterceptingRoute[],
   matcher: ValidFileMatcher,
+  parentLayoutPaths: readonly string[] = [],
 ): void {
+  const currentLayoutPath = findFile(currentDir, "layout", matcher);
+  const layoutPaths = currentLayoutPath
+    ? [...parentLayoutPaths, currentLayoutPath]
+    : parentLayoutPaths;
+
   // Check for page.tsx in current directory
   const page = findFile(currentDir, "page", matcher);
   if (page) {
@@ -873,6 +937,7 @@ function collectInterceptingPages(
     if (targetPattern) {
       results.push({
         convention,
+        layoutPaths: [...layoutPaths],
         targetPattern: targetPattern.pattern,
         pagePath: page,
         params: targetPattern.params,
@@ -896,6 +961,7 @@ function collectInterceptingPages(
       appDir,
       results,
       matcher,
+      layoutPaths,
     );
   }
 }

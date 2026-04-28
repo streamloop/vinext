@@ -1,4 +1,5 @@
 import { Fragment, createElement, type ComponentType, type ReactNode } from "react";
+import { buildClientHookErrorMessage } from "../shims/client-hook-error.js";
 import { ErrorBoundary } from "../shims/error-boundary.js";
 import { LayoutSegmentProvider } from "../shims/layout-segment-context.js";
 import {
@@ -12,6 +13,7 @@ import {
   type Viewport,
 } from "../shims/metadata.js";
 import type { AppPageFontPreload } from "./app-page-execution.js";
+import type { AppPageMiddlewareContext } from "./app-page-response.js";
 import {
   renderAppPageBoundaryResponse,
   resolveAppPageErrorBoundary,
@@ -24,7 +26,13 @@ import {
   renderAppPageHtmlResponse,
   type AppPageSsrHandler,
 } from "./app-page-stream.js";
-import { APP_ROOT_LAYOUT_KEY, APP_ROUTE_KEY, type AppElements } from "./app-elements.js";
+import {
+  APP_INTERCEPTION_CONTEXT_KEY,
+  APP_ROOT_LAYOUT_KEY,
+  APP_ROUTE_KEY,
+  createAppPayloadRouteId,
+  type AppElements,
+} from "./app-elements.js";
 import { createAppPageLayoutEntries } from "./app-page-route-wiring.js";
 
 // oxlint-disable-next-line @typescript-eslint/no-explicit-any
@@ -44,7 +52,7 @@ type AppPageBoundaryRscPayloadOptions<TModule extends AppPageModule = AppPageMod
   route?: AppPageBoundaryRoute<TModule> | null;
 };
 
-export type AppPageBoundaryRoute<TModule extends AppPageModule = AppPageModule> = {
+type AppPageBoundaryRoute<TModule extends AppPageModule = AppPageModule> = {
   error?: TModule | null;
   errors?: readonly (TModule | null | undefined)[] | null;
   forbidden?: TModule | null;
@@ -69,6 +77,7 @@ type AppPageBoundaryRenderCommonOptions<TModule extends AppPageModule = AppPageM
   isRscRequest: boolean;
   loadSsrHandler: () => Promise<AppPageSsrHandler>;
   makeThenableParams: (params: AppPageParams) => unknown;
+  middlewareContext: AppPageMiddlewareContext;
   renderToReadableStream: (
     element: ReactNode | AppElements,
     options: { onError: AppPageBoundaryOnError },
@@ -83,19 +92,18 @@ type AppPageBoundaryRenderCommonOptions<TModule extends AppPageModule = AppPageM
   scriptNonce?: string;
 };
 
-export type RenderAppPageHttpAccessFallbackOptions<TModule extends AppPageModule = AppPageModule> =
-  {
-    boundaryComponent?: AppPageComponent | null;
-    layoutModules?: readonly (TModule | null | undefined)[] | null;
-    matchedParams: AppPageParams;
-    rootForbiddenModule?: TModule | null;
-    rootNotFoundModule?: TModule | null;
-    rootUnauthorizedModule?: TModule | null;
-    route?: AppPageBoundaryRoute<TModule> | null;
-    statusCode: number;
-  } & AppPageBoundaryRenderCommonOptions<TModule>;
+type RenderAppPageHttpAccessFallbackOptions<TModule extends AppPageModule = AppPageModule> = {
+  boundaryComponent?: AppPageComponent | null;
+  layoutModules?: readonly (TModule | null | undefined)[] | null;
+  matchedParams: AppPageParams;
+  rootForbiddenModule?: TModule | null;
+  rootNotFoundModule?: TModule | null;
+  rootUnauthorizedModule?: TModule | null;
+  route?: AppPageBoundaryRoute<TModule> | null;
+  statusCode: number;
+} & AppPageBoundaryRenderCommonOptions<TModule>;
 
-export type RenderAppPageErrorBoundaryOptions<TModule extends AppPageModule = AppPageModule> = {
+type RenderAppPageErrorBoundaryOptions<TModule extends AppPageModule = AppPageModule> = {
   error: unknown;
   matchedParams?: AppPageParams | null;
   route?: AppPageBoundaryRoute<TModule> | null;
@@ -234,9 +242,10 @@ function resolveAppPageBoundaryRootLayoutTreePath<TModule extends AppPageModule>
 function createAppPageBoundaryRscPayload<TModule extends AppPageModule>(
   options: AppPageBoundaryRscPayloadOptions<TModule>,
 ): AppElements {
-  const routeId = `route:${options.pathname}`;
+  const routeId = createAppPayloadRouteId(options.pathname, null);
 
   return {
+    [APP_INTERCEPTION_CONTEXT_KEY]: null,
     [APP_ROUTE_KEY]: routeId,
     [APP_ROOT_LAYOUT_KEY]: resolveAppPageBoundaryRootLayoutTreePath(options.route),
     [routeId]: options.element,
@@ -271,6 +280,7 @@ async function renderAppPageBoundaryElementResponse<TModule extends AppPageModul
         clearRequestContext: options.clearRequestContext,
         fontData,
         fontLinkHeader: options.buildFontLinkHeader(fontData.preloads),
+        middlewareHeaders: options.middlewareContext.headers,
         navigationContext: options.getNavigationContext(),
         rscStream,
         scriptNonce: options.scriptNonce,
@@ -283,6 +293,7 @@ async function renderAppPageBoundaryElementResponse<TModule extends AppPageModul
     },
     element: payload,
     isRscRequest: options.isRscRequest,
+    middlewareHeaders: options.middlewareContext.headers,
     renderToReadableStream: options.renderToReadableStream,
     status: options.status,
   });
@@ -360,6 +371,7 @@ export async function renderAppPageErrorBoundary<TModule extends AppPageModule>(
 
   const rawError =
     options.error instanceof Error ? options.error : new Error(String(options.error));
+  rewriteClientHookError(rawError);
   const errorObject = options.sanitizeErrorForClient(rawError);
   const matchedParams = options.matchedParams ?? options.route?.params ?? {};
   const layoutModules = options.route?.layouts ?? options.rootLayouts;
@@ -388,4 +400,18 @@ export async function renderAppPageErrorBoundary<TModule extends AppPageModule>(
     routePattern: options.route?.pattern,
     status: 200,
   });
+}
+
+// React client-only hooks that are absent from the `react-server` export
+// condition. When called in a Server Component they produce a TypeError like
+// "useState is not a function". Rewrite into an actionable message matching
+// the format used by the next/navigation shims (see client-hook-error.ts).
+const _clientHookPattern =
+  /\b(useState|useEffect|useReducer|useRef|useContext|useLayoutEffect|useInsertionEffect|useSyncExternalStore|useTransition|useImperativeHandle|useDeferredValue|useActionState|useOptimistic|useEffectEvent)\b.*is not a function/;
+
+function rewriteClientHookError(error: Error): void {
+  const match = error.message.match(_clientHookPattern);
+  if (match) {
+    error.message = buildClientHookErrorMessage(`${match[1]}()`);
+  }
 }

@@ -92,8 +92,10 @@ export function createRequestContext(opts?: Partial<UnifiedRequestContext>): Uni
     serverContext: null,
     serverInsertedHTMLCallbacks: [],
     requestScopedCacheLife: null,
+    unstableCacheRevalidation: "foreground",
     _privateCache: null,
     currentRequestTags: [],
+    currentFetchSoftTags: [],
     executionContext: _getInheritedExecutionContext(), // inherits from standalone ALS if present
     requestCache: new WeakMap(),
     ssrContext: null,
@@ -107,6 +109,14 @@ export function createRequestContext(opts?: Partial<UnifiedRequestContext>): Uni
  * All shim modules will read/write their state from `ctx` for the
  * duration of the call, including async continuations.
  */
+export function runWithRequestContext<T>(
+  ctx: UnifiedRequestContext,
+  fn: () => Promise<T>,
+): Promise<T>;
+export function runWithRequestContext<T>(
+  ctx: UnifiedRequestContext,
+  fn: () => T | Promise<T>,
+): T | Promise<T>;
 export function runWithRequestContext<T>(
   ctx: UnifiedRequestContext,
   fn: () => T | Promise<T>,
@@ -123,6 +133,14 @@ export function runWithRequestContext<T>(
  *
  * @internal
  */
+export function runWithUnifiedStateMutation<T>(
+  mutate: (ctx: UnifiedRequestContext) => void,
+  fn: () => Promise<T>,
+): Promise<T>;
+export function runWithUnifiedStateMutation<T>(
+  mutate: (ctx: UnifiedRequestContext) => void,
+  fn: () => T | Promise<T>,
+): T | Promise<T>;
 export function runWithUnifiedStateMutation<T>(
   mutate: (ctx: UnifiedRequestContext) => void,
   fn: () => T | Promise<T>,

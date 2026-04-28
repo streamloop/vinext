@@ -20,6 +20,18 @@ function createStream(chunks: string[]): ReadableStream<Uint8Array> {
   });
 }
 
+function createMiddlewareContext() {
+  const headers = new Headers();
+  headers.set("x-middleware-security", "present");
+  headers.append("set-cookie", "session=rotated; Path=/; HttpOnly");
+  headers.set("vary", "x-auth-state");
+
+  return {
+    headers,
+    status: 299,
+  };
+}
+
 describe("app page execution helpers", () => {
   it("parses redirect and access-fallback digests", () => {
     expect(
@@ -49,6 +61,7 @@ describe("app page execution helpers", () => {
 
     const redirectResponse = await buildAppPageSpecialErrorResponse({
       clearRequestContext,
+      middlewareContext: createMiddlewareContext(),
       requestUrl: "https://example.com/start",
       specialError: {
         kind: "redirect",
@@ -59,14 +72,23 @@ describe("app page execution helpers", () => {
 
     expect(redirectResponse.status).toBe(307);
     expect(redirectResponse.headers.get("location")).toBe("https://example.com/redirected");
+    expect(redirectResponse.headers.get("x-middleware-security")).toBe("present");
+    expect(redirectResponse.headers.get("vary")).toBe("x-auth-state");
+    expect(redirectResponse.headers.getSetCookie()).toContain("session=rotated; Path=/; HttpOnly");
     expect(clearRequestContext).toHaveBeenCalledTimes(1);
 
     clearRequestContext.mockClear();
 
     const fallbackResponse = await buildAppPageSpecialErrorResponse({
       clearRequestContext,
+      middlewareContext: createMiddlewareContext(),
       renderFallbackPage(statusCode) {
-        return Promise.resolve(new Response(`fallback:${statusCode}`, { status: statusCode }));
+        return Promise.resolve(
+          new Response(`fallback:${statusCode}`, {
+            headers: { Vary: "RSC, Accept" },
+            status: statusCode,
+          }),
+        );
       },
       requestUrl: "https://example.com/start",
       specialError: {
@@ -76,6 +98,14 @@ describe("app page execution helpers", () => {
     });
 
     expect(fallbackResponse.status).toBe(404);
+    expect(fallbackResponse.headers.get("x-middleware-security")).toBe("present");
+    expect(fallbackResponse.headers.get("vary")).toBe("RSC, Accept, x-auth-state");
+    expect(fallbackResponse.headers.getSetCookie()).toContain("session=rotated; Path=/; HttpOnly");
+    expect(
+      fallbackResponse.headers
+        .getSetCookie()
+        .filter((cookie) => cookie === "session=rotated; Path=/; HttpOnly"),
+    ).toHaveLength(1);
     await expect(fallbackResponse.text()).resolves.toBe("fallback:404");
     expect(clearRequestContext).not.toHaveBeenCalled();
   });
@@ -85,6 +115,7 @@ describe("app page execution helpers", () => {
 
     const response = await buildAppPageSpecialErrorResponse({
       clearRequestContext,
+      middlewareContext: createMiddlewareContext(),
       renderFallbackPage() {
         return Promise.resolve(null);
       },
@@ -96,6 +127,9 @@ describe("app page execution helpers", () => {
     });
 
     expect(response.status).toBe(401);
+    expect(response.headers.get("x-middleware-security")).toBe("present");
+    expect(response.headers.get("vary")).toBe("x-auth-state");
+    expect(response.headers.getSetCookie()).toContain("session=rotated; Path=/; HttpOnly");
     await expect(response.text()).resolves.toBe("Unauthorized");
     expect(clearRequestContext).toHaveBeenCalledTimes(1);
   });
@@ -103,7 +137,7 @@ describe("app page execution helpers", () => {
   it("probes layouts from inner to outer and stops on a handled special response", async () => {
     const probedLayouts: number[] = [];
 
-    const response = await probeAppPageLayouts({
+    const result = await probeAppPageLayouts({
       layoutCount: 3,
       async onLayoutError(error, layoutIndex) {
         expect(error).toBeInstanceOf(Error);
@@ -122,8 +156,8 @@ describe("app page execution helpers", () => {
     });
 
     expect(probedLayouts).toEqual([2, 1]);
-    expect(response?.status).toBe(404);
-    await expect(response?.text()).resolves.toBe("layout-fallback");
+    expect(result.response?.status).toBe(404);
+    await expect(result.response?.text()).resolves.toBe("layout-fallback");
   });
 
   it("does not await async page probes when a loading boundary is present", async () => {
@@ -152,6 +186,420 @@ describe("app page execution helpers", () => {
     expect(new TextDecoder().decode(captured ? new Uint8Array(captured) : undefined)).toBe(
       "flight-chunk",
     );
+  });
+
+  it("tracks per-layout dynamic usage when classification options are provided", async () => {
+    const result = await probeAppPageLayouts({
+      layoutCount: 3,
+      onLayoutError() {
+        return Promise.resolve(null);
+      },
+      probeLayoutAt() {
+        return null;
+      },
+      runWithSuppressedHookWarning(probe) {
+        return probe();
+      },
+      classification: {
+        buildTimeClassifications: new Map([
+          [0, "static"],
+          [2, "dynamic"],
+        ]),
+        getLayoutId(layoutIndex) {
+          return ["layout:/", "layout:/blog", "layout:/blog/post"][layoutIndex];
+        },
+        runWithIsolatedDynamicScope(fn) {
+          return Promise.resolve({ result: fn(), dynamicDetected: false });
+        },
+      },
+    });
+
+    expect(result.response).toBeNull();
+    // Layout 0 is build-time static, layout 2 is build-time dynamic
+    // Layout 1 has no build-time classification, probed with no dynamic detected
+    expect(result.layoutFlags).toEqual({
+      "layout:/": "s",
+      "layout:/blog": "s",
+      "layout:/blog/post": "d",
+    });
+  });
+
+  it("detects dynamic usage per-layout through isolated scope", async () => {
+    let probeCallCount = 0;
+    const result = await probeAppPageLayouts({
+      layoutCount: 2,
+      onLayoutError() {
+        return Promise.resolve(null);
+      },
+      probeLayoutAt() {
+        return null;
+      },
+      runWithSuppressedHookWarning(probe) {
+        return probe();
+      },
+      classification: {
+        getLayoutId(layoutIndex) {
+          return ["layout:/", "layout:/dashboard"][layoutIndex];
+        },
+        runWithIsolatedDynamicScope(fn) {
+          probeCallCount++;
+          const result = fn();
+          // Simulate: second probe call (layout 0, since we iterate inner-to-outer)
+          // detects dynamic usage
+          return Promise.resolve({
+            result,
+            dynamicDetected: probeCallCount === 2,
+          });
+        },
+      },
+    });
+
+    expect(result.response).toBeNull();
+    expect(result.layoutFlags).toEqual({
+      "layout:/": "d",
+      "layout:/dashboard": "s",
+    });
+  });
+
+  it("returns empty layoutFlags when classification options are absent (backward compat)", async () => {
+    const result = await probeAppPageLayouts({
+      layoutCount: 2,
+      onLayoutError() {
+        return Promise.resolve(null);
+      },
+      probeLayoutAt() {
+        return null;
+      },
+      runWithSuppressedHookWarning(probe) {
+        return probe();
+      },
+    });
+
+    expect(result.response).toBeNull();
+    expect(result.layoutFlags).toEqual({});
+  });
+
+  it("defaults to dynamic flag when probe throws a non-special error", async () => {
+    const result = await probeAppPageLayouts({
+      layoutCount: 2,
+      onLayoutError() {
+        // Non-special error — return null (don't short-circuit)
+        return Promise.resolve(null);
+      },
+      probeLayoutAt(layoutIndex) {
+        if (layoutIndex === 1) throw new Error("use() outside render");
+        return null;
+      },
+      runWithSuppressedHookWarning(probe) {
+        return probe();
+      },
+      classification: {
+        getLayoutId(layoutIndex) {
+          return ["layout:/", "layout:/dashboard"][layoutIndex];
+        },
+        runWithIsolatedDynamicScope(fn) {
+          // Re-throw so the catch path in probeAppPageLayouts fires
+          return Promise.resolve(fn()).then((result) => ({ result, dynamicDetected: false }));
+        },
+      },
+    });
+
+    expect(result.response).toBeNull();
+    // Layout 1 threw → conservatively flagged as dynamic
+    expect(result.layoutFlags["layout:/dashboard"]).toBe("d");
+    // Layout 0 probed successfully
+    expect(result.layoutFlags["layout:/"]).toBe("s");
+  });
+
+  it("isolates dynamic usage across throwing layout probes", async () => {
+    let dynamicUsageDetected = false;
+
+    const result = await probeAppPageLayouts({
+      layoutCount: 2,
+      onLayoutError() {
+        return Promise.resolve(null);
+      },
+      probeLayoutAt(layoutIndex) {
+        if (layoutIndex === 1) {
+          dynamicUsageDetected = true;
+          throw new Error("layout failed after headers()");
+        }
+        return null;
+      },
+      runWithSuppressedHookWarning(probe) {
+        return probe();
+      },
+      classification: {
+        getLayoutId(layoutIndex) {
+          return ["layout:/", "layout:/dashboard"][layoutIndex];
+        },
+        async runWithIsolatedDynamicScope(fn) {
+          const priorDynamic = dynamicUsageDetected;
+          dynamicUsageDetected = false;
+          try {
+            const result = await fn();
+            const detectedInScope = dynamicUsageDetected;
+            dynamicUsageDetected = false;
+            return { result, dynamicDetected: detectedInScope };
+          } finally {
+            dynamicUsageDetected = false;
+            if (priorDynamic) dynamicUsageDetected = true;
+          }
+        },
+      },
+    });
+
+    expect(result.response).toBeNull();
+    expect(result.layoutFlags).toEqual({
+      "layout:/": "s",
+      "layout:/dashboard": "d",
+    });
+  });
+
+  it("skips probe for build-time classified layouts", async () => {
+    let probeCalls = 0;
+    const result = await probeAppPageLayouts({
+      layoutCount: 2,
+      onLayoutError() {
+        return Promise.resolve(null);
+      },
+      probeLayoutAt() {
+        return null;
+      },
+      runWithSuppressedHookWarning(probe) {
+        return probe();
+      },
+      classification: {
+        buildTimeClassifications: new Map([
+          [0, "static"],
+          [1, "dynamic"],
+        ]),
+        getLayoutId(layoutIndex) {
+          return ["layout:/", "layout:/admin"][layoutIndex];
+        },
+        runWithIsolatedDynamicScope(fn) {
+          probeCalls++;
+          return Promise.resolve({ result: fn(), dynamicDetected: false });
+        },
+      },
+    });
+
+    expect(probeCalls).toBe(0);
+    expect(result.layoutFlags).toEqual({
+      "layout:/": "s",
+      "layout:/admin": "d",
+    });
+  });
+
+  it("returns special error response when build-time classified layout throws during error probe", async () => {
+    const layoutError = new Error("layout failed");
+    const specialResponse = new Response("layout-fallback", { status: 404 });
+
+    const result = await probeAppPageLayouts({
+      layoutCount: 2,
+      onLayoutError(error) {
+        return Promise.resolve(error === layoutError ? specialResponse : null);
+      },
+      probeLayoutAt(layoutIndex) {
+        if (layoutIndex === 1) throw layoutError;
+        return null;
+      },
+      runWithSuppressedHookWarning(probe) {
+        return probe();
+      },
+      classification: {
+        buildTimeClassifications: new Map([
+          [0, "static"],
+          [1, "static"],
+        ]),
+        getLayoutId(layoutIndex) {
+          return ["layout:/", "layout:/admin"][layoutIndex];
+        },
+        runWithIsolatedDynamicScope() {
+          throw new Error("isolated scope must not run for build-time classified layouts");
+        },
+      },
+    });
+
+    // The special-error response from the throwing layout short-circuits the
+    // loop. The flag for layout 1 is still recorded (set before the error
+    // probe runs), and layout 0 is never reached.
+    expect(result.response).toBe(specialResponse);
+    expect(result.layoutFlags).toEqual({ "layout:/admin": "s" });
+  });
+
+  it("does not read build-time reasons when debugClassification is absent", async () => {
+    const throwingReasons = {
+      get() {
+        throw new Error("build-time reasons should stay dormant when debug is disabled");
+      },
+    } as unknown as ReadonlyMap<number, { layer: "segment-config"; key: "dynamic"; value: string }>;
+
+    await probeAppPageLayouts({
+      layoutCount: 2,
+      onLayoutError() {
+        return Promise.resolve(null);
+      },
+      probeLayoutAt() {
+        return null;
+      },
+      runWithSuppressedHookWarning(probe) {
+        return probe();
+      },
+      classification: {
+        buildTimeClassifications: new Map([
+          [0, "static"],
+          [1, "dynamic"],
+        ]),
+        buildTimeReasons: throwingReasons,
+        getLayoutId(layoutIndex) {
+          return ["layout:/", "layout:/admin"][layoutIndex];
+        },
+        runWithIsolatedDynamicScope(fn) {
+          return Promise.resolve({ result: fn(), dynamicDetected: false });
+        },
+      },
+    });
+  });
+
+  it("emits a debug reason per layout when debugClassification is provided with build-time reasons", async () => {
+    const calls: Array<{ layoutId: string; reason: unknown }> = [];
+
+    await probeAppPageLayouts({
+      layoutCount: 3,
+      onLayoutError() {
+        return Promise.resolve(null);
+      },
+      probeLayoutAt() {
+        return null;
+      },
+      runWithSuppressedHookWarning(probe) {
+        return probe();
+      },
+      classification: {
+        buildTimeClassifications: new Map([
+          [0, "static"],
+          [1, "dynamic"],
+          [2, "static"],
+        ]),
+        buildTimeReasons: new Map([
+          [0, { layer: "segment-config", key: "dynamic", value: "force-static" }],
+          [1, { layer: "segment-config", key: "dynamic", value: "force-dynamic" }],
+          [2, { layer: "module-graph", result: "static" }],
+        ]),
+        debugClassification(layoutId, reason) {
+          calls.push({ layoutId, reason });
+        },
+        getLayoutId(layoutIndex) {
+          return ["layout:/", "layout:/admin", "layout:/admin/posts"][layoutIndex];
+        },
+        runWithIsolatedDynamicScope(fn) {
+          return Promise.resolve({ result: fn(), dynamicDetected: false });
+        },
+      },
+    });
+
+    expect(calls).toHaveLength(3);
+    const byId = Object.fromEntries(calls.map((c) => [c.layoutId, c.reason]));
+    expect(byId["layout:/"]).toEqual({
+      layer: "segment-config",
+      key: "dynamic",
+      value: "force-static",
+    });
+    expect(byId["layout:/admin"]).toEqual({
+      layer: "segment-config",
+      key: "dynamic",
+      value: "force-dynamic",
+    });
+    expect(byId["layout:/admin/posts"]).toEqual({
+      layer: "module-graph",
+      result: "static",
+    });
+  });
+
+  it("emits runtime-probe reason for layouts resolved by the Layer 3 probe", async () => {
+    const calls: Array<{ layoutId: string; reason: unknown }> = [];
+    let probeCalls = 0;
+
+    await probeAppPageLayouts({
+      layoutCount: 2,
+      onLayoutError() {
+        return Promise.resolve(null);
+      },
+      probeLayoutAt() {
+        return null;
+      },
+      runWithSuppressedHookWarning(probe) {
+        return probe();
+      },
+      classification: {
+        // No buildTimeClassifications → every layout takes the runtime path.
+        debugClassification(layoutId, reason) {
+          calls.push({ layoutId, reason });
+        },
+        getLayoutId(layoutIndex) {
+          return ["layout:/", "layout:/dashboard"][layoutIndex];
+        },
+        runWithIsolatedDynamicScope(fn) {
+          probeCalls++;
+          // probeAppPageLayouts iterates inner-to-outer:
+          // first call → layout 1 (dashboard) → dynamic
+          // second call → layout 0 (root) → static
+          return Promise.resolve({ result: fn(), dynamicDetected: probeCalls === 1 });
+        },
+      },
+    });
+
+    expect(calls).toHaveLength(2);
+    const byId = Object.fromEntries(calls.map((c) => [c.layoutId, c.reason]));
+    expect(byId["layout:/dashboard"]).toEqual({
+      layer: "runtime-probe",
+      outcome: "dynamic",
+    });
+    expect(byId["layout:/"]).toEqual({
+      layer: "runtime-probe",
+      outcome: "static",
+    });
+  });
+
+  it("emits runtime-probe reason with the error message when the probe throws", async () => {
+    const calls: Array<{ layoutId: string; reason: unknown }> = [];
+
+    await probeAppPageLayouts({
+      layoutCount: 2,
+      onLayoutError() {
+        return Promise.resolve(null);
+      },
+      probeLayoutAt(layoutIndex) {
+        if (layoutIndex === 1) throw new Error("headers() outside render");
+        return null;
+      },
+      runWithSuppressedHookWarning(probe) {
+        return probe();
+      },
+      classification: {
+        debugClassification(layoutId, reason) {
+          calls.push({ layoutId, reason });
+        },
+        getLayoutId(layoutIndex) {
+          return ["layout:/", "layout:/dashboard"][layoutIndex];
+        },
+        runWithIsolatedDynamicScope(fn) {
+          return Promise.resolve(fn()).then((result) => ({ result, dynamicDetected: false }));
+        },
+      },
+    });
+
+    const byId = Object.fromEntries(calls.map((c) => [c.layoutId, c.reason]));
+    expect(byId["layout:/dashboard"]).toEqual({
+      layer: "runtime-probe",
+      outcome: "dynamic",
+      error: "headers() outside render",
+    });
+    expect(byId["layout:/"]).toEqual({
+      layer: "runtime-probe",
+      outcome: "static",
+    });
   });
 
   it("builds Link headers for preloaded app-page fonts", () => {

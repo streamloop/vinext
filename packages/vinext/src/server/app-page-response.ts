@@ -12,7 +12,7 @@ export type AppPageResponseTiming = {
   responseKind: "html" | "rsc";
 };
 
-export type AppPageResponsePolicy = {
+type AppPageResponsePolicy = {
   cacheControl?: string;
   cacheState?: "MISS" | "STATIC";
 };
@@ -25,27 +25,28 @@ type ResolveAppPageResponsePolicyBaseOptions = {
   revalidateSeconds: number | null;
 };
 
-export type ResolveAppPageRscResponsePolicyOptions = {
+type ResolveAppPageRscResponsePolicyOptions = {
   dynamicUsedDuringBuild: boolean;
 } & ResolveAppPageResponsePolicyBaseOptions;
 
-export type ResolveAppPageHtmlResponsePolicyOptions = {
+type ResolveAppPageHtmlResponsePolicyOptions = {
   dynamicUsedDuringRender: boolean;
   hasScriptNonce: boolean;
 } & ResolveAppPageResponsePolicyBaseOptions;
 
-export type AppPageHtmlResponsePolicy = {
+type AppPageHtmlResponsePolicy = {
   shouldWriteToCache: boolean;
 } & AppPageResponsePolicy;
 
-export type BuildAppPageRscResponseOptions = {
+type BuildAppPageRscResponseOptions = {
   middlewareContext: AppPageMiddlewareContext;
+  mountedSlotsHeader?: string | null;
   params?: Record<string, unknown>;
   policy: AppPageResponsePolicy;
   timing?: AppPageResponseTiming;
 };
 
-export type BuildAppPageHtmlResponseOptions = {
+type BuildAppPageHtmlResponseOptions = {
   draftCookie?: string | null;
   fontLinkHeader?: string;
   middlewareContext: AppPageMiddlewareContext;
@@ -198,6 +199,9 @@ export function buildAppPageRscResponse(
     // encodeURIComponent so non-ASCII params (e.g. Korean slugs) survive the
     // HTTP ByteString constraint — Headers.set() rejects chars above U+00FF.
     headers.set("X-Vinext-Params", encodeURIComponent(JSON.stringify(options.params)));
+  }
+  if (options.mountedSlotsHeader) {
+    headers.set("X-Vinext-Mounted-Slots", options.mountedSlotsHeader);
   }
   if (options.policy.cacheControl) {
     headers.set("Cache-Control", options.policy.cacheControl);

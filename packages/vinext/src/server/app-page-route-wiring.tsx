@@ -1,8 +1,11 @@
 import { Suspense, type ComponentType, type ReactNode } from "react";
 import {
+  APP_INTERCEPTION_CONTEXT_KEY,
   APP_ROOT_LAYOUT_KEY,
   APP_ROUTE_KEY,
   APP_UNMATCHED_SLOT_WIRE_VALUE,
+  createAppPayloadPageId,
+  createAppPayloadRouteId,
   type AppElements,
 } from "./app-elements.js";
 import { ErrorBoundary, NotFoundBoundary } from "../shims/error-boundary.js";
@@ -31,11 +34,11 @@ export type AppPageModule = Record<string, unknown> & {
   default?: AppPageComponent | null | undefined;
 };
 
-export type AppPageErrorModule = Record<string, unknown> & {
+type AppPageErrorModule = Record<string, unknown> & {
   default?: AppPageErrorComponent | null | undefined;
 };
 
-export type AppPageRouteWiringSlot<
+type AppPageRouteWiringSlot<
   TModule extends AppPageModule = AppPageModule,
   TErrorModule extends AppPageErrorModule = AppPageErrorModule,
 > = {
@@ -50,7 +53,7 @@ export type AppPageRouteWiringSlot<
   routeSegments?: readonly string[] | null;
 };
 
-export type AppPageRouteWiringRoute<
+type AppPageRouteWiringRoute<
   TModule extends AppPageModule = AppPageModule,
   TErrorModule extends AppPageErrorModule = AppPageErrorModule,
 > = {
@@ -71,12 +74,13 @@ export type AppPageRouteWiringRoute<
 };
 
 export type AppPageSlotOverride<TModule extends AppPageModule = AppPageModule> = {
+  layoutModules?: readonly (TModule | null | undefined)[] | null;
   pageModule: TModule;
   params?: AppPageParams;
   props?: Readonly<Record<string, unknown>>;
 };
 
-export type AppPageLayoutEntry<
+type AppPageLayoutEntry<
   TModule extends AppPageModule = AppPageModule,
   TErrorModule extends AppPageErrorModule = AppPageErrorModule,
 > = {
@@ -88,7 +92,7 @@ export type AppPageLayoutEntry<
   treePosition: number;
 };
 
-export type BuildAppPageRouteElementOptions<
+type BuildAppPageRouteElementOptions<
   TModule extends AppPageModule = AppPageModule,
   TErrorModule extends AppPageErrorModule = AppPageErrorModule,
 > = {
@@ -103,10 +107,13 @@ export type BuildAppPageRouteElementOptions<
   slotOverrides?: Readonly<Record<string, AppPageSlotOverride<TModule>>> | null;
 };
 
-export type BuildAppPageElementsOptions<
+type BuildAppPageElementsOptions<
   TModule extends AppPageModule = AppPageModule,
   TErrorModule extends AppPageErrorModule = AppPageErrorModule,
 > = BuildAppPageRouteElementOptions<TModule, TErrorModule> & {
+  interceptionContext?: string | null;
+  isRscRequest?: boolean;
+  mountedSlotIds?: ReadonlySet<string> | null;
   routePath: string;
 };
 
@@ -163,7 +170,7 @@ export function createAppPageLayoutEntries<
   });
 }
 
-export function createAppPageTemplateEntries<TModule extends AppPageModule>(
+function createAppPageTemplateEntries<TModule extends AppPageModule>(
   route: Pick<
     AppPageRouteWiringRoute<TModule>,
     "routeSegments" | "templateTreePositions" | "templates"
@@ -299,8 +306,9 @@ export function buildAppPageElements<
   TErrorModule extends AppPageErrorModule,
 >(options: BuildAppPageElementsOptions<TModule, TErrorModule>): AppElements {
   const elements: Record<string, ReactNode | string | null> = {};
-  const routeId = `route:${options.routePath}`;
-  const pageId = `page:${options.routePath}`;
+  const interceptionContext = options.interceptionContext ?? null;
+  const routeId = createAppPayloadRouteId(options.routePath, interceptionContext);
+  const pageId = createAppPayloadPageId(options.routePath, interceptionContext);
   const layoutEntries = createAppPageLayoutEntries(options.route);
   const templateEntries = createAppPageTemplateEntries(options.route);
   const layoutEntriesByTreePosition = new Map<number, AppPageLayoutEntry<TModule, TErrorModule>>();
@@ -376,6 +384,7 @@ export function buildAppPageElements<
   }
 
   elements[APP_ROUTE_KEY] = routeId;
+  elements[APP_INTERCEPTION_CONTEXT_KEY] = interceptionContext;
   elements[APP_ROOT_LAYOUT_KEY] = rootLayoutTreePath;
   elements[pageId] = renderAfterAppDependencies(options.element, pageDependencies);
 
@@ -451,18 +460,33 @@ export function buildAppPageElements<
     const slotId = `slot:${slotName}:${treePath}`;
     const slotOverride = resolveSlotOverride(slotKey, slotName);
     const slotParams = getEffectiveSlotParams(slotKey, slotName);
-    const slotComponent =
-      getDefaultExport(slotOverride?.pageModule) ??
-      getDefaultExport(slot.page) ??
-      getDefaultExport(slot.default);
+    const overrideOrPageComponent =
+      getDefaultExport(slotOverride?.pageModule) ?? getDefaultExport(slot.page);
+    const defaultComponent = getDefaultExport(slot.default);
+
+    // On soft nav (RSC): omit key when only default.tsx exists and the slot is
+    // already mounted on the client. Absent key means the browser retains prior
+    // slot content rather than replacing it. When the slot is not yet mounted
+    // (first entry into this layout), include the key so default.tsx renders.
+    if (
+      !overrideOrPageComponent &&
+      defaultComponent &&
+      options.isRscRequest &&
+      options.mountedSlotIds?.has(slotId)
+    ) {
+      continue;
+    }
+
+    const slotComponent = overrideOrPageComponent ?? defaultComponent;
 
     if (!slotComponent) {
       elements[slotId] = APP_UNMATCHED_SLOT_WIRE_VALUE;
       continue;
     }
 
+    const slotThenableParams = options.makeThenableParams(slotParams);
     const slotProps: Record<string, unknown> = {
-      params: options.makeThenableParams(slotParams),
+      params: slotThenableParams,
     };
     if (slotOverride?.props) {
       Object.assign(slotProps, slotOverride.props);
@@ -470,14 +494,26 @@ export function buildAppPageElements<
 
     const SlotComponent = slotComponent;
     let slotElement: ReactNode = <SlotComponent {...slotProps} />;
+    const interceptLayouts = slotOverride?.layoutModules ?? [];
+
+    for (let layoutIndex = interceptLayouts.length - 1; layoutIndex >= 0; layoutIndex--) {
+      const interceptLayoutComponent = getDefaultExport(interceptLayouts[layoutIndex]);
+      if (!interceptLayoutComponent) {
+        continue;
+      }
+      const InterceptLayoutComponent = interceptLayoutComponent;
+      slotElement = (
+        <InterceptLayoutComponent params={slotThenableParams}>
+          {slotElement}
+        </InterceptLayoutComponent>
+      );
+    }
 
     const slotLayoutComponent = getDefaultExport(slot.layout);
     if (slotLayoutComponent) {
       const SlotLayoutComponent = slotLayoutComponent;
       slotElement = (
-        <SlotLayoutComponent params={options.makeThenableParams(slotParams)}>
-          {slotElement}
-        </SlotLayoutComponent>
+        <SlotLayoutComponent params={slotThenableParams}>{slotElement}</SlotLayoutComponent>
       );
     }
 
