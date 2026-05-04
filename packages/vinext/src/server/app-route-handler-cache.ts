@@ -1,8 +1,10 @@
 import type { NextI18nConfig } from "../config/next-config.js";
+import type { HeadersAccessPhase } from "vinext/shims/headers";
 import type { ISRCacheEntry } from "./isr-cache.js";
 import type { RouteHandlerMiddlewareContext } from "./app-route-handler-response.js";
 import {
   applyRouteHandlerMiddlewareContext,
+  assertSupportedAppRouteHandlerResponse,
   buildAppRouteCacheValue,
   buildRouteHandlerCachedResponse,
 } from "./app-route-handler-response.js";
@@ -27,6 +29,7 @@ type ReadAppRouteHandlerCacheOptions = {
   cleanPathname: string;
   clearRequestContext: () => void;
   consumeDynamicUsage: AppRouteDynamicUsageFn;
+  dynamicConfig?: string;
   getCollectedFetchTags: () => string[];
   handlerFn: AppRouteHandlerFunction;
   i18n?: NextI18nConfig | null;
@@ -40,10 +43,12 @@ type ReadAppRouteHandlerCacheOptions = {
   params: AppRouteParams;
   requestUrl: string;
   revalidateSearchParams: URLSearchParams;
+  expireSeconds?: number;
   revalidateSeconds: number;
   routePattern: string;
   runInRevalidationContext: RouteHandlerRevalidationContextRunner;
   scheduleBackgroundRegeneration: RouteHandlerBackgroundRegenerator;
+  setHeadersAccessPhase: (phase: HeadersAccessPhase) => HeadersAccessPhase;
   setNavigationContext: (
     context: {
       pathname: string;
@@ -72,6 +77,8 @@ export async function readAppRouteHandlerCacheResponse(
       return applyRouteHandlerMiddlewareContext(
         buildRouteHandlerCachedResponse(cachedValue, {
           cacheState: "HIT",
+          cacheControl: cached?.value.cacheControl,
+          expireSeconds: options.expireSeconds,
           isHead: options.isAutoHead,
           revalidateSeconds: options.revalidateSeconds,
         }),
@@ -94,14 +101,18 @@ export async function readAppRouteHandlerCacheResponse(
           const { dynamicUsedInHandler, response } = await runAppRouteHandler({
             basePath: options.basePath,
             consumeDynamicUsage: options.consumeDynamicUsage,
+            dynamicConfig: options.dynamicConfig,
             handlerFn: options.handlerFn,
             i18n: options.i18n,
             markDynamicUsage: options.markDynamicUsage,
             params: options.params,
             request: new Request(options.requestUrl, { method: "GET" }),
+            routePattern: options.routePattern,
+            setHeadersAccessPhase: options.setHeadersAccessPhase,
           });
 
           options.setNavigationContext(null);
+          assertSupportedAppRouteHandlerResponse(response);
 
           if (dynamicUsedInHandler) {
             markKnownDynamicAppRoute(options.routePattern);
@@ -114,7 +125,13 @@ export async function readAppRouteHandlerCacheResponse(
             options.getCollectedFetchTags(),
           );
           const routeCacheValue = await buildAppRouteCacheValue(response);
-          await options.isrSet(routeKey, routeCacheValue, options.revalidateSeconds, routeTags);
+          await options.isrSet(
+            routeKey,
+            routeCacheValue,
+            options.revalidateSeconds,
+            routeTags,
+            options.expireSeconds,
+          );
           options.isrDebug?.("route regen complete", routeKey);
         });
       });
@@ -124,6 +141,8 @@ export async function readAppRouteHandlerCacheResponse(
       return applyRouteHandlerMiddlewareContext(
         buildRouteHandlerCachedResponse(staleValue, {
           cacheState: "STALE",
+          cacheControl: cached.value.cacheControl,
+          expireSeconds: options.expireSeconds,
           isHead: options.isAutoHead,
           revalidateSeconds: options.revalidateSeconds,
         }),

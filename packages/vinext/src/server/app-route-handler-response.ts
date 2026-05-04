@@ -1,5 +1,7 @@
-import type { CachedRouteValue } from "../shims/cache.js";
+import type { CachedRouteValue, CacheControlMetadata } from "vinext/shims/cache";
+import { buildCachedRevalidateCacheControl, NEVER_CACHE_CONTROL } from "./cache-control.js";
 import { mergeMiddlewareResponseHeaders } from "./middleware-response-headers.js";
+import { processMiddlewareHeaders } from "./request-pipeline.js";
 
 export type RouteHandlerMiddlewareContext = {
   headers: Headers | null;
@@ -7,7 +9,9 @@ export type RouteHandlerMiddlewareContext = {
 };
 
 type BuildRouteHandlerCachedResponseOptions = {
+  cacheControl?: CacheControlMetadata;
   cacheState: "HIT" | "STALE";
+  expireSeconds?: number;
   isHead: boolean;
   revalidateSeconds: number;
 };
@@ -18,13 +22,22 @@ type FinalizeRouteHandlerResponseOptions = {
   isHead: boolean;
 };
 
-// Matches Next.js's getCacheControlHeader for revalidate === 0.
-// See .nextjs-ref/packages/next/src/server/lib/cache-control.ts.
-const NEVER_CACHE_CONTROL = "private, no-cache, no-store, max-age=0, must-revalidate";
+const APP_ROUTE_REWRITE_ERROR =
+  "NextResponse.rewrite() was used in a app route handler, this is not currently supported. Please remove the invocation to continue.";
+const APP_ROUTE_NEXT_ERROR =
+  "NextResponse.next() was used in a app route handler, this is not supported. See here for more info: https://nextjs.org/docs/messages/next-response-next-in-app-route-handler";
+
+function hasMiddlewareHeader(headers: Headers): boolean {
+  for (const key of headers.keys()) {
+    if (key.startsWith("x-middleware-")) return true;
+  }
+  return false;
+}
 
 function buildRouteHandlerCacheControl(
   cacheState: BuildRouteHandlerCachedResponseOptions["cacheState"],
   revalidateSeconds: number,
+  expireSeconds?: number,
 ): string {
   if (revalidateSeconds === 0) {
     // A cached response is never produced for revalidate = 0 (the ISR write
@@ -34,11 +47,7 @@ function buildRouteHandlerCacheControl(
     return NEVER_CACHE_CONTROL;
   }
 
-  if (cacheState === "STALE") {
-    return "s-maxage=0, stale-while-revalidate";
-  }
-
-  return `s-maxage=${revalidateSeconds}, stale-while-revalidate`;
+  return buildCachedRevalidateCacheControl(cacheState, revalidateSeconds, expireSeconds);
 }
 
 export function applyRouteHandlerMiddlewareContext(
@@ -59,6 +68,18 @@ export function applyRouteHandlerMiddlewareContext(
   });
 }
 
+export function assertSupportedAppRouteHandlerResponse(response: Response): void {
+  // NextResponse.next() and rewrite() are middleware control-flow signals.
+  // Once an App Route handler has returned, Next.js rejects those responses.
+  if (response.headers.has("x-middleware-rewrite")) {
+    throw new Error(APP_ROUTE_REWRITE_ERROR);
+  }
+
+  if (response.headers.get("x-middleware-next") === "1") {
+    throw new Error(APP_ROUTE_NEXT_ERROR);
+  }
+}
+
 export function buildRouteHandlerCachedResponse(
   cachedValue: CachedRouteValue,
   options: BuildRouteHandlerCachedResponseOptions,
@@ -74,9 +95,14 @@ export function buildRouteHandlerCachedResponse(
     }
   }
   headers.set("X-Vinext-Cache", options.cacheState);
+  const revalidateSeconds = options.cacheControl?.revalidate ?? options.revalidateSeconds;
+  const expireSeconds =
+    options.cacheControl === undefined
+      ? undefined
+      : (options.cacheControl.expire ?? options.expireSeconds);
   headers.set(
     "Cache-Control",
-    buildRouteHandlerCacheControl(options.cacheState, options.revalidateSeconds),
+    buildRouteHandlerCacheControl(options.cacheState, revalidateSeconds, expireSeconds),
   );
 
   return new Response(options.isHead ? null : cachedValue.body, {
@@ -88,12 +114,64 @@ export function buildRouteHandlerCachedResponse(
 export function applyRouteHandlerRevalidateHeader(
   response: Response,
   revalidateSeconds: number,
+  expireSeconds?: number,
 ): void {
-  response.headers.set("cache-control", buildRouteHandlerCacheControl("HIT", revalidateSeconds));
+  response.headers.set(
+    "cache-control",
+    buildRouteHandlerCacheControl("HIT", revalidateSeconds, expireSeconds),
+  );
 }
 
 export function markRouteHandlerCacheMiss(response: Response): void {
   response.headers.set("X-Vinext-Cache", "MISS");
+}
+
+function getSetCookieName(cookie: string): string | null {
+  const equalsIndex = cookie.indexOf("=");
+  if (equalsIndex <= 0) {
+    return null;
+  }
+  return cookie.slice(0, equalsIndex);
+}
+
+function applyMutableCookieFallbacks(headers: Headers, pendingCookies: string[]): void {
+  if (pendingCookies.length === 0) {
+    return;
+  }
+
+  const returnedCookies = headers.getSetCookie();
+  const returnedCookieNames = new Set<string>();
+  for (const cookie of returnedCookies) {
+    const name = getSetCookieName(cookie);
+    if (name) {
+      returnedCookieNames.add(name);
+    }
+  }
+
+  const fallbackCookies = new Map<string, string>();
+  const unkeyedFallbackCookies: string[] = [];
+  for (const cookie of pendingCookies) {
+    const name = getSetCookieName(cookie);
+    if (!name) {
+      unkeyedFallbackCookies.push(cookie);
+      continue;
+    }
+
+    if (!returnedCookieNames.has(name)) {
+      fallbackCookies.set(name, cookie);
+    }
+  }
+
+  headers.delete("Set-Cookie");
+  for (const cookie of unkeyedFallbackCookies) {
+    headers.append("Set-Cookie", cookie);
+  }
+  for (const cookie of fallbackCookies.values()) {
+    headers.append("Set-Cookie", cookie);
+  }
+  for (const cookie of returnedCookies) {
+    headers.append("Set-Cookie", cookie);
+  }
 }
 
 export async function buildAppRouteCacheValue(response: Response): Promise<CachedRouteValue> {
@@ -101,7 +179,14 @@ export async function buildAppRouteCacheValue(response: Response): Promise<Cache
   const headers: CachedRouteValue["headers"] = {};
 
   response.headers.forEach((value, key) => {
-    if (key === "set-cookie" || key === "x-vinext-cache" || key === "cache-control") return;
+    if (
+      key === "set-cookie" ||
+      key === "x-vinext-cache" ||
+      key === "cache-control" ||
+      key.startsWith("x-middleware-")
+    ) {
+      return;
+    }
     headers[key] = value;
   });
   const setCookies = response.headers.getSetCookie?.() ?? [];
@@ -122,14 +207,18 @@ export function finalizeRouteHandlerResponse(
   options: FinalizeRouteHandlerResponseOptions,
 ): Response {
   const { pendingCookies, draftCookie, isHead } = options;
-  if (pendingCookies.length === 0 && !draftCookie && !isHead) {
+  if (
+    pendingCookies.length === 0 &&
+    !draftCookie &&
+    !isHead &&
+    !hasMiddlewareHeader(response.headers)
+  ) {
     return response;
   }
 
   const headers = new Headers(response.headers);
-  for (const cookie of pendingCookies) {
-    headers.append("Set-Cookie", cookie);
-  }
+  processMiddlewareHeaders(headers);
+  applyMutableCookieFallbacks(headers, pendingCookies);
   if (draftCookie) {
     headers.append("Set-Cookie", draftCookie);
   }

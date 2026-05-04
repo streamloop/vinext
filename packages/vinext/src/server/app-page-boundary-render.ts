@@ -1,19 +1,12 @@
 import { Fragment, createElement, type ComponentType, type ReactNode } from "react";
-import { buildClientHookErrorMessage } from "../shims/client-hook-error.js";
-import { ErrorBoundary } from "../shims/error-boundary.js";
-import { LayoutSegmentProvider } from "../shims/layout-segment-context.js";
-import {
-  MetadataHead,
-  ViewportHead,
-  mergeMetadata,
-  mergeViewport,
-  resolveModuleMetadata,
-  resolveModuleViewport,
-  type Metadata,
-  type Viewport,
-} from "../shims/metadata.js";
+import { buildClientHookErrorMessage } from "vinext/shims/client-hook-error";
+import { ErrorBoundary } from "vinext/shims/error-boundary";
+import { LayoutSegmentProvider } from "vinext/shims/layout-segment-context";
+import { MetadataHead, ViewportHead } from "vinext/shims/metadata";
 import type { AppPageFontPreload } from "./app-page-execution.js";
 import type { AppPageMiddlewareContext } from "./app-page-response.js";
+import type { MetadataFileRoute } from "./metadata-routes.js";
+import { resolveAppPageHead } from "./app-page-head.js";
 import {
   renderAppPageBoundaryResponse,
   resolveAppPageErrorBoundary,
@@ -52,7 +45,7 @@ type AppPageBoundaryRscPayloadOptions<TModule extends AppPageModule = AppPageMod
   route?: AppPageBoundaryRoute<TModule> | null;
 };
 
-type AppPageBoundaryRoute<TModule extends AppPageModule = AppPageModule> = {
+export type AppPageBoundaryRoute<TModule extends AppPageModule = AppPageModule> = {
   error?: TModule | null;
   errors?: readonly (TModule | null | undefined)[] | null;
   forbidden?: TModule | null;
@@ -78,6 +71,7 @@ type AppPageBoundaryRenderCommonOptions<TModule extends AppPageModule = AppPageM
   loadSsrHandler: () => Promise<AppPageSsrHandler>;
   makeThenableParams: (params: AppPageParams) => unknown;
   middlewareContext: AppPageMiddlewareContext;
+  metadataRoutes: MetadataFileRoute[];
   renderToReadableStream: (
     element: ReactNode | AppElements,
     options: { onError: AppPageBoundaryOnError },
@@ -114,55 +108,6 @@ function getDefaultExport<TModule extends AppPageModule>(
   module: TModule | null | undefined,
 ): AppPageComponent | null {
   return module?.default ?? null;
-}
-
-async function resolveAppPageLayoutHead<TModule extends AppPageModule>(
-  layoutModules: readonly (TModule | null | undefined)[],
-  params: AppPageParams,
-): Promise<{ metadata: Metadata | null; viewport: Viewport }> {
-  const filteredLayouts = layoutModules.filter(Boolean) as TModule[];
-  const layoutMetadataPromises: Promise<Metadata | null>[] = [];
-  let accumulatedMetadata = Promise.resolve<Metadata>({});
-
-  for (let index = 0; index < filteredLayouts.length; index++) {
-    const parentForLayout = accumulatedMetadata;
-    const metadataPromise = resolveModuleMetadata(
-      filteredLayouts[index],
-      params,
-      undefined,
-      parentForLayout,
-    ).catch((error) => {
-      console.error("[vinext] Layout generateMetadata() failed:", error);
-      return null;
-    });
-    layoutMetadataPromises.push(metadataPromise);
-    accumulatedMetadata = metadataPromise.then(async (metadataResult) => {
-      if (metadataResult) {
-        return mergeMetadata([await parentForLayout, metadataResult]);
-      }
-      return parentForLayout;
-    });
-  }
-
-  const [metadataResults, viewportResults] = await Promise.all([
-    Promise.all(layoutMetadataPromises),
-    Promise.all(
-      filteredLayouts.map((layoutModule) =>
-        resolveModuleViewport(layoutModule, params).catch((error) => {
-          console.error("[vinext] Layout generateViewport() failed:", error);
-          return null;
-        }),
-      ),
-    ),
-  ]);
-
-  const metadataList = metadataResults.filter(Boolean) as Metadata[];
-  const viewportList = viewportResults.filter(Boolean) as Viewport[];
-
-  return {
-    metadata: metadataList.length > 0 ? mergeMetadata(metadataList) : null,
-    viewport: mergeViewport(viewportList),
-  };
 }
 
 function wrapRenderedBoundaryElement<TModule extends AppPageModule>(
@@ -237,6 +182,38 @@ function resolveAppPageBoundaryRootLayoutTreePath<TModule extends AppPageModule>
   // Without route tree metadata we cannot derive a canonical root layout tree path.
   // Returning null keeps boundary payloads soft-navigation compatible.
   return null;
+}
+
+function resolveHttpAccessFallbackHeadRouteSegments<TModule extends AppPageModule>(
+  route: AppPageBoundaryRoute<TModule> | null | undefined,
+  layoutModules: readonly (TModule | null | undefined)[],
+): readonly string[] | undefined {
+  if (!route?.routeSegments) {
+    return undefined;
+  }
+
+  if (!route.layouts || layoutModules.length >= route.layouts.length) {
+    return route.routeSegments;
+  }
+
+  const lastIncludedLayoutIndex = layoutModules.length - 1;
+  if (lastIncludedLayoutIndex < 0) {
+    return [];
+  }
+
+  const segmentCount = route.layoutTreePositions?.[lastIncludedLayoutIndex] ?? 0;
+  return route.routeSegments.slice(0, segmentCount);
+}
+
+function resolveHttpAccessFallbackHeadLayoutTreePositions<TModule extends AppPageModule>(
+  route: AppPageBoundaryRoute<TModule> | null | undefined,
+  layoutModules: readonly (TModule | null | undefined)[],
+): readonly number[] | null | undefined {
+  if (!route?.layouts || layoutModules.length >= route.layouts.length) {
+    return route?.layoutTreePositions;
+  }
+
+  return route.layoutTreePositions?.slice(0, layoutModules.length);
 }
 
 function createAppPageBoundaryRscPayload<TModule extends AppPageModule>(
@@ -319,10 +296,18 @@ export async function renderAppPageHttpAccessFallback<TModule extends AppPageMod
   }
 
   const layoutModules = options.layoutModules ?? options.route?.layouts ?? options.rootLayouts;
-  const { metadata, viewport } = await resolveAppPageLayoutHead(
+  const routeSegments = resolveHttpAccessFallbackHeadRouteSegments(options.route, layoutModules);
+  const { metadata, viewport } = await resolveAppPageHead({
     layoutModules,
-    options.matchedParams,
-  );
+    layoutTreePositions: resolveHttpAccessFallbackHeadLayoutTreePositions(
+      options.route,
+      layoutModules,
+    ),
+    metadataRoutes: options.metadataRoutes,
+    params: options.matchedParams,
+    routePath: options.route?.pattern ?? new URL(options.requestUrl).pathname,
+    routeSegments,
+  });
 
   const headElements: ReactNode[] = [
     createElement("meta", { charSet: "utf-8", key: "charset" }),
@@ -375,11 +360,41 @@ export async function renderAppPageErrorBoundary<TModule extends AppPageModule>(
   const errorObject = options.sanitizeErrorForClient(rawError);
   const matchedParams = options.matchedParams ?? options.route?.params ?? {};
   const layoutModules = options.route?.layouts ?? options.rootLayouts;
+  const pathname = new URL(options.requestUrl).pathname;
+
+  const headElements: ReactNode[] = [createElement("meta", { charSet: "utf-8", key: "charset" })];
+  if (!errorBoundary.isGlobalError) {
+    try {
+      const { metadata, viewport } = await resolveAppPageHead({
+        fallbackOnFileMetadataError: true,
+        layoutModules,
+        layoutTreePositions: options.route?.layoutTreePositions,
+        metadataRoutes: options.metadataRoutes,
+        params: matchedParams,
+        routePath: options.route?.pattern ?? pathname,
+        routeSegments: options.route?.routeSegments,
+      });
+      if (metadata) {
+        headElements.push(createElement(MetadataHead, { key: "metadata", metadata }));
+      }
+      headElements.push(createElement(ViewportHead, { key: "viewport", viewport }));
+    } catch (error) {
+      console.error(
+        `[vinext] App page error boundary head resolution failed for ${options.route?.pattern ?? pathname}:`,
+        error,
+      );
+    }
+  }
 
   const element = wrapRenderedBoundaryElement({
-    element: createElement(errorBoundary.component, {
-      error: errorObject,
-    }),
+    element: createElement(
+      Fragment,
+      null,
+      ...headElements,
+      createElement(errorBoundary.component, {
+        error: errorObject,
+      }),
+    ),
     globalErrorModule: options.globalErrorModule,
     includeGlobalErrorBoundary: !errorBoundary.isGlobalError,
     isRscRequest: options.isRscRequest,

@@ -349,6 +349,39 @@ describe("analyzeConfig", () => {
     expect(items.find((i) => i.name === "experimental.serverActions")?.status).toBe("supported");
   });
 
+  it("detects experimental.prefetchInlining as partial", () => {
+    writeFile(
+      "next.config.mjs",
+      `export default {
+        experimental: {
+          prefetchInlining: true,
+        },
+      };`,
+    );
+
+    const items = analyzeConfig(tmpDir);
+    expect(items.find((i) => i.name === "experimental.prefetchInlining")?.status).toBe("partial");
+  });
+
+  it("detects experimental.swcEnvOptions as unsupported", () => {
+    writeFile(
+      "next.config.mjs",
+      `export default {
+        experimental: {
+          swcEnvOptions: {
+            mode: "usage",
+            coreJs: "3",
+          },
+        },
+      };`,
+    );
+
+    const items = analyzeConfig(tmpDir);
+    const item = items.find((i) => i.name === "experimental.swcEnvOptions");
+    expect(item?.status).toBe("unsupported");
+    expect(item?.detail).toContain("not applicable");
+  });
+
   it("detects allowedDevOrigins as supported", () => {
     writeFile(
       "next.config.mjs",
@@ -376,6 +409,19 @@ describe("analyzeConfig", () => {
     const items = analyzeConfig(tmpDir);
     expect(items.find((i) => i.name === "i18n")?.status).toBe("supported");
     expect(items.find((i) => i.name === "i18n.domains")?.status).toBe("partial");
+  });
+
+  it.each([
+    ["experimental.ppr", "experimental", "ppr: true"],
+    ["experimental.typedRoutes", "experimental", "typedRoutes: true"],
+    ["experimental.serverActions", "experimental", "serverActions: { allowedOrigins: [] }"],
+    ["experimental.prefetchInlining", "experimental", "prefetchInlining: true"],
+    ["experimental.swcEnvOptions", "experimental", 'swcEnvOptions: { mode: "usage" }'],
+    ["i18n.domains", "i18n", "domains: []"],
+  ])("detects %s via generic dot-notation handling", (name, parent, body) => {
+    writeFile("next.config.mjs", `export default { ${parent}: { ${body} } };`);
+    const items = analyzeConfig(tmpDir);
+    expect(items.find((i) => i.name === name)).toBeDefined();
   });
 
   it("reads next.config.ts files", () => {

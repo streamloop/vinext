@@ -333,6 +333,90 @@ describe("Tick-buffered RSC streaming (behavioral)", () => {
     expect(injectPos).toBeLessThan(headEndPos);
   });
 
+  it("emits new server-inserted HTML before streamed Suspense chunks after head injection", async () => {
+    // Ported from Next.js: test/e2e/app-dir/use-server-inserted-html/use-server-inserted-html.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/use-server-inserted-html/use-server-inserted-html.test.ts
+    const rsc = createMockRscStream();
+    rsc.close();
+
+    const rscEmbed = createRscEmbedTransform(rsc.stream);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const insertions = [
+      '<style data-styled="shell">.shell { color: blue; }</style>',
+      '<style data-styled="suspense">.suspense { color: orange; }</style>',
+      "",
+    ];
+    let insertCalls = 0;
+    const getServerInsertedHTML = () => {
+      insertCalls++;
+      return insertions.shift() ?? "";
+    };
+
+    const encoder = new TextEncoder();
+    const htmlStream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(
+          encoder.encode("<html><head><title>Test</title></head><body><main>shell"),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        controller.enqueue(
+          encoder.encode(
+            '<span id="footer-inner">resolved</span><script>$RC=function(){}</script></main></body></html>',
+          ),
+        );
+        controller.close();
+      },
+    });
+
+    const transform = createTickBufferedTransform(rscEmbed, getServerInsertedHTML);
+    const output = await collectStream(htmlStream.pipeThrough(transform));
+
+    const shellStylePos = output.indexOf('data-styled="shell"');
+    const headEndPos = output.indexOf("</head>");
+    expect(shellStylePos).toBeGreaterThan(-1);
+    expect(shellStylePos).toBeLessThan(headEndPos);
+
+    const suspenseStylePos = output.indexOf('data-styled="suspense"');
+    const refreshScriptPos = output.indexOf("$RC=function");
+    expect(suspenseStylePos).toBeGreaterThan(headEndPos);
+    expect(suspenseStylePos).toBeLessThan(refreshScriptPos);
+    expect(insertCalls).toBeGreaterThanOrEqual(2);
+  });
+
+  it("emits final server-inserted HTML even after buffered chunks were already drained", async () => {
+    const rsc = createMockRscStream();
+    rsc.close();
+
+    const rscEmbed = createRscEmbedTransform(rsc.stream);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const insertions = [
+      '<style data-styled="shell">.shell { color: blue; }</style>',
+      '<style data-styled="trailing">.trailing { color: green; }</style>',
+    ];
+    const getServerInsertedHTML = () => insertions.shift() ?? "";
+
+    const encoder = new TextEncoder();
+    const htmlStream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(encoder.encode("<html><head></head><body>shell</body></html>"));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        controller.close();
+      },
+    });
+
+    const transform = createTickBufferedTransform(rscEmbed, getServerInsertedHTML);
+    const output = await collectStream(htmlStream.pipeThrough(transform));
+
+    const shellStylePos = output.indexOf('data-styled="shell"');
+    const trailingStylePos = output.indexOf('data-styled="trailing"');
+    const donePos = output.indexOf("__VINEXT_RSC_DONE__=true");
+    expect(shellStylePos).toBeGreaterThan(-1);
+    expect(trailingStylePos).toBeGreaterThan(shellStylePos);
+    expect(trailingStylePos).toBeLessThan(donePos);
+  });
+
   it("still injects head content even without </head> in stream", async () => {
     const rsc = createMockRscStream();
     rsc.close();

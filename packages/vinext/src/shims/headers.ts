@@ -25,6 +25,7 @@ export type HeadersContext = {
   headers: Headers;
   cookies: Map<string, string>;
   accessError?: Error;
+  forceStatic?: boolean;
   mutableCookies?: RequestCookies;
   readonlyCookies?: RequestCookies;
   readonlyHeaders?: Headers;
@@ -35,6 +36,8 @@ export type HeadersAccessPhase = "render" | "action" | "route-handler";
 export type VinextHeadersShimState = {
   headersContext: HeadersContext | null;
   dynamicUsageDetected: boolean;
+  /** Error recorded by throwIfInsideCacheScope for dev diagnostics, persists even if caught by user code. */
+  invalidDynamicUsageError: unknown;
   pendingSetCookies: string[];
   draftModeCookieHeader: string | null;
   phase: HeadersAccessPhase;
@@ -56,11 +59,93 @@ const _als = (_g[_ALS_KEY] ??=
 const _fallbackState = (_g[_FALLBACK_KEY] ??= {
   headersContext: null,
   dynamicUsageDetected: false,
+  invalidDynamicUsageError: null,
   pendingSetCookies: [],
   draftModeCookieHeader: null,
   phase: "render",
 } satisfies VinextHeadersShimState) as VinextHeadersShimState;
 const EXPIRED_COOKIE_DATE = new Date(0).toUTCString();
+const MIDDLEWARE_SET_COOKIE_HEADER = "x-middleware-set-cookie";
+
+function splitMiddlewareSetCookieHeader(value: string): string[] {
+  const cookies: string[] = [];
+  let start = 0;
+  let inExpires = false;
+  let expiresCommaSeen = false;
+
+  for (let i = 0; i < value.length; i++) {
+    if (value.slice(i, i + 8).toLowerCase() === "expires=") {
+      inExpires = true;
+      expiresCommaSeen = false;
+      i += 7;
+      continue;
+    }
+
+    const ch = value[i];
+    if (inExpires && ch === ";") {
+      inExpires = false;
+      expiresCommaSeen = false;
+      continue;
+    }
+
+    if (ch !== ",") continue;
+    if (inExpires && !expiresCommaSeen) {
+      expiresCommaSeen = true;
+      continue;
+    }
+
+    const cookie = value.slice(start, i).trim();
+    if (cookie) cookies.push(cookie);
+    start = i + 1;
+    inExpires = false;
+    expiresCommaSeen = false;
+  }
+
+  const cookie = value.slice(start).trim();
+  if (cookie) cookies.push(cookie);
+  return cookies;
+}
+
+function setCookieNameValue(setCookie: string): { name: string; value: string } | null {
+  const equalsIndex = setCookie.indexOf("=");
+  if (equalsIndex <= 0) return null;
+
+  const name = setCookie.slice(0, equalsIndex).trim();
+  const valueEnd = setCookie.indexOf(";", equalsIndex + 1);
+  const encodedValue = setCookie.slice(equalsIndex + 1, valueEnd === -1 ? undefined : valueEnd);
+  let value: string;
+  try {
+    value = decodeURIComponent(encodedValue);
+  } catch {
+    value = encodedValue;
+  }
+
+  return { name, value };
+}
+
+function rebuildCookiesFromHeader(ctx: HeadersContext, cookieHeader: string | null): void {
+  ctx.cookies.clear();
+  if (cookieHeader === null) return;
+
+  const nextCookies = parseCookieHeader(cookieHeader);
+  for (const [name, value] of nextCookies) {
+    ctx.cookies.set(name, value);
+  }
+}
+
+function mergeMiddlewareSetCookies(ctx: HeadersContext, rawHeader: string | null): boolean {
+  if (rawHeader === null) return false;
+
+  let merged = false;
+  for (const setCookie of splitMiddlewareSetCookieHeader(rawHeader)) {
+    const entry = setCookieNameValue(setCookie);
+    if (!entry) continue;
+    ctx.cookies.set(entry.name, entry.value);
+    merged = true;
+  }
+
+  return merged;
+}
 
 function _getState(): VinextHeadersShimState {
   if (isInsideUnifiedScope()) {
@@ -81,7 +166,11 @@ function _getState(): VinextHeadersShimState {
  * Called by connection(), cookies(), headers(), and noStore().
  */
 export function markDynamicUsage(): void {
-  _getState().dynamicUsageDetected = true;
+  const state = _getState();
+  if (state.headersContext?.forceStatic) {
+    return;
+  }
+  state.dynamicUsageDetected = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,19 +205,54 @@ function _isInsideUnstableCache(): boolean {
  */
 export function throwIfInsideCacheScope(apiName: string): void {
   if (_isInsideUseCache()) {
-    throw new Error(
+    const error = new Error(
       `\`${apiName}\` cannot be called inside "use cache". ` +
         `If you need this data inside a cached function, call \`${apiName}\` ` +
         "outside and pass the required data as an argument.",
     );
+    // Record the error on the request context so it survives user try/catch
+    // and can be forwarded to the dev overlay on client-side navigations.
+    // Ported from Next.js: workStore.invalidDynamicUsageError assignment in
+    // packages/next/src/server/app-render/app-render.tsx
+    // https://github.com/vercel/next.js/commit/f5e54c06726b571a042fce67417e40a29f6b8689
+    try {
+      const ctx = getRequestContext();
+      if (ctx) ctx.invalidDynamicUsageError = error;
+    } catch {
+      // Ignore — best-effort recording for dev diagnostics
+    }
+    throw error;
   }
   if (_isInsideUnstableCache()) {
-    throw new Error(
+    const error = new Error(
       `\`${apiName}\` cannot be called inside a function cached with \`unstable_cache()\`. ` +
         `If you need this data inside a cached function, call \`${apiName}\` ` +
         "outside and pass the required data as an argument.",
     );
+    try {
+      const ctx = getRequestContext();
+      if (ctx) ctx.invalidDynamicUsageError = error;
+    } catch {
+      // Ignore
+    }
+    throw error;
   }
+}
+
+/**
+ * Check, consume, and return any invalid dynamic usage error recorded during
+ * the render (e.g. cookies() called inside "use cache"). This error persists
+ * even if the throw was caught by user-code try/catch, so it can surface on
+ * client-side navigations where the static shell validation is skipped.
+ * Ported from Next.js: workStore.invalidDynamicUsageError in
+ * packages/next/src/server/app-render/app-render.tsx
+ * https://github.com/vercel/next.js/commit/f5e54c06726b571a042fce67417e40a29f6b8689
+ */
+export function consumeInvalidDynamicUsageError(): unknown {
+  const state = _getState();
+  const err = state.invalidDynamicUsageError;
+  state.invalidDynamicUsageError = null;
+  return err;
 }
 
 /**
@@ -224,6 +348,7 @@ export function runWithHeadersContext<T>(
   const state: VinextHeadersShimState = {
     headersContext: ctx,
     dynamicUsageDetected: false,
+    invalidDynamicUsageError: null,
     pendingSetCookies: [],
     draftModeCookieHeader: null,
     phase: "render",
@@ -257,31 +382,31 @@ export function applyMiddlewareRequestHeaders(middlewareResponseHeaders: Headers
 
   const ctx = state.headersContext;
   const previousCookieHeader = ctx.headers.get("cookie");
+  const middlewareSetCookieHeader = middlewareResponseHeaders.get(MIDDLEWARE_SET_COOKIE_HEADER);
   const nextHeaders = buildRequestHeadersFromMiddlewareResponse(
     ctx.headers,
     middlewareResponseHeaders,
   );
 
-  if (!nextHeaders) return;
+  if (!nextHeaders && middlewareSetCookieHeader === null) return;
 
-  ctx.headers = nextHeaders;
-  // Invalidate any sealed snapshot of the pre-override headers. A middleware
-  // that read `headers()` before returning the override (e.g. clerkMiddleware)
-  // would otherwise leak the pre-override view into the Server Component.
-  ctx.readonlyHeaders = undefined;
-  const nextCookieHeader = nextHeaders.get("cookie");
-  if (previousCookieHeader === nextCookieHeader) return;
-
-  // If middleware modified the cookie header, rebuild the cookies map and
-  // drop any sealed snapshots that were captured from the pre-override map.
-  ctx.cookies.clear();
-  ctx.readonlyCookies = undefined;
-  ctx.mutableCookies = undefined;
-  if (nextCookieHeader !== null) {
-    const nextCookies = parseCookieHeader(nextCookieHeader);
-    for (const [name, value] of nextCookies) {
-      ctx.cookies.set(name, value);
+  if (nextHeaders) {
+    ctx.headers = nextHeaders;
+    // Invalidate any sealed snapshot of the pre-override headers. A middleware
+    // that read `headers()` before returning the override (e.g. clerkMiddleware)
+    // would otherwise leak the pre-override view into the Server Component.
+    ctx.readonlyHeaders = undefined;
+    const nextCookieHeader = nextHeaders.get("cookie");
+    if (previousCookieHeader !== nextCookieHeader) {
+      rebuildCookiesFromHeader(ctx, nextCookieHeader);
+      ctx.readonlyCookies = undefined;
+      ctx.mutableCookies = undefined;
     }
+  }
+
+  if (mergeMiddlewareSetCookies(ctx, middlewareSetCookieHeader)) {
+    ctx.readonlyCookies = undefined;
+    ctx.mutableCookies = undefined;
   }
 }
 
@@ -300,6 +425,9 @@ class ReadonlyHeadersError extends Error {
   }
 }
 
+// Keep this error message in sync with server.ts. The two RequestCookies
+// adapters are separate until the next/headers and NextRequest cookie paths
+// share one implementation.
 class ReadonlyRequestCookiesError extends Error {
   constructor() {
     super(
@@ -598,6 +726,7 @@ export function getAndClearPendingCookies(): string[] {
 
 // Draft mode cookie name (matches Next.js convention)
 const DRAFT_MODE_COOKIE = "__prerender_bypass";
+const DRAFT_MODE_EXPIRED_DATE = new Date(0).toUTCString();
 
 // Draft mode secret — generated once at build time via Vite `define` so the
 // __prerender_bypass cookie is consistent across all server instances (e.g.
@@ -633,6 +762,13 @@ type DraftModeResult = {
   disable(): void;
 };
 
+function draftModeCookieAttributes(): string {
+  if (typeof process !== "undefined" && process.env?.NODE_ENV === "development") {
+    return "Path=/; HttpOnly; SameSite=Lax";
+  }
+  return "Path=/; HttpOnly; SameSite=None; Secure";
+}
+
 /**
  * Draft mode — check/toggle via a `__prerender_bypass` cookie.
  *
@@ -662,9 +798,7 @@ export async function draftMode(): Promise<DraftModeResult> {
       if (state.headersContext) {
         state.headersContext.cookies.set(DRAFT_MODE_COOKIE, secret);
       }
-      const secure =
-        typeof process !== "undefined" && process.env?.NODE_ENV === "production" ? "; Secure" : "";
-      state.draftModeCookieHeader = `${DRAFT_MODE_COOKIE}=${secret}; Path=/; HttpOnly; SameSite=Lax${secure}`;
+      state.draftModeCookieHeader = `${DRAFT_MODE_COOKIE}=${secret}; ${draftModeCookieAttributes()}`;
     },
     disable(): void {
       if (state.headersContext?.accessError) {
@@ -673,9 +807,7 @@ export async function draftMode(): Promise<DraftModeResult> {
       if (state.headersContext) {
         state.headersContext.cookies.delete(DRAFT_MODE_COOKIE);
       }
-      const secure =
-        typeof process !== "undefined" && process.env?.NODE_ENV === "production" ? "; Secure" : "";
-      state.draftModeCookieHeader = `${DRAFT_MODE_COOKIE}=; Path=/; HttpOnly; SameSite=Lax${secure}; Max-Age=0`;
+      state.draftModeCookieHeader = `${DRAFT_MODE_COOKIE}=; ${draftModeCookieAttributes()}; Expires=${DRAFT_MODE_EXPIRED_DATE}`;
     },
   };
 }

@@ -3,7 +3,11 @@ import { createInlineScriptTag, safeJsonStringify } from "./html.js";
 type RscEmbedTransform = {
   flush(): string;
   finalize(): Promise<string>;
+  /** Resolves when all raw bytes from the embed stream have been read. */
+  getRawBuffer(): Promise<ArrayBuffer>;
 };
+
+type HtmlInsertion = string | (() => string);
 
 /**
  * Fix invalid preload "as" values in RSC Flight hint lines before they reach
@@ -25,6 +29,7 @@ export function createRscEmbedTransform(
   const reader = embedStream.getReader();
   const decoder = new TextDecoder();
   let pendingChunks: string[] = [];
+  const rawChunks: Uint8Array[] = [];
   let reading = false;
 
   async function pumpReader(): Promise<void> {
@@ -34,6 +39,9 @@ export function createRscEmbedTransform(
       while (true) {
         const result = await reader.read();
         if (result.done) break;
+        // Accumulate raw bytes BEFORE fixFlightHints so the cache stores
+        // unmodified RSC data. The embed script path below applies fixes.
+        rawChunks.push(result.value);
         const text = decoder.decode(result.value, { stream: true });
         // The RSC entry already fixes HL hints at the source. Keep this second
         // pass as defense in depth for any embed stream that bypasses that
@@ -44,6 +52,7 @@ export function createRscEmbedTransform(
       if (process.env.NODE_ENV !== "production") {
         console.warn("[vinext] RSC embed stream read error:", error);
       }
+      throw error;
     } finally {
       reading = false;
     }
@@ -76,6 +85,22 @@ export function createRscEmbedTransform(
       scripts += createInlineScriptTag("self.__VINEXT_RSC_DONE__=true", scriptNonce);
       return scripts;
     },
+
+    async getRawBuffer(): Promise<ArrayBuffer> {
+      await pumpPromise;
+      let totalLength = 0;
+      for (const chunk of rawChunks) {
+        totalLength += chunk.byteLength;
+      }
+      const buffer = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const chunk of rawChunks) {
+        buffer.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      rawChunks.length = 0;
+      return buffer.buffer;
+    },
   };
 }
 
@@ -96,22 +121,39 @@ export function fixPreloadAs(html: string): string {
  */
 export function createTickBufferedTransform(
   rscEmbed: RscEmbedTransform,
-  injectHTML = "",
+  injectHTML: HtmlInsertion = "",
 ): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
+  const insertsPerFlush = typeof injectHTML === "function";
   let injected = false;
   let buffered: string[] = [];
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const readInsertion = (): string =>
+    typeof injectHTML === "function" ? injectHTML() : injectHTML;
+  const emitInsertion = (controller: TransformStreamDefaultController<Uint8Array>): void => {
+    const insertion = readInsertion();
+    if (insertion) {
+      controller.enqueue(encoder.encode(insertion));
+    }
+  };
 
   const flushBuffered = (controller: TransformStreamDefaultController<Uint8Array>): void => {
+    if (buffered.length === 0) return;
+
+    if (injected && insertsPerFlush) {
+      // Emit newly collected server-inserted HTML before the next Fizz HTML
+      // batch so CSS-in-JS styles precede the elements they style.
+      emitInsertion(controller);
+    }
+
     for (const chunk of buffered) {
       if (!injected) {
         const headEnd = chunk.indexOf("</head>");
         if (headEnd !== -1) {
           const before = chunk.slice(0, headEnd);
           const after = chunk.slice(headEnd);
-          controller.enqueue(encoder.encode(before + injectHTML + after));
+          controller.enqueue(encoder.encode(before + readInsertion() + after));
           injected = true;
           continue;
         }
@@ -153,8 +195,11 @@ export function createTickBufferedTransform(
 
       flushBuffered(controller);
 
-      if (!injected && injectHTML) {
-        controller.enqueue(encoder.encode(injectHTML));
+      if (!injected) {
+        emitInsertion(controller);
+        injected = true;
+      } else if (insertsPerFlush) {
+        emitInsertion(controller);
       }
 
       const finalScripts = await rscEmbed.finalize();

@@ -54,7 +54,7 @@ const IMPORT_SUPPORT: Record<string, { status: Status; detail?: string }> = {
   "next/server": { status: "supported", detail: "NextRequest/NextResponse shimmed" },
   "next/cache": {
     status: "supported",
-    detail: "revalidateTag, revalidatePath, unstable_cache, cacheLife, cacheTag",
+    detail: "revalidateTag, revalidatePath, unstable_cache, unstable_io, cacheLife, cacheTag",
   },
   "next/dynamic": { status: "supported" },
   "next/head": { status: "supported" },
@@ -70,6 +70,10 @@ const IMPORT_SUPPORT: Record<string, { status: Status; detail?: string }> = {
   "next/og": { status: "supported", detail: "ImageResponse via @vercel/og" },
   "next/config": { status: "supported" },
   "next/amp": { status: "unsupported", detail: "AMP is not supported" },
+  "next/offline": {
+    status: "partial",
+    detail: "useOffline() hook available; offline retry behavior deferred",
+  },
   "next/document": { status: "supported", detail: "custom _document.tsx" },
   "next/app": { status: "supported", detail: "custom _app.tsx" },
   "next/error": { status: "supported" },
@@ -158,11 +162,29 @@ const CONFIG_SUPPORT: Record<string, { status: Status; detail?: string }> = {
     status: "unsupported",
     detail: "Vite replaces webpack — custom webpack configs need migration",
   },
+  enablePrerenderSourceMaps: {
+    status: "supported",
+    detail: "sourcemap-resolved stack traces during prerender",
+  },
   "experimental.ppr": { status: "unsupported", detail: "partial prerendering not yet implemented" },
   "experimental.typedRoutes": { status: "unsupported", detail: "typed routes not implemented" },
   "experimental.serverActions": {
     status: "supported",
     detail: "server actions via 'use server' directive",
+  },
+  "experimental.prefetchInlining": {
+    status: "partial",
+    detail:
+      "config recognized; vinext uses unified RSC navigation payloads so per-segment prefetch inlining is a no-op",
+  },
+  "experimental.outputHashSalt": {
+    status: "supported",
+    detail: "salt mixed into output content hashes for cache-busting",
+  },
+  "experimental.swcEnvOptions": {
+    status: "unsupported",
+    detail:
+      "not applicable; vinext uses Vite instead of SWC. A Vite-compatible polyfill solution may be explored in the future.",
   },
   "i18n.domains": {
     status: "partial",
@@ -376,7 +398,7 @@ export function analyzeConfig(root: string): CheckItem[] {
 
   for (const opt of configOptions) {
     // Simple heuristic: check if the option name appears as a property in the config
-    const regex = new RegExp(`\\b${opt}\\b`);
+    const regex = new RegExp(String.raw`\b${opt}\b`);
     if (regex.test(content)) {
       const support = CONFIG_SUPPORT[opt];
       if (support) {
@@ -387,28 +409,15 @@ export function analyzeConfig(root: string): CheckItem[] {
     }
   }
 
-  // Check for experimental options
-  if (/experimental\s*[:=]\s*\{/.test(content)) {
-    if (/\bppr\b/.test(content)) {
-      items.push({ name: "experimental.ppr", ...CONFIG_SUPPORT["experimental.ppr"]! });
+  // Check for nested (dot-notation) options: parent block present + child name appears
+  for (const key of Object.keys(CONFIG_SUPPORT)) {
+    if (!key.includes(".")) continue;
+    const dot = key.indexOf(".");
+    const parentBlock = new RegExp(String.raw`\b${key.slice(0, dot)}\s*[:=]\s*\{`);
+    const childRef = new RegExp(String.raw`\b${key.slice(dot + 1)}\b`);
+    if (parentBlock.test(content) && childRef.test(content)) {
+      items.push({ name: key, ...CONFIG_SUPPORT[key]! });
     }
-    if (/\btypedRoutes\b/.test(content)) {
-      items.push({
-        name: "experimental.typedRoutes",
-        ...CONFIG_SUPPORT["experimental.typedRoutes"]!,
-      });
-    }
-    if (/\bserverActions\b/.test(content)) {
-      items.push({
-        name: "experimental.serverActions",
-        ...CONFIG_SUPPORT["experimental.serverActions"]!,
-      });
-    }
-  }
-
-  // Check for i18n.domains
-  if (/domains\s*:/.test(content) && /i18n/.test(content)) {
-    items.push({ name: "i18n.domains", ...CONFIG_SUPPORT["i18n.domains"]! });
   }
 
   // Sort: unsupported first

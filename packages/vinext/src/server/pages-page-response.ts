@@ -1,5 +1,6 @@
 import React, { type ComponentType, type ReactNode } from "react";
-import { withScriptNonce } from "../shims/script-nonce-context.js";
+import { withScriptNonce } from "vinext/shims/script-nonce-context";
+import { buildRevalidateCacheControl } from "./cache-control.js";
 import { createInlineScriptTag, createNonceAttribute, escapeHtmlAttr } from "./html.js";
 
 type PagesFontPreload = {
@@ -37,6 +38,7 @@ type RenderPagesPageResponseOptions = {
   getSSRHeadHTML?: (() => string) | undefined;
   gsspRes: PagesGsspResponse | null;
   isrCacheKey: (router: string, pathname: string) => string;
+  expireSeconds?: number;
   isrRevalidateSeconds: number | null;
   isrSet: (
     key: string,
@@ -48,6 +50,8 @@ type RenderPagesPageResponseOptions = {
       status: undefined;
     },
     revalidateSeconds: number,
+    tags?: string[],
+    expireSeconds?: number,
   ) => Promise<void>;
   i18n: PagesI18nRenderContext;
   pageProps: Record<string, unknown>;
@@ -247,6 +251,13 @@ export async function renderPagesPageResponse(
     scriptNonce: options.scriptNonce,
   });
   const bodyMarker = "<!--VINEXT_STREAM_BODY-->";
+  // Render the page FIRST so that <Head> and other SSR state collectors
+  // (e.g. styled-jsx, useServerInsertedHTML) are populated before we read
+  // them. This fixes a race condition where head styles were silently dropped
+  // because they were collected before the page had finished rendering.
+  // Mirrors Next.js fix: vercel/next.js@9853944
+  const bodyStream = await options.renderToReadableStream(pageElement);
+
   const shellHtml = await buildPagesShellHtml(bodyMarker, fontHeadHTML, nextDataScript, {
     assetTags: options.assetTags,
     DocumentComponent: options.DocumentComponent,
@@ -259,7 +270,6 @@ export async function renderPagesPageResponse(
   const markerIndex = shellHtml.indexOf(bodyMarker);
   const shellPrefix = shellHtml.slice(0, markerIndex);
   const shellSuffix = shellHtml.slice(markerIndex + bodyMarker.length);
-  const bodyStream = await options.renderToReadableStream(pageElement);
   const compositeStream = await buildPagesCompositeStream(bodyStream, shellPrefix, shellSuffix);
 
   if (
@@ -288,6 +298,8 @@ export async function renderPagesPageResponse(
         status: undefined,
       },
       options.isrRevalidateSeconds,
+      undefined,
+      options.expireSeconds,
     );
   }
 
@@ -299,7 +311,7 @@ export async function renderPagesPageResponse(
   } else if (options.isrRevalidateSeconds) {
     responseHeaders.set(
       "Cache-Control",
-      `s-maxage=${options.isrRevalidateSeconds}, stale-while-revalidate`,
+      buildRevalidateCacheControl(options.isrRevalidateSeconds, options.expireSeconds),
     );
     responseHeaders.set("X-Vinext-Cache", "MISS");
   }

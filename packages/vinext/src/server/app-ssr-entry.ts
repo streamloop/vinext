@@ -5,17 +5,17 @@ import { Fragment, createElement as createReactElement, use } from "react";
 import { createFromReadableStream } from "@vitejs/plugin-rsc/ssr";
 import { renderToReadableStream, renderToStaticMarkup } from "react-dom/server.edge";
 import * as clientReferences from "virtual:vite-rsc/client-references";
-import type { NavigationContext } from "../shims/navigation.js";
+import type { NavigationContext } from "vinext/shims/navigation";
 import {
   ServerInsertedHTMLContext,
   clearServerInsertedHTML,
-  flushServerInsertedHTML,
+  renderServerInsertedHTML,
   setNavigationContext,
   useServerInsertedHTML,
-} from "../shims/navigation.js";
-import { runWithNavigationContext } from "../shims/navigation-state.js";
+} from "vinext/shims/navigation";
+import { runWithNavigationContext } from "vinext/shims/navigation-state";
 import { isOpenRedirectShaped } from "./request-pipeline.js";
-import { withScriptNonce } from "../shims/script-nonce-context.js";
+import { withScriptNonce } from "vinext/shims/script-nonce-context";
 import {
   createInlineScriptTag,
   createNonceAttribute,
@@ -23,12 +23,13 @@ import {
   safeJsonStringify,
 } from "./html.js";
 import { createRscEmbedTransform, createTickBufferedTransform } from "./app-ssr-stream.js";
+import { deferUntilStreamConsumed } from "./app-page-stream.js";
 import {
   normalizeAppElements,
   readAppElementsMetadata,
   type AppWireElements,
 } from "./app-elements.js";
-import { ElementsContext, Slot } from "../shims/slot.js";
+import { ElementsContext, Slot } from "vinext/shims/slot";
 
 export type FontPreload = {
   href: string;
@@ -166,7 +167,15 @@ export async function handleSsr(
   rscStream: ReadableStream<Uint8Array>,
   navContext: NavigationContext | null,
   fontData?: FontData,
-  options?: { scriptNonce?: string },
+  options?: {
+    scriptNonce?: string;
+    /** Pre-split side stream for embed+capture fusion. When provided,
+     *  rscStream is fed directly to createFromReadableStream (no internal tee).
+     *  The embed transform accumulates raw bytes. */
+    sideStream?: ReadableStream<Uint8Array>;
+    /** Out-parameter: filled with accumulated raw RSC bytes when sideStream is consumed. */
+    capturedRscDataRef?: { value: Promise<ArrayBuffer> | null };
+  },
 ): Promise<ReadableStream<Uint8Array>> {
   return runWithNavigationContext(async () => {
     await preloadClientReferences();
@@ -177,9 +186,29 @@ export async function handleSsr(
 
     clearServerInsertedHTML();
 
+    const cleanup = (): void => {
+      setNavigationContext(null);
+      clearServerInsertedHTML();
+    };
+
     try {
-      const [ssrStream, embedStream] = rscStream.tee();
-      const rscEmbed = createRscEmbedTransform(embedStream, options?.scriptNonce);
+      // Fused tee path (#981): caller pre-split the stream. No internal tee needed.
+      // sideStream carries both the embed transform and raw byte accumulation.
+      // rscStream is used directly for createFromReadableStream (SSR).
+      let ssrStream: ReadableStream<Uint8Array>;
+      let rscEmbed;
+
+      if (options?.sideStream) {
+        ssrStream = rscStream;
+        rscEmbed = createRscEmbedTransform(options.sideStream, options?.scriptNonce);
+        if (options.capturedRscDataRef) {
+          options.capturedRscDataRef.value = rscEmbed.getRawBuffer();
+        }
+      } else {
+        const [s1, s2] = rscStream.tee();
+        ssrStream = s1;
+        rscEmbed = createRscEmbedTransform(s2, options?.scriptNonce);
+      }
 
       let flightRoot: PromiseLike<AppWireElements> | null = null;
 
@@ -227,20 +256,29 @@ export async function handleSsr(
         },
       });
 
-      const insertedHTML = renderInsertedHtml(flushServerInsertedHTML());
       const fontHTML = renderFontHtml(fontData, options?.scriptNonce);
-      const injectHTML = buildHeadInjectionHtml(
-        navContext,
-        bootstrapScriptContent,
-        insertedHTML,
-        fontHTML,
-        options?.scriptNonce,
-      );
+      let didInjectHeadHTML = false;
+      const getInsertedHTML = (): string => {
+        const insertedHTML = renderInsertedHtml(renderServerInsertedHTML());
+        if (didInjectHeadHTML) return insertedHTML;
 
-      return htmlStream.pipeThrough(createTickBufferedTransform(rscEmbed, injectHTML));
-    } finally {
-      setNavigationContext(null);
-      clearServerInsertedHTML();
+        didInjectHeadHTML = true;
+        return buildHeadInjectionHtml(
+          navContext,
+          bootstrapScriptContent,
+          insertedHTML,
+          fontHTML,
+          options?.scriptNonce,
+        );
+      };
+
+      return deferUntilStreamConsumed(
+        htmlStream.pipeThrough(createTickBufferedTransform(rscEmbed, getInsertedHTML)),
+        cleanup,
+      );
+    } catch (error) {
+      cleanup();
+      throw error;
     }
   }) as Promise<ReadableStream<Uint8Array>>;
 }

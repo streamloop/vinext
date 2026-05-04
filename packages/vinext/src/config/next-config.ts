@@ -7,8 +7,9 @@
 import path from "node:path";
 import { createRequire } from "node:module";
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import { PHASE_DEVELOPMENT_SERVER, PHASE_PRODUCTION_BUILD } from "../shims/constants.js";
+import { PHASE_DEVELOPMENT_SERVER, PHASE_PRODUCTION_BUILD } from "vinext/shims/constants";
 import { normalizePageExtensions } from "../routing/file-matcher.js";
 import { isExternalUrl } from "./config-matchers.js";
 
@@ -179,12 +180,20 @@ export type NextConfig = {
   pageExtensions?: string[];
   /** Extra origins allowed to access the dev server. */
   allowedDevOrigins?: string[];
+  /** Maximum age in seconds for stale ISR entries before blocking regeneration. */
+  expireTime?: number;
   /**
    * Enable Cache Components (Next.js 16).
    * When true, enables the "use cache" directive for pages, components, and functions.
    * Replaces the removed experimental.ppr and experimental.dynamicIO flags.
    */
   cacheComponents?: boolean;
+  /**
+   * Enables source maps while generating static pages.
+   * Helps with errors during the prerender phase in `vinext build`.
+   * Defaults to `true`. Set to `false` to disable.
+   */
+  enablePrerenderSourceMaps?: boolean;
   /** Transpile packages (Vite handles this natively) */
   transpilePackages?: string[];
   /**
@@ -195,6 +204,18 @@ export type NextConfig = {
   serverExternalPackages?: string[];
   /** Webpack config (ignored — we use Vite) */
   webpack?: unknown;
+  /**
+   * Path to a custom cache handler module (e.g., KV, Redis, DynamoDB).
+   * Accepts relative paths, absolute paths, or file:// URLs from import.meta.resolve().
+   * When "type": "module" is set in package.json, use import.meta.resolve() instead of
+   * require.resolve() to get a valid path.
+   */
+  cacheHandler?: string;
+  /**
+   * Maximum memory size (bytes) for the default in-memory cache handler.
+   * Set to 0 to disable in-memory caching entirely.
+   */
+  cacheMaxMemorySize?: number;
   /**
    * Custom build ID generator. If provided, called once at build/dev start.
    * Must return a non-empty string, or null to use the default random ID.
@@ -242,17 +263,39 @@ export type ResolvedNextConfig = {
   optimizePackageImports: string[];
   /** Parsed body size limit for server actions in bytes (from experimental.serverActions.bodySizeLimit). Defaults to 1MB. */
   serverActionsBodySizeLimit: number;
+  /** Route-level expire fallback in seconds for ISR entries with numeric revalidate. */
+  expireTime: number;
   /**
    * Packages that should be treated as server-external (not bundled by Vite).
    * Sourced from `serverExternalPackages` or the legacy
    * `experimental.serverComponentsExternalPackages` in next.config.
    */
   serverExternalPackages: string[];
+  /** Enable sourcemaps for prerender error stack traces. Defaults to true. */
+  enablePrerenderSourceMaps: boolean;
   /** Resolved build ID (from generateBuildId, or a random UUID if not provided). */
   buildId: string;
+  /**
+   * Path to a custom cache handler module. file:// URLs are resolved to
+   * filesystem paths via fileURLToPath() during config resolution.
+   */
+  cacheHandler: string | undefined;
+  /**
+   * Maximum memory size (bytes) for the default in-memory cache handler.
+   * Set to 0 to disable in-memory caching entirely.
+   */
+  cacheMaxMemorySize: number | undefined;
+  /**
+   * Concatenated hash salt from `experimental.outputHashSalt` config option
+   * and `NEXT_HASH_SALT` environment variable. Empty string when neither is set.
+   * When non-empty, mix into content-addressed output filenames so hash values
+   * change without modifying source — useful for cache-busting after CDN poisoning.
+   */
+  hashSalt: string;
 };
 
 const CONFIG_FILES = ["next.config.ts", "next.config.mjs", "next.config.js", "next.config.cjs"];
+const DEFAULT_EXPIRE_TIME = 31_536_000;
 
 /**
  * Check whether an error indicates a CJS module was loaded in an ESM context
@@ -435,6 +478,20 @@ async function resolveBuildId(
 }
 
 /**
+ * Converts a cache handler path to a filesystem path.
+ * ESM's import.meta.resolve() returns file:// URLs which break when concatenated
+ * with path operations like path.join or path.relative.
+ * @param filePath - Absolute path, relative path, or file:// URL (e.g. from import.meta.resolve)
+ * @returns A filesystem path suitable for path operations
+ */
+function resolveCacheHandlerPathToFilesystem(filePath: string): string {
+  if (filePath.startsWith("file://")) {
+    return fileURLToPath(filePath);
+  }
+  return filePath;
+}
+
+/**
  * Resolve a NextConfig into a fully-resolved ResolvedNextConfig.
  * Awaits async functions for redirects/rewrites/headers.
  */
@@ -462,7 +519,12 @@ export async function resolveNextConfig(
       serverActionsAllowedOrigins: [],
       optimizePackageImports: [],
       serverActionsBodySizeLimit: 1 * 1024 * 1024,
+      expireTime: DEFAULT_EXPIRE_TIME,
       serverExternalPackages: [],
+      cacheHandler: undefined,
+      cacheMaxMemorySize: undefined,
+      enablePrerenderSourceMaps: true,
+      hashSalt: process.env.NEXT_HASH_SALT ?? "",
       buildId,
     };
     detectNextIntlConfig(root, resolved);
@@ -542,6 +604,11 @@ export async function resolveNextConfig(
     serverActionsConfig?.bodySizeLimit as string | number | undefined,
   );
 
+  // Resolve hashSalt from experimental.outputHashSalt config + NEXT_HASH_SALT env var.
+  // Next.js concatenates them: config value first, then env var.
+  const configOutputHashSalt = experimental?.outputHashSalt as string | undefined;
+  const hashSalt = (configOutputHashSalt ?? "") + (process.env.NEXT_HASH_SALT ?? "");
+
   // Resolve optimizePackageImports from experimental config
   const rawOptimize = experimental?.optimizePackageImports;
   const optimizePackageImports = Array.isArray(rawOptimize)
@@ -557,6 +624,15 @@ export async function resolveNextConfig(
     : Array.isArray(legacyServerComponentsExternal)
       ? (legacyServerComponentsExternal as string[])
       : [];
+
+  // Warn about unsupported experimental.swcEnvOptions. vinext uses Vite for
+  // transforms, not SWC, so automatic polyfill injection is not applicable.
+  if (experimental?.swcEnvOptions !== undefined) {
+    console.warn(
+      '[vinext] next.config option "experimental.swcEnvOptions" is not applicable and will be ignored (vinext uses Vite, not SWC). ' +
+        "A Vite-compatible polyfill solution may be explored in the future.",
+    );
+  }
 
   // Warn about unsupported webpack usage. We preserve alias injection and
   // extract MDX settings, but all other webpack customization is still ignored.
@@ -595,6 +671,16 @@ export async function resolveNextConfig(
     config.generateBuildId as (() => string | null | Promise<string | null>) | undefined,
   );
 
+  // Resolve cacheHandler path — handle file:// URLs from import.meta.resolve()
+  const cacheHandler: string | undefined =
+    typeof config.cacheHandler === "string"
+      ? resolveCacheHandlerPathToFilesystem(config.cacheHandler)
+      : undefined;
+
+  // Resolve cacheMaxMemorySize
+  const cacheMaxMemorySize: number | undefined =
+    typeof config.cacheMaxMemorySize === "number" ? config.cacheMaxMemorySize : undefined;
+
   const resolved: ResolvedNextConfig = {
     env: config.env ?? {},
     basePath: config.basePath ?? "",
@@ -613,7 +699,12 @@ export async function resolveNextConfig(
     serverActionsAllowedOrigins,
     optimizePackageImports,
     serverActionsBodySizeLimit,
+    expireTime: typeof config.expireTime === "number" ? config.expireTime : DEFAULT_EXPIRE_TIME,
     serverExternalPackages,
+    cacheHandler,
+    cacheMaxMemorySize,
+    enablePrerenderSourceMaps: config.enablePrerenderSourceMaps ?? true,
+    hashSalt,
     buildId,
   };
 
@@ -850,4 +941,4 @@ function extractPluginsFromOptions(opts: any): MdxOptions | null {
   return null;
 }
 
-export { PHASE_PRODUCTION_BUILD } from "../shims/constants.js";
+export { PHASE_PRODUCTION_BUILD } from "vinext/shims/constants";

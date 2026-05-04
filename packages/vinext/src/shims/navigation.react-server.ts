@@ -21,6 +21,7 @@ export {
 
   // Server-inserted HTML
   flushServerInsertedHTML,
+  renderServerInsertedHTML,
   clearServerInsertedHTML,
 
   // Control-flow errors

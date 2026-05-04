@@ -1407,6 +1407,28 @@ export function flushServerInsertedHTML(): unknown[] {
 }
 
 /**
+ * Render collected useServerInsertedHTML callbacks without unregistering them.
+ *
+ * Streaming SSR needs to invoke the same style-registry callbacks after each
+ * Fizz flush. Libraries such as styled-components and Emotion clear their own
+ * per-flush buffers inside the callback; the registration itself must survive
+ * until the request stream is closed.
+ */
+export function renderServerInsertedHTML(): unknown[] {
+  const callbacks = _getInsertedHTMLCallbacks();
+  const results: unknown[] = [];
+  for (const cb of callbacks) {
+    try {
+      const result = cb();
+      if (result != null) results.push(result);
+    } catch {
+      // Ignore errors from individual callbacks
+    }
+  }
+  return results;
+}
+
+/**
  * Clear all collected useServerInsertedHTML callbacks without flushing.
  * Used for cleanup between requests.
  */

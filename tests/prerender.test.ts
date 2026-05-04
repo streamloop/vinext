@@ -262,6 +262,16 @@ describe("prerenderPages — export mode (pages-basic)", () => {
       expect(ssr.error).toMatch(/getServerSideProps/);
     }
   });
+
+  it("includes stack trace in error when enablePrerenderSourceMaps is true", () => {
+    // enablePrerenderSourceMaps defaults to true in resolveNextConfig (line 230)
+    const errorRoute = findRoute(results, "/error-throw");
+    expect(errorRoute).toMatchObject({ status: "error" });
+    if (errorRoute?.status === "error") {
+      // Verify the error includes a stack trace (multiple lines with "at " frames)
+      expect(errorRoute.error).toMatch(/\n\s+at /);
+    }
+  });
 });
 
 // ─── App Router ───────────────────────────────────────────────────────────────
@@ -326,6 +336,40 @@ describe("prerenderApp — default mode (app-basic)", () => {
   it("renders ISR page with revalidate=60", () => {
     const r = findRoute(results, "/revalidate-test");
     expect(r).toMatchObject({ route: "/revalidate-test", status: "rendered", revalidate: 60 });
+  });
+
+  it("uses the rendered cacheLife expire value for App Router ISR prerender entries", () => {
+    const r = findRoute(results, "/prerender-cache-life");
+    expect(r).toMatchObject({
+      route: "/prerender-cache-life",
+      status: "rendered",
+      revalidate: 1,
+      expire: 3,
+    });
+
+    const indexPath = path.join(outDir, "vinext-prerender.json");
+    const index = JSON.parse(fs.readFileSync(indexPath, "utf-8"));
+    const manifestRoute = index.routes.find(
+      (route: { route: string }) => route.route === "/prerender-cache-life",
+    );
+    expect(manifestRoute).toMatchObject({ revalidate: 1, expire: 3 });
+  });
+
+  it("infers App Router ISR prerender metadata from cacheLife without route revalidate", () => {
+    const r = findRoute(results, "/prerender-cache-life-only");
+    expect(r).toMatchObject({
+      route: "/prerender-cache-life-only",
+      status: "rendered",
+      revalidate: 1,
+      expire: 3,
+    });
+
+    const indexPath = path.join(outDir, "vinext-prerender.json");
+    const index = JSON.parse(fs.readFileSync(indexPath, "utf-8"));
+    const manifestRoute = index.routes.find(
+      (route: { route: string }) => route.route === "/prerender-cache-life-only",
+    );
+    expect(manifestRoute).toMatchObject({ revalidate: 1, expire: 3 });
   });
 
   // ── Dynamic routes — skipped ───────────────────────────────────────────────
@@ -741,7 +785,9 @@ function mockRoute(pattern: string, opts: { pagePath?: string | null } = {}): Ap
     layoutErrorPaths: [],
     notFoundPath: null,
     notFoundPaths: [],
+    forbiddenPaths: [],
     forbiddenPath: null,
+    unauthorizedPaths: [],
     unauthorizedPath: null,
     routeSegments: [],
     layoutTreePositions: [],

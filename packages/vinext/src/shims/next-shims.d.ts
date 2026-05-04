@@ -500,6 +500,7 @@ declare module "next/cache" {
   ): T;
   export function unstable_noStore(): void;
   export function noStore(): void;
+  export function unstable_io(): Promise<void>;
 
   // "use cache" APIs (Next.js 15+)
   export type CacheLifeConfig = {
@@ -541,6 +542,10 @@ declare module "next/web-vitals" {
 declare module "next/amp" {
   export function useAmp(): boolean;
   export function isInAmpMode(): boolean;
+}
+
+declare module "next/offline" {
+  export function useOffline(): boolean;
 }
 
 declare module "next/og" {

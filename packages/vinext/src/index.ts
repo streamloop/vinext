@@ -14,22 +14,19 @@ import { createValidFileMatcher } from "./routing/file-matcher.js";
 import { createSSRHandler } from "./server/dev-server.js";
 import { handleApiRoute } from "./server/api-handler.js";
 import { installSocketErrorBackstop } from "./server/socket-error-backstop.js";
+import { shouldInvalidateAppRouteFile } from "./server/dev-route-files.js";
 import { createDirectRunner } from "./server/dev-module-runner.js";
 import { generateRscEntry } from "./entries/app-rsc-entry.js";
 import { generateSsrEntry } from "./entries/app-ssr-entry.js";
 import { generateBrowserEntry } from "./entries/app-browser-entry.js";
 import {
-  buildGenerateBundleReplacement,
-  buildReasonsReplacement,
   collectRouteClassificationManifest,
   type RouteClassificationManifest,
 } from "./build/route-classification-manifest.js";
 import {
-  classifyLayoutByModuleGraph,
-  isStaticModuleGraphResult,
-  moduleGraphReason,
-} from "./build/layout-classification.js";
-import type { ModuleGraphStaticReason } from "./build/layout-classification-types.js";
+  planRouteClassificationInjection,
+  type RouteClassificationChunk,
+} from "./build/route-classification-injector.js";
 import { normalizePathnameForRouteMatchStrict } from "./routing/utils.js";
 import {
   findNextConfigPath,
@@ -53,7 +50,7 @@ import {
   findInstrumentationFile,
   runInstrumentation,
 } from "./server/instrumentation.js";
-import { PHASE_PRODUCTION_BUILD, PHASE_DEVELOPMENT_SERVER } from "./shims/constants.js";
+import { PHASE_PRODUCTION_BUILD, PHASE_DEVELOPMENT_SERVER } from "vinext/shims/constants";
 import { precompressAssets } from "./build/precompress.js";
 import { validateDevRequest } from "./server/dev-origin-check.js";
 import {
@@ -76,6 +73,10 @@ import { clientReferenceDedupPlugin } from "./plugins/client-reference-dedup.js"
 import { createInstrumentationClientTransformPlugin } from "./plugins/instrumentation-client.js";
 import { createOptimizeImportsPlugin } from "./plugins/optimize-imports.js";
 import { createOgInlineFetchAssetsPlugin, ogAssetsPlugin } from "./plugins/og-assets.js";
+import {
+  mergeOptimizeDepsExclude,
+  VINEXT_OPTIMIZE_DEPS_EXCLUDE,
+} from "./plugins/rsc-client-shim-excludes.js";
 import { createServerExternalsManifestPlugin } from "./plugins/server-externals-manifest.js";
 import {
   VIRTUAL_GOOGLE_FONTS,
@@ -367,6 +368,8 @@ const VIRTUAL_APP_SSR_ENTRY = "virtual:vinext-app-ssr-entry";
 const RESOLVED_APP_SSR_ENTRY = "\0" + VIRTUAL_APP_SSR_ENTRY;
 const VIRTUAL_APP_BROWSER_ENTRY = "virtual:vinext-app-browser-entry";
 const RESOLVED_APP_BROWSER_ENTRY = "\0" + VIRTUAL_APP_BROWSER_ENTRY;
+const VIRTUAL_ROOT_PARAMS = "virtual:vinext-root-params";
+const RESOLVED_ROOT_PARAMS = "\0" + VIRTUAL_ROOT_PARAMS;
 /** Image file extensions handled by the vinext:image-imports plugin.
  *  Shared between the Rolldown hook filter and the transform handler regex. */
 const IMAGE_EXTS = "png|jpe?g|gif|webp|avif|svg|ico|bmp|tiff?";
@@ -374,6 +377,21 @@ const IMAGE_EXTS = "png|jpe?g|gif|webp|avif|svg|ico|bmp|tiff?";
 /** Absolute path to vinext's shims directory, used by clientManualChunks. */
 const _shimsDir = path.resolve(__dirname, "shims") + "/";
 const _fontGoogleShimPath = resolveShimModulePath(_shimsDir, "font-google");
+
+function isValidExportIdentifier(name: string): boolean {
+  return /^[$A-Z_a-z][$\w]*$/.test(name);
+}
+
+function generateRootParamsModule(rootParamNames: Iterable<string>): string {
+  const names = Array.from(new Set(rootParamNames)).filter(isValidExportIdentifier).sort();
+  if (names.length === 0) return "export {};\n";
+
+  const rootParamsShimPath = resolveShimModulePath(_shimsDir, "root-params");
+  const exports = names
+    .map((name) => `export function ${name}() { return getRootParam(${JSON.stringify(name)}); }`)
+    .join("\n");
+  return `import { getRootParam } from ${JSON.stringify(rootParamsShimPath)};\n${exports}\n`;
+}
 
 /**
  * Shims with a `.react-server.ts` variant for the RSC environment.
@@ -910,6 +928,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             "next/og": path.join(shimsDir, "og"),
             "next/web-vitals": path.join(shimsDir, "web-vitals"),
             "next/amp": path.join(shimsDir, "amp"),
+            "next/offline": path.join(shimsDir, "offline"),
             "next/error": path.join(shimsDir, "error"),
             "next/constants": path.join(shimsDir, "constants"),
             // Internal next/dist/* paths used by popular libraries
@@ -957,6 +976,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               "internal",
               "work-unit-async-storage",
             ),
+            "next/dist/server/request/root-params": path.join(shimsDir, "root-params"),
             // Re-export public modules for internal path imports
             // "next/dist/client/components/navigation" in _reactServerShims (#834).
             "next/dist/server/config-shared": path.join(shimsDir, "internal", "utils"),
@@ -1249,7 +1269,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         };
         viteConfig.optimizeDeps = {
           // @tailwindcss/oxide contains native .node bindings that Rolldown cannot process
-          exclude: [...new Set([...incomingExclude, "vinext", "@vercel/og", "@tailwindcss/oxide"])],
+          exclude: mergeOptimizeDepsExclude(incomingExclude, VINEXT_OPTIMIZE_DEPS_EXCLUDE, [
+            "@tailwindcss/oxide",
+          ]),
           ...(incomingInclude.length > 0 ? { include: incomingInclude } : {}),
           rolldownOptions: { plugins: [depOptimizeAliasPlugin] },
         };
@@ -1306,7 +1328,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                     },
                   }),
               optimizeDeps: {
-                exclude: [...new Set([...incomingExclude, "vinext", "@vercel/og"])],
+                exclude: mergeOptimizeDepsExclude(incomingExclude, VINEXT_OPTIMIZE_DEPS_EXCLUDE),
                 entries: optimizeEntries,
               },
               build: {
@@ -1331,7 +1353,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                     },
                   }),
               optimizeDeps: {
-                exclude: [...new Set([...incomingExclude, "vinext", "@vercel/og"])],
+                exclude: mergeOptimizeDepsExclude(incomingExclude, VINEXT_OPTIMIZE_DEPS_EXCLUDE),
                 entries: optimizeEntries,
               },
               build: {
@@ -1358,9 +1380,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 // `fileTypeFromFile` only from its `node` condition via `index.js`,
                 // but the browser optimizer resolves to `core.js` which lacks it,
                 // causing MISSING_EXPORT build failures).
-                exclude: [
-                  ...new Set([...incomingExclude, "vinext", "@vercel/og", ...nextServerExternal]),
-                ],
+                exclude: mergeOptimizeDepsExclude(
+                  incomingExclude,
+                  VINEXT_OPTIMIZE_DEPS_EXCLUDE,
+                  nextServerExternal,
+                ),
                 // Crawl app/ source files up front so client-only deps imported
                 // by user components are discovered during startup instead of
                 // triggering a late re-optimisation + full page reload.
@@ -1574,6 +1598,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           if (cleanId === VIRTUAL_RSC_ENTRY) return RESOLVED_RSC_ENTRY;
           if (cleanId === VIRTUAL_APP_SSR_ENTRY) return RESOLVED_APP_SSR_ENTRY;
           if (cleanId === VIRTUAL_APP_BROWSER_ENTRY) return RESOLVED_APP_BROWSER_ENTRY;
+          if (cleanId === "next/root-params" || cleanId === "next/root-params.js") {
+            return RESOLVED_ROOT_PARAMS;
+          }
           if (cleanId.startsWith(VIRTUAL_GOOGLE_FONTS + "?")) {
             return RESOLVED_VIRTUAL_GOOGLE_FONTS + cleanId.slice(VIRTUAL_GOOGLE_FONTS.length);
           }
@@ -1658,12 +1685,19 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               allowedOrigins: nextConfig?.serverActionsAllowedOrigins,
               allowedDevOrigins: nextConfig?.allowedDevOrigins,
               bodySizeLimit: nextConfig?.serverActionsBodySizeLimit,
+              expireTime: nextConfig?.expireTime,
               i18n: nextConfig?.i18n,
               hasPagesDir,
               publicFiles: scanPublicFileRoutes(root),
             },
             instrumentationPath,
           );
+        }
+        if (id === RESOLVED_ROOT_PARAMS) {
+          const routes = hasAppDir
+            ? await appRouter(appDir, nextConfig?.pageExtensions, fileMatcher)
+            : [];
+          return generateRootParamsModule(routes.flatMap((route) => route.rootParamNames ?? []));
         }
         if (id === RESOLVED_APP_SSR_ENTRY && hasAppDir) {
           return generateSsrEntry(hasPagesDir);
@@ -1697,61 +1731,18 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
 
         const enableClassificationDebug = Boolean(process.env.VINEXT_DEBUG_CLASSIFICATION);
 
-        // The `?` after the semicolon is intentional: Rolldown may or may not
-        // emit the trailing semicolon depending on minification settings.
-        // This regex relies on `__VINEXT_CLASS` retaining its name, which holds
-        // because RSC entry chunk bindings are not subject to scope-hoisting renames.
-        const stubRe = /function __VINEXT_CLASS\(routeIdx\)\s*\{\s*return null;?\s*\}/;
-        const reasonsStubRe =
-          /function __VINEXT_CLASS_REASONS\(routeIdx\)\s*\{\s*return null;?\s*\}/;
-
-        // Skip the scan-phase build where the RSC entry code has been
-        // tree-shaken out entirely. In the real RSC build the chunk that
-        // carries our runtime code will reference `__VINEXT_CLASS` via the
-        // per-route literal `__buildTimeClassifications: __VINEXT_CLASS(N)`,
-        // which Rolldown emits verbatim.
-        //
-        // If we see a chunk that mentions __VINEXT_CLASS but none of them
-        // contain the stub body we recognise, something upstream reshaped the
-        // generated source and we would silently degrade back to the Layer 3
-        // runtime probe. Fail loudly instead so regressions surface at build
-        // time rather than as a mysterious perf cliff at request time.
-        const chunksMentioningStub: Array<{
-          chunk: Extract<(typeof bundle)[string], { type: "chunk" }>;
-          fileName: string;
-        }> = [];
-        const chunksWithStubBody: Array<{
-          chunk: Extract<(typeof bundle)[string], { type: "chunk" }>;
-          fileName: string;
-        }> = [];
+        const chunks: RouteClassificationChunk[] = [];
+        const chunksByFileName = new Map<
+          string,
+          Extract<(typeof bundle)[string], { type: "chunk" }>
+        >();
         for (const chunk of Object.values(bundle)) {
           if (chunk.type !== "chunk") continue;
-          if (!chunk.code.includes("__VINEXT_CLASS")) continue;
-          chunksMentioningStub.push({ chunk, fileName: chunk.fileName });
-          if (stubRe.test(chunk.code)) {
-            chunksWithStubBody.push({ chunk, fileName: chunk.fileName });
-          }
-        }
-
-        if (chunksMentioningStub.length === 0) return;
-        if (chunksWithStubBody.length === 0) {
-          throw new Error(
-            `vinext: build-time classification — __VINEXT_CLASS is referenced in ${chunksMentioningStub
-              .map((c) => c.fileName)
-              .join(
-                ", ",
-              )} but no chunk contains the stub body. The generator and generateBundle have drifted.`,
-          );
-        }
-        if (chunksWithStubBody.length > 1) {
-          throw new Error(
-            `vinext: build-time classification — expected __VINEXT_CLASS stub in exactly one RSC chunk, found ${chunksWithStubBody.length}`,
-          );
-        }
-        if (enableClassificationDebug && !reasonsStubRe.test(chunksWithStubBody[0]!.chunk.code)) {
-          throw new Error(
-            "vinext: build-time classification — __VINEXT_CLASS_REASONS stub is missing alongside __VINEXT_CLASS. The generator and generateBundle have drifted.",
-          );
+          chunks.push({
+            code: chunk.code,
+            fileName: chunk.fileName,
+          });
+          chunksByFileName.set(chunk.fileName, chunk);
         }
 
         // `canonicalize` and `dynamicShimPaths` are hoisted to plugin init
@@ -1776,61 +1767,28 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           },
         };
 
-        const layer2PerRoute = new Map<number, Map<number, ModuleGraphStaticReason>>();
-        const graphCache = new Map<string, ReturnType<typeof classifyLayoutByModuleGraph>>();
-        for (let routeIdx = 0; routeIdx < rscClassificationManifest.routes.length; routeIdx++) {
-          const route = rscClassificationManifest.routes[routeIdx]!;
-          const perRoute = new Map<number, ModuleGraphStaticReason>();
-          for (let layoutIdx = 0; layoutIdx < route.layoutPaths.length; layoutIdx++) {
-            // Skip layouts already decided by Layer 1 — segment config is
-            // authoritative, so there is no need to walk the module graph.
-            if (route.layer1.has(layoutIdx)) continue;
-            const layoutModuleId = canonicalize(route.layoutPaths[layoutIdx]!);
-            // If the layout module itself is not in the graph, we have no
-            // evidence either way — do NOT claim it static, or we would skip
-            // the runtime probe for a layout we never actually analysed.
-            // `classifyLayoutByModuleGraph` returns "static" for an empty
-            // traversal, so the seed presence check has to happen here.
-            if (!moduleInfo.getModuleInfo(layoutModuleId)) continue;
-            let graphResult = graphCache.get(layoutModuleId);
-            if (graphResult === undefined) {
-              graphResult = classifyLayoutByModuleGraph(
-                layoutModuleId,
-                dynamicShimPaths,
-                moduleInfo,
-              );
-              graphCache.set(layoutModuleId, graphResult);
-            }
-            if (isStaticModuleGraphResult(graphResult)) {
-              perRoute.set(layoutIdx, moduleGraphReason(graphResult));
-            }
-          }
-          if (perRoute.size > 0) {
-            layer2PerRoute.set(routeIdx, perRoute);
-          }
-        }
+        const patchPlan = planRouteClassificationInjection({
+          canonicalizeLayoutPath: canonicalize,
+          chunks,
+          dynamicShimPaths,
+          enableDebugReasons: enableClassificationDebug,
+          manifest: rscClassificationManifest,
+          moduleInfo,
+        });
+        if (patchPlan.kind === "skip") return;
 
-        const replacement = buildGenerateBundleReplacement(
-          rscClassificationManifest,
-          layer2PerRoute,
-        );
-        const patchedBody = `function __VINEXT_CLASS(routeIdx) { return (${replacement})(routeIdx); }`;
-        const target = chunksWithStubBody[0]!.chunk;
-        target.code = target.code.replace(stubRe, patchedBody);
-
-        if (enableClassificationDebug) {
-          const reasonsReplacement = buildReasonsReplacement(
-            rscClassificationManifest,
-            layer2PerRoute,
+        const target = chunksByFileName.get(patchPlan.fileName);
+        if (!target) {
+          throw new Error(
+            `vinext: build-time classification — patch target ${patchPlan.fileName} disappeared from the RSC bundle`,
           );
-          const patchedReasonsBody = `function __VINEXT_CLASS_REASONS(routeIdx) { return (${reasonsReplacement})(routeIdx); }`;
-          target.code = target.code.replace(reasonsStubRe, patchedReasonsBody);
         }
+        target.code = patchPlan.code;
 
         // The patched body is longer than the stub, so any existing source map
         // would be stale. RSC entry source maps are not served or consumed, so
         // nulling the map is safe and prevents stale-map confusion in tooling.
-        target.map = null;
+        target.map = patchPlan.map;
         // Consume the manifest exactly once per RSC entry load. Clearing here
         // prevents a stale manifest from leaking into a subsequent generateBundle
         // call if the load hook is not re-triggered (e.g., in non-standard rebuild paths).
@@ -1952,7 +1910,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
       },
 
       configureServer(server: ViteDevServer) {
-        // Watch pages directory for file additions/removals to invalidate route cache.
+        // Watch route files for additions/removals to invalidate route cache.
         const pageExtensions = fileMatcher.extensionRegex;
 
         // Build a long-lived ModuleRunner for loading all Pages Router modules
@@ -2002,6 +1960,19 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           }
         }
 
+        function invalidateRootParamsModule() {
+          for (const env of Object.values(server.environments)) {
+            const mod = env.moduleGraph.getModuleById(RESOLVED_ROOT_PARAMS);
+            if (mod) env.moduleGraph.invalidateModule(mod);
+          }
+        }
+
+        function invalidateAppRoutingModules() {
+          invalidateAppRouteCache();
+          invalidateRscEntryModule();
+          invalidateRootParamsModule();
+        }
+
         // Node throws on unhandled 'error' events on sockets. When a browser
         // drops the connection mid-response (common in dev: HMR triggers a
         // reload while an RSC stream is still flushing), the next res.write
@@ -2018,18 +1989,16 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           if (hasPagesDir && filePath.startsWith(pagesDir) && pageExtensions.test(filePath)) {
             invalidateRouteCache(pagesDir);
           }
-          if (hasAppDir && filePath.startsWith(appDir) && pageExtensions.test(filePath)) {
-            invalidateAppRouteCache();
-            invalidateRscEntryModule();
+          if (hasAppDir && shouldInvalidateAppRouteFile(appDir, filePath, fileMatcher)) {
+            invalidateAppRoutingModules();
           }
         });
         server.watcher.on("unlink", (filePath: string) => {
           if (hasPagesDir && filePath.startsWith(pagesDir) && pageExtensions.test(filePath)) {
             invalidateRouteCache(pagesDir);
           }
-          if (hasAppDir && filePath.startsWith(appDir) && pageExtensions.test(filePath)) {
-            invalidateAppRouteCache();
-            invalidateRscEntryModule();
+          if (hasAppDir && shouldInvalidateAppRouteFile(appDir, filePath, fileMatcher)) {
+            invalidateAppRoutingModules();
           }
         });
 
@@ -2463,6 +2432,13 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   }
                 }
               };
+              const applyMwRequestHeadersForExternalProxy = () => {
+                if (middlewareRequestHeaders) {
+                  applyRequestHeadersToNodeRequest(middlewareRequestHeaders);
+                } else {
+                  delete req.headers["x-vinext-mw-ctx"];
+                }
+              };
 
               // Run middleware.ts if present
               if (middlewarePath) {
@@ -2636,6 +2612,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               // External rewrite from beforeFiles — proxy to external URL
               if (isExternalUrl(resolvedUrl)) {
                 applyDeferredMwHeaders();
+                applyMwRequestHeadersForExternalProxy();
                 await proxyExternalRewriteNode(req, res, resolvedUrl);
                 return;
               }
@@ -2691,6 +2668,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               // External rewrite from afterFiles — proxy to external URL
               if (isExternalUrl(resolvedUrl)) {
                 applyDeferredMwHeaders();
+                applyMwRequestHeadersForExternalProxy();
                 await proxyExternalRewriteNode(req, res, resolvedUrl);
                 return;
               }
@@ -2729,6 +2707,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   // External fallback rewrite — proxy to external URL
                   if (isExternalUrl(fallbackRewrite)) {
                     applyDeferredMwHeaders();
+                    applyMwRequestHeadersForExternalProxy();
                     await proxyExternalRewriteNode(req, res, fallbackRewrite);
                     return;
                   }
@@ -3185,6 +3164,23 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         },
       };
     })(),
+    // Mix experimental.outputHashSalt / NEXT_HASH_SALT into chunk content hashes.
+    // This changes output filenames (e.g., index-[hash].js) without modifying source.
+    // Uses augmentChunkHash (supported by Rolldown) instead of the unsupported output.hashSalt.
+    {
+      name: "vinext:hash-salt",
+      apply: "build",
+      augmentChunkHash() {
+        // Only apply to client environment; SSR/RSC don't use content hashing
+        if (this.environment?.name !== "client") return;
+        const salt = nextConfig?.hashSalt;
+        if (salt) {
+          return salt;
+        }
+      },
+    },
+    // Note: augmentChunkHash only affects JS chunk hashes. CSS and static asset
+    // hashes are not salted, which is a known gap vs Next.js behavior.
     // Write vinext-server.json to dist/server/ with a per-build prerender secret.
     // The prerender secret is used by prod-server.ts to authenticate requests to
     // the internal /__vinext/prerender/* endpoints, which are only reachable during

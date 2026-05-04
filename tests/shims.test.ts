@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { PAGES_FIXTURE_DIR } from "./helpers.js";
 import { isExternalUrl, isHashOnlyChange } from "../packages/vinext/src/shims/router.js";
@@ -1049,6 +1050,51 @@ describe("next/headers shim", () => {
     });
   });
 
+  // Ported from Next.js:
+  // - packages/next/src/server/async-storage/request-store.ts
+  // - test/e2e/app-dir/app-middleware/app-middleware.test.ts
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/async-storage/request-store.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/app-middleware/app-middleware.test.ts
+  it("middleware-set cookies are visible to cookies() in the same render", async () => {
+    const { NextResponse } = await import("../packages/vinext/src/shims/server.js");
+    const {
+      headersContextFromRequest,
+      applyMiddlewareRequestHeaders,
+      runWithHeadersContext,
+      cookies,
+    } = await import("../packages/vinext/src/shims/headers.js");
+
+    const middlewareResponse = NextResponse.next();
+    middlewareResponse.cookies.set("rsc-cookie-value-1", "123", { path: "/" });
+    middlewareResponse.cookies.set("rsc-cookie-value-2", "456", { path: "/", secure: true });
+
+    const ctx = headersContextFromRequest(
+      new Request("https://example.com/rsc-cookies", {
+        headers: { cookie: "existing=kept" },
+      }),
+    );
+
+    await runWithHeadersContext(ctx, async () => {
+      applyMiddlewareRequestHeaders(middlewareResponse.headers);
+
+      const jar = await cookies();
+      expect(jar.get("existing")).toEqual({ name: "existing", value: "kept" });
+      expect(jar.get("rsc-cookie-value-1")).toEqual({
+        name: "rsc-cookie-value-1",
+        value: "123",
+      });
+      expect(jar.get("rsc-cookie-value-2")).toEqual({
+        name: "rsc-cookie-value-2",
+        value: "456",
+      });
+      expect(jar.getAll()).toEqual([
+        { name: "existing", value: "kept" },
+        { name: "rsc-cookie-value-1", value: "123" },
+        { name: "rsc-cookie-value-2", value: "456" },
+      ]);
+    });
+  });
+
   it("throws when called outside request context", async () => {
     const { headers, cookies } = await import("../packages/vinext/src/shims/headers.js");
     // Ensure context is cleared
@@ -1142,7 +1188,8 @@ describe("next/headers shim", () => {
     expect(dm2.isEnabled).toBe(false);
 
     const cookieHeader = getDraftModeCookieHeader();
-    expect(cookieHeader).toContain("Max-Age=0");
+    expect(cookieHeader).toContain("Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+    expect(cookieHeader).not.toContain("Max-Age=0");
     setHeadersContext(null);
   });
 
@@ -1470,6 +1517,28 @@ describe("next/server shim", () => {
     expect(res.headers.get("x-middleware-override-headers")).toBe("cookie,x-added");
     expect(res.headers.get("x-middleware-request-cookie")).toBe("a=1");
     expect(res.headers.get("x-middleware-request-x-added")).toBe("1");
+  });
+
+  // Ported from Next.js:
+  // - packages/next/src/server/web/spec-extension/response.ts
+  // - test/e2e/app-dir/app-middleware/app-middleware.test.ts
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/web/spec-extension/response.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/app-middleware/app-middleware.test.ts
+  it("NextResponse.cookies.set() emits x-middleware-set-cookie for same-render reads", async () => {
+    const { NextResponse } = await import("../packages/vinext/src/shims/server.js");
+    const res = NextResponse.next();
+
+    res.cookies.set("rsc-cookie-value-1", "123", { path: "/" });
+    res.cookies.set("rsc-cookie-value-2", "456", { path: "/", httpOnly: true });
+
+    expect(res.headers.getSetCookie()).toEqual([
+      "rsc-cookie-value-1=123; Path=/",
+      "rsc-cookie-value-2=456; Path=/; HttpOnly",
+    ]);
+    const internalCookieHeader = res.headers.get("x-middleware-set-cookie");
+    expect(internalCookieHeader).not.toBeNull();
+    expect(internalCookieHeader).toContain("rsc-cookie-value-1=123; Path=/");
+    expect(internalCookieHeader).toContain("rsc-cookie-value-2=456; Path=/; HttpOnly");
   });
 
   it("NextResponse.next() sets x-middleware-next header", async () => {
@@ -1824,6 +1893,151 @@ describe("next/cache shim", () => {
     mod.refresh();
   });
 
+  // Ported from Next.js: packages/next/src/client/request/io.browser.ts
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/client/request/io.browser.ts
+  it("exports unstable_io function", async () => {
+    const mod = await import("../packages/vinext/src/shims/cache.js");
+    expect(typeof mod.unstable_io).toBe("function");
+  });
+
+  it("unstable_io returns a resolved promise", async () => {
+    const { unstable_io } = await import("../packages/vinext/src/shims/cache.js");
+    const result = unstable_io();
+    expect(result).toBeInstanceOf(Promise);
+    expect((result as any).status).toBe("fulfilled");
+    expect((result as any).value).toBeUndefined();
+    await expect(result).resolves.toBeUndefined();
+  });
+
+  it("unstable_io returns same instance (singleton)", async () => {
+    const { unstable_io } = await import("../packages/vinext/src/shims/cache.js");
+    const r1 = unstable_io();
+    const r2 = unstable_io();
+    expect(r1).toBe(r2);
+  });
+
+  // Ported from Next.js: packages/next/src/server/request/io.ts
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/request/io.ts
+  it("unstable_io returns a hanging promise during prerender", async () => {
+    const { unstable_io } = await import("../packages/vinext/src/shims/cache.js");
+    const { workUnitAsyncStorage } =
+      await import("../packages/vinext/src/shims/internal/work-unit-async-storage.js");
+
+    const controller = new AbortController();
+
+    // run() returns whatever the callback returns — a hanging promise.
+    const hanging = workUnitAsyncStorage.run(
+      { type: "prerender", renderSignal: controller.signal },
+      unstable_io,
+    );
+
+    // The promise should not be resolved or rejected (it's "hanging")
+    expect(hanging).toBeInstanceOf(Promise);
+
+    // Verify it's still hanging using Promise.race (more portable than V8 internals)
+    const result = await Promise.race([
+      hanging.then(() => "resolved"),
+      new Promise((r) => setTimeout(() => r("still-hanging"), 50)),
+    ]);
+    expect(result).toBe("still-hanging");
+
+    // Clean up by aborting the signal
+    controller.abort();
+  });
+
+  it("unstable_io resolves immediately with request store", async () => {
+    const { unstable_io } = await import("../packages/vinext/src/shims/cache.js");
+    const { workUnitAsyncStorage } =
+      await import("../packages/vinext/src/shims/internal/work-unit-async-storage.js");
+
+    const promise = workUnitAsyncStorage.run({ type: "request" }, unstable_io);
+
+    expect(promise).toBeInstanceOf(Promise);
+    await expect(promise).resolves.toBeUndefined();
+  });
+
+  it("unstable_io resolves immediately with cache store", async () => {
+    const { unstable_io } = await import("../packages/vinext/src/shims/cache.js");
+    const { workUnitAsyncStorage } =
+      await import("../packages/vinext/src/shims/internal/work-unit-async-storage.js");
+
+    const promise = workUnitAsyncStorage.run({ type: "cache" }, unstable_io);
+
+    expect(promise).toBeInstanceOf(Promise);
+    await expect(promise).resolves.toBeUndefined();
+  });
+
+  it("unstable_io rejects hanging promise on abort when prerendering", async () => {
+    const { unstable_io } = await import("../packages/vinext/src/shims/cache.js");
+    const { workUnitAsyncStorage } =
+      await import("../packages/vinext/src/shims/internal/work-unit-async-storage.js");
+
+    const controller = new AbortController();
+
+    const hanging = workUnitAsyncStorage.run(
+      { type: "prerender", renderSignal: controller.signal },
+      unstable_io,
+    );
+
+    expect(hanging).toBeInstanceOf(Promise);
+
+    // Abort the signal — the hanging promise should reject
+    controller.abort();
+    await expect(hanging).rejects.toThrow(/unstable_io/i);
+  });
+
+  it("unstable_io returns rejected promise when signal already aborted", async () => {
+    const { unstable_io } = await import("../packages/vinext/src/shims/cache.js");
+    const { workUnitAsyncStorage } =
+      await import("../packages/vinext/src/shims/internal/work-unit-async-storage.js");
+
+    const controller = new AbortController();
+    controller.abort(); // already aborted
+
+    const promise = workUnitAsyncStorage.run(
+      { type: "prerender", renderSignal: controller.signal },
+      unstable_io,
+    );
+
+    await expect(promise).rejects.toThrow(/prerendering/i);
+  });
+
+  it("unstable_io does not emit unhandled rejection when signal already aborted", async () => {
+    const { unstable_io } = await import("../packages/vinext/src/shims/cache.js");
+    const { workUnitAsyncStorage } =
+      await import("../packages/vinext/src/shims/internal/work-unit-async-storage.js");
+
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+
+    try {
+      const controller = new AbortController();
+      controller.abort(); // already aborted
+
+      const promise = workUnitAsyncStorage.run(
+        { type: "prerender", renderSignal: controller.signal, route: "/test" },
+        unstable_io,
+      );
+
+      // Wait a tick for potential unhandled rejection to be detected
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // Await the promise to handle the rejection
+      try {
+        await promise;
+      } catch {
+        // expected
+      }
+
+      expect(unhandledRejections.length).toBe(0);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
+
   it("setCacheHandler swaps the active handler", async () => {
     const { setCacheHandler, getCacheHandler, unstable_cache } =
       await import("../packages/vinext/src/shims/cache.js");
@@ -1958,6 +2172,29 @@ describe("next/cache shim", () => {
       expect.stringContaining("expire must be >= revalidate"),
     );
     consoleWarn.mockRestore();
+  });
+
+  it("cacheLife inline configs inherit default profile values for omitted fields", async () => {
+    const {
+      cacheLife,
+      _consumeRequestScopedCacheLife,
+      _peekRequestScopedCacheLife,
+      _runWithCacheState,
+    } = await import("../packages/vinext/src/shims/cache.js");
+
+    await _runWithCacheState(async () => {
+      cacheLife({ expire: 60 });
+
+      expect(_peekRequestScopedCacheLife()).toEqual({
+        revalidate: 900,
+        expire: 60,
+      });
+      expect(_consumeRequestScopedCacheLife()).toEqual({
+        revalidate: 900,
+        expire: 60,
+      });
+      expect(_peekRequestScopedCacheLife()).toBeNull();
+    });
   });
 
   it("exports cacheTag as a no-op function", async () => {
@@ -2759,6 +2996,50 @@ describe("runMiddleware preserves x-middleware-request-* headers (dev mode)", ()
     // x-middleware-rewrite must be stripped
     expect(result.responseHeaders!.has("x-middleware-rewrite")).toBe(false);
   });
+
+  // Ported from Next.js: test/e2e/middleware-rewrites/test/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/middleware-rewrites/test/index.test.ts
+  it("preserves the full external URL for middleware rewrites", async () => {
+    const { runMiddleware } = await import("../packages/vinext/src/server/middleware.js");
+    const { NextResponse } = await import("../packages/vinext/src/shims/server.js");
+
+    const mockRunner = {
+      import: async () => ({
+        default: () => NextResponse.rewrite("https://api.example.com/echo?from=middleware"),
+        config: { matcher: "/:path*" },
+      }),
+    };
+
+    const request = new Request("http://localhost/original?keep=1");
+    const result = await runMiddleware(mockRunner as any, "/fake/middleware.ts", request);
+
+    expect(result.continue).toBe(true);
+    expect(result.rewriteUrl).toBe("https://api.example.com/echo?from=middleware");
+  });
+
+  it("strips x-middleware-set-cookie from custom middleware responses", async () => {
+    const { runMiddleware } = await import("../packages/vinext/src/server/middleware.js");
+    const { NextResponse } = await import("../packages/vinext/src/shims/server.js");
+
+    const mockRunner = {
+      import: async () => ({
+        default: () => {
+          const res = new NextResponse("blocked", { status: 403 });
+          res.cookies.set("blocked", "1", { path: "/" });
+          return res;
+        },
+        config: { matcher: "/:path*" },
+      }),
+    };
+
+    const request = new Request("http://localhost/blocked");
+    const result = await runMiddleware(mockRunner as any, "/fake/middleware.ts", request);
+
+    expect(result.continue).toBe(false);
+    expect(result.response).toBeDefined();
+    expect(result.response!.headers.get("x-middleware-set-cookie")).toBeNull();
+    expect(result.response!.headers.get("set-cookie")).toContain("blocked=1");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3292,210 +3573,6 @@ describe("decodePathParams", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Codegen parity tests (verify generated code matches runtime behavior)
-
-describe("middleware codegen parity", () => {
-  it("generateMiddlewareMatcherCode('modern') produces working matchesMiddleware", async () => {
-    const { generateSafeRegExpCode, generateMiddlewareMatcherCode } =
-      await import("../packages/vinext/src/server/middleware-codegen.js");
-    // Eval the generated code and test it behaves identically to the runtime
-    const code = generateSafeRegExpCode("modern") + generateMiddlewareMatcherCode("modern");
-    // oxlint-disable-next-line no-new-func, no-implied-eval -- intentional: eval generated codegen output
-    const fn = new Function(code + "\nreturn { matchMiddlewarePattern, matchesMiddleware };");
-    const { matchMiddlewarePattern, matchesMiddleware } = fn();
-
-    // No matcher → matches all (Next.js default)
-    expect(matchesMiddleware("/", undefined)).toBe(true);
-    expect(matchesMiddleware("/api/hello", undefined)).toBe(true);
-    expect(matchesMiddleware("/_next/static/chunk.js", undefined)).toBe(true);
-    expect(matchesMiddleware("/favicon.ico", undefined)).toBe(true);
-
-    // Exact match
-    expect(matchMiddlewarePattern("/about", "/about")).toBe(true);
-    expect(matchMiddlewarePattern("/other", "/about")).toBe(false);
-    // Ported from Next.js: test/e2e/middleware-custom-matchers-i18n/test/index.test.ts
-    // https://github.com/vercel/next.js/blob/canary/test/e2e/middleware-custom-matchers-i18n/test/index.test.ts
-    expect(
-      matchesMiddleware("/about", "/about", undefined, {
-        locales: ["en", "fr"],
-        defaultLocale: "en",
-      }),
-    ).toBe(true);
-    expect(
-      matchesMiddleware("/fr/about", "/about", undefined, {
-        locales: ["en", "fr"],
-        defaultLocale: "en",
-      }),
-    ).toBe(true);
-    // Ported from Next.js: test/e2e/middleware-matcher/index.test.ts
-    // https://github.com/vercel/next.js/blob/canary/test/e2e/middleware-matcher/index.test.ts
-    expect(
-      matchesMiddleware("/", "/", undefined, {
-        locales: ["en", "fr"],
-        defaultLocale: "en",
-      }),
-    ).toBe(true);
-
-    // Regex pattern with groups (must NOT corrupt the regex via dot-escaping)
-    expect(matchMiddlewarePattern("/about", "/((?!api|_next|favicon\\.ico).*)")).toBe(true);
-    expect(matchMiddlewarePattern("/api/hello", "/((?!api|_next|favicon\\.ico).*)")).toBe(false);
-    expect(
-      matchesMiddleware("/fr/about", "/((?!api|_next|favicon\\.ico).*)", undefined, {
-        locales: ["en", "fr"],
-        defaultLocale: "en",
-      }),
-    ).toBe(true);
-    expect(
-      matchesMiddleware("/fr/api/hello", "/((?!api|_next|favicon\\.ico).*)", undefined, {
-        locales: ["en", "fr"],
-        defaultLocale: "en",
-      }),
-    ).toBe(false);
-    expect(
-      matchesMiddleware(
-        "/fr/_next/static/chunk.js",
-        "/((?!api|_next|favicon\\.ico).*)",
-        undefined,
-        {
-          locales: ["en", "fr"],
-          defaultLocale: "en",
-        },
-      ),
-    ).toBe(false);
-    expect(
-      matchesMiddleware("/fr/favicon.ico", "/((?!api|_next|favicon\\.ico).*)", undefined, {
-        locales: ["en", "fr"],
-        defaultLocale: "en",
-      }),
-    ).toBe(false);
-
-    // Named params
-    expect(matchMiddlewarePattern("/user/123", "/user/:id")).toBe(true);
-
-    // :param(constraint) — inline regex constraint on a named param
-    expect(matchMiddlewarePattern("/blog/123", "/blog/:id(\\d+)")).toBe(true);
-    expect(matchMiddlewarePattern("/blog/abc", "/blog/:id(\\d+)")).toBe(false);
-    expect(matchMiddlewarePattern("/en/about", "/:locale(en|es|fr)/about")).toBe(true);
-    expect(matchMiddlewarePattern("/de/about", "/:locale(en|es|fr)/about")).toBe(false);
-
-    // Wildcard
-    expect(matchMiddlewarePattern("/dashboard/settings", "/dashboard/:path*")).toBe(true);
-    expect(matchMiddlewarePattern("/dashboard", "/dashboard/:path*")).toBe(true);
-
-    const gatedMatcher = [
-      {
-        source: "/dashboard",
-        has: [{ type: "query", key: "preview", value: "1" }],
-        missing: [{ type: "header", key: "x-blocked" }],
-      },
-    ];
-    expect(matchesMiddleware("/dashboard", gatedMatcher)).toBe(false);
-    expect(
-      matchesMiddleware(
-        "/dashboard",
-        gatedMatcher,
-        new Request("https://example.com/dashboard?preview=1"),
-      ),
-    ).toBe(true);
-    expect(
-      matchesMiddleware(
-        "/dashboard",
-        gatedMatcher,
-        new Request("https://example.com/dashboard?preview=1", {
-          headers: { "x-blocked": "1" },
-        }),
-      ),
-    ).toBe(false);
-
-    expect(
-      matchesMiddleware("/dashboard", [{ source: "/dashboard" }], undefined, {
-        locales: ["en", "fr"],
-        defaultLocale: "en",
-      }),
-    ).toBe(true);
-    expect(
-      matchesMiddleware("/fr/dashboard", [{ source: "/dashboard" }], undefined, {
-        locales: ["en", "fr"],
-        defaultLocale: "en",
-      }),
-    ).toBe(true);
-  });
-
-  it("generateMiddlewareMatcherCode('es5') produces working matchesMiddleware", async () => {
-    const { generateSafeRegExpCode, generateMiddlewareMatcherCode } =
-      await import("../packages/vinext/src/server/middleware-codegen.js");
-    const code = generateSafeRegExpCode("es5") + generateMiddlewareMatcherCode("es5");
-    // oxlint-disable-next-line no-new-func, no-implied-eval -- intentional: eval generated codegen output
-    const fn = new Function(code + "\nreturn { matchMiddlewarePattern, matchesMiddleware };");
-    const { matchMiddlewarePattern, matchesMiddleware } = fn();
-
-    // No matcher → matches all
-    expect(matchesMiddleware("/api/hello", undefined)).toBe(true);
-
-    // Regex guard (must not corrupt regex patterns via dot-escaping)
-    expect(matchMiddlewarePattern("/about", "/((?!api|_next|favicon\\.ico).*)")).toBe(true);
-    expect(matchMiddlewarePattern("/api/hello", "/((?!api|_next|favicon\\.ico).*)")).toBe(false);
-
-    // :param(constraint) — inline regex constraint on a named param
-    expect(matchMiddlewarePattern("/blog/123", "/blog/:id(\\d+)")).toBe(true);
-    expect(matchMiddlewarePattern("/blog/abc", "/blog/:id(\\d+)")).toBe(false);
-    expect(matchMiddlewarePattern("/en/about", "/:locale(en|es|fr)/about")).toBe(true);
-    expect(matchMiddlewarePattern("/de/about", "/:locale(en|es|fr)/about")).toBe(false);
-
-    const headerMatcher = [
-      {
-        source: "/dashboard",
-        has: [{ type: "header", key: "x-user-tier", value: "pro" }],
-      },
-    ];
-    expect(matchesMiddleware("/dashboard", headerMatcher)).toBe(false);
-    expect(
-      matchesMiddleware(
-        "/dashboard",
-        headerMatcher,
-        new Request("https://example.com/dashboard", {
-          headers: { "x-user-tier": "pro" },
-        }),
-      ),
-    ).toBe(true);
-
-    const hostMatcher = [
-      {
-        source: "/dashboard",
-        has: [{ type: "host", value: "example.com" }],
-      },
-    ];
-    const mixedCaseHostRequest = {
-      url: "https://example.com/dashboard",
-      headers: new Headers([["host", "Example.com:3000"]]),
-    };
-    const emptyHostRequest = {
-      url: "https://example.com/dashboard",
-      headers: new Headers([["host", ""]]),
-    };
-    expect(matchesMiddleware("/dashboard", hostMatcher, mixedCaseHostRequest)).toBe(true);
-    expect(matchesMiddleware("/dashboard", hostMatcher, emptyHostRequest)).toBe(false);
-  });
-
-  it("generateNormalizePathCode produces working __normalizePath", async () => {
-    const { generateNormalizePathCode } =
-      await import("../packages/vinext/src/server/middleware-codegen.js");
-    const code = generateNormalizePathCode("modern");
-    // oxlint-disable-next-line no-new-func, no-implied-eval -- intentional: eval generated codegen output
-    const fn = new Function(code + "\nreturn __normalizePath;");
-    const __normalizePath = fn();
-
-    expect(__normalizePath("/")).toBe("/");
-    expect(__normalizePath("/foo/bar")).toBe("/foo/bar");
-    expect(__normalizePath("//foo")).toBe("/foo");
-    expect(__normalizePath("/foo//bar")).toBe("/foo/bar");
-    expect(__normalizePath("/foo/./bar")).toBe("/foo/bar");
-    expect(__normalizePath("/foo/../bar")).toBe("/bar");
-    expect(__normalizePath("/../../../etc/passwd")).toBe("/etc/passwd");
-  });
-});
-
-// ---------------------------------------------------------------------------
 // Integration: verify decodeURIComponent + normalizePath applied before matching
 
 describe("middleware bypass prevention", () => {
@@ -3666,9 +3743,8 @@ describe("double-encoded path handling in middleware", () => {
     expect(matchPattern(normalized, "/dashboard")).toBe(false);
   });
 
-  it("matchRoute in generated code does not double-decode pathnames", async () => {
-    // Verify that matchRoute no longer calls decodeURIComponent internally.
-    // The generated RSC entry code is a string — we check it directly.
+  it("RSC route matching does not double-decode pathnames", async () => {
+    // Verify the generated entry delegates route matching to the typed helper.
     const { generateRscEntry } = await import("../packages/vinext/src/entries/app-rsc-entry.js");
     const code = generateRscEntry("/tmp/app", [
       {
@@ -3687,55 +3763,50 @@ describe("double-encoded path handling in middleware", () => {
         layoutErrorPaths: [],
         notFoundPath: null,
         notFoundPaths: [],
+        forbiddenPaths: [],
         forbiddenPath: null,
+        unauthorizedPaths: [],
         unauthorizedPath: null,
         parallelSlots: [],
       },
     ]);
-    // Extract the matchRoute function from generated code
-    const matchRouteMatch = code.match(/function matchRoute\(url\) \{[\s\S]*?\n\}/);
-    expect(matchRouteMatch).toBeTruthy();
-    const matchRouteCode = matchRouteMatch![0];
+    expect(code).toContain("createAppRscRouteMatcher as __createAppRscRouteMatcher");
+    expect(code).toContain("return __routeMatcher.matchRoute(url);");
+
+    const routeMatchingSource = await readFile(
+      new URL("../packages/vinext/src/server/app-rsc-route-matching.ts", import.meta.url),
+      "utf8",
+    );
     // Verify it does NOT call decodeURIComponent (the comment mentions it but
     // should not have an actual call like `decodeURIComponent(...)`)
-    expect(matchRouteCode).not.toMatch(/\bdecodeURIComponent\s*\(/);
+    expect(routeMatchingSource).not.toMatch(/\bdecodeURIComponent\s*\(/);
   });
 
-  it("middleware always receives a Request with the decoded pathname (not raw URL)", async () => {
-    const { generateRscEntry } = await import("../packages/vinext/src/entries/app-rsc-entry.js");
-    const code = generateRscEntry(
-      "/tmp/app",
-      [
-        {
-          pattern: "/dashboard",
-          patternParts: ["dashboard"],
-          isDynamic: false,
-          params: [],
-          pagePath: null,
-          routePath: null,
-          layouts: [],
-          routeSegments: [],
-          layoutTreePositions: [],
-          templates: [],
-          loadingPath: null,
-          errorPath: null,
-          layoutErrorPaths: [],
-          notFoundPath: null,
-          notFoundPaths: [],
-          forbiddenPath: null,
-          unauthorizedPath: null,
-          parallelSlots: [],
-        },
-      ],
-      "/tmp/middleware.ts",
-    );
-    // The generated code should ALWAYS construct a new Request with cleanPathname.
-    // Verify the generated code constructs a Request with the decoded pathname
-    // for ALL requests (not just RSC).
-    expect(code).not.toMatch(/let mwRequest = request;/);
-    expect(code).toContain("const mwUrl = new URL(request.url)");
-    expect(code).toContain("mwUrl.pathname = cleanPathname");
-    expect(code).toContain("const mwRequest = new Request(mwUrl, request)");
+  it("App Router middleware receives a Request with the decoded pathname (not raw URL)", async () => {
+    const { applyAppMiddleware } = await import("../packages/vinext/src/server/app-middleware.js");
+    let capturedUrl: string | undefined;
+    const module = {
+      default: (req: Request) => {
+        capturedUrl = req.url;
+        return new Response(null, {
+          headers: { "x-middleware-next": "1" },
+        });
+      },
+    };
+
+    const result = await applyAppMiddleware({
+      cleanPathname: "/%64ashboard",
+      context: { headers: null, requestHeaders: null, status: null },
+      isProxy: false,
+      module,
+      request: new Request("http://localhost:3000/%2564ashboard"),
+    });
+
+    expect(result.kind).toBe("continue");
+    expect(capturedUrl).toBeDefined();
+    const mwPathname = new URL(capturedUrl!).pathname;
+    expect(mwPathname).toBe("/%64ashboard");
+    expect(mwPathname).not.toBe("/%2564ashboard");
   });
 
   it("Pages Router runMiddleware passes decoded pathname to middleware function", async () => {
@@ -10067,6 +10138,92 @@ describe("next/image component rendering", () => {
     );
     expect(html).toContain('decoding="async"');
   });
+
+  // ── SSR-only smoke tests: verify SSR output does not crash when onLoad / onError /
+  // ref are provided. The hydration replay logic (useLayoutEffect, img.src = img.src,
+  // mergedRef DOM node capture) requires a client-side mount; the handler wiring is
+  // tested in the Playwright E2E test suite.
+
+  it("renders with onError callback attached (SSR smoke test)", async () => {
+    const React = await import("react");
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const Image = (await import("../packages/vinext/src/shims/image.js")).default;
+
+    const html = renderToStaticMarkup(
+      React.createElement(Image, {
+        src: "/broken.jpg",
+        alt: "Broken",
+        width: 400,
+        height: 300,
+        onError: () => {},
+      }),
+    );
+    // SSR should render without errors — the onError replay is client-side only
+    expect(html).toContain("<img");
+    expect(html).toContain("/_vinext/image");
+  });
+
+  it("renders with both onLoad and onError callbacks (SSR smoke test)", async () => {
+    const React = await import("react");
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const Image = (await import("../packages/vinext/src/shims/image.js")).default;
+
+    const html = renderToStaticMarkup(
+      React.createElement(Image, {
+        src: "/photo.jpg",
+        alt: "Photo",
+        width: 800,
+        height: 600,
+        onLoad: () => {},
+        onError: () => {},
+      }),
+    );
+    expect(html).toContain("<img");
+    expect(html).toContain("/_vinext/image");
+  });
+
+  it("forwards ref to img element via mergedRef (SSR smoke test)", async () => {
+    const React = await import("react");
+    const { renderToString } = await import("react-dom/server");
+
+    const ref = React.createRef<HTMLImageElement>();
+    const Image = (await import("../packages/vinext/src/shims/image.js")).default;
+
+    const html = renderToString(
+      React.createElement(Image, {
+        src: "/photo.jpg",
+        alt: "Ref test",
+        width: 800,
+        height: 600,
+        ref,
+      }),
+    );
+    expect(html).toContain("<img");
+    expect(html).toContain("/_vinext/image");
+    // ref.current is null after SSR — that's expected since refs don't hydrate in SSR
+    expect(ref.current).toBeNull();
+  });
+
+  it("renders with onError in loader path (SSR smoke test)", async () => {
+    const React = await import("react");
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const Image = (await import("../packages/vinext/src/shims/image.js")).default;
+
+    const html = renderToStaticMarkup(
+      React.createElement(Image, {
+        src: "/photo.jpg",
+        alt: "Loader",
+        width: 800,
+        height: 600,
+        onError: () => {},
+        loader: ({ src, width, quality }) =>
+          `https://cdn.example.com${src}?w=${width}&q=${quality}`,
+      }),
+    );
+    expect(html).toContain("<img");
+    expect(html).not.toContain("/_vinext/image");
+    expect(html).toContain("cdn.example.com");
+  });
 });
 
 describe("image remote pattern matching", () => {
@@ -12458,6 +12615,69 @@ describe("cache scope guards for dynamic APIs", () => {
 
     setCacheHandler(new MemoryCacheHandler());
   });
+
+  // Ported from Next.js: workStore.invalidDynamicUsageError in
+  // packages/next/src/server/app-render/app-render.tsx
+  // https://github.com/vercel/next.js/commit/f5e54c06726b571a042fce67417e40a29f6b8689
+  it("records invalid dynamic usage error on request context (survives try/catch)", async () => {
+    const { cacheContextStorage } = await import("../packages/vinext/src/shims/cache-runtime.js");
+    const { setHeadersContext, throwIfInsideCacheScope, consumeInvalidDynamicUsageError } =
+      await import("../packages/vinext/src/shims/headers.js");
+    const { createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
+
+    setHeadersContext({ headers: new Headers(), cookies: new Map() });
+
+    const ctx = createRequestContext({
+      headersContext: { headers: new Headers(), cookies: new Map() },
+    });
+    let recordedError: unknown = null;
+
+    await runWithRequestContext(ctx, async () => {
+      try {
+        await cacheContextStorage.run(
+          { tags: [], lifeConfigs: [], variant: "default" },
+          async () => {
+            throwIfInsideCacheScope("cookies()");
+          },
+        );
+      } catch {
+        // User try/catch — the error should still be recorded on the context
+      }
+      recordedError = consumeInvalidDynamicUsageError();
+    });
+
+    expect(recordedError).toBeInstanceOf(Error);
+    expect((recordedError as Error).message).toContain('cannot be called inside "use cache"');
+
+    // After consumption, the error is cleared
+    expect(consumeInvalidDynamicUsageError()).toBeNull();
+
+    setHeadersContext(null);
+  });
+
+  it("consumeInvalidDynamicUsageError returns null when no error was recorded", async () => {
+    const { consumeInvalidDynamicUsageError } =
+      await import("../packages/vinext/src/shims/headers.js");
+    const { createRequestContext, runWithRequestContext } =
+      await import("../packages/vinext/src/shims/unified-request-context.js");
+
+    const ctx = createRequestContext();
+    let result: unknown;
+
+    await runWithRequestContext(ctx, async () => {
+      result = consumeInvalidDynamicUsageError();
+    });
+
+    expect(result!).toBeNull();
+  });
+
+  it("consumeInvalidDynamicUsageError works outside unified request scope", async () => {
+    const { consumeInvalidDynamicUsageError } =
+      await import("../packages/vinext/src/shims/headers.js");
+    // Should return null without throwing when no unified scope is active
+    expect(consumeInvalidDynamicUsageError()).toBeNull();
+  });
 });
 
 describe("shim alias map .js variants", () => {
@@ -12701,5 +12921,19 @@ describe("isOriginAllowed", () => {
     // evil.example.com.attacker.com
     expect(isOriginAllowed("evil.example.com.attacker.com", ["*.example.com"])).toBe(false);
     expect(isOriginAllowed("evil.example.com.attacker.com", ["**.example.com"])).toBe(false);
+  });
+});
+
+// Reference: vercel/next.js#92012 — useOffline() hook
+describe("next/offline shim", () => {
+  it("exports useOffline", async () => {
+    const offline = await import("../packages/vinext/src/shims/offline.js");
+    expect(offline.useOffline).toBeDefined();
+    expect(typeof offline.useOffline).toBe("function");
+  });
+
+  it("useOffline returns false (no-op stub)", async () => {
+    const offline = await import("../packages/vinext/src/shims/offline.js");
+    expect(offline.useOffline()).toBe(false);
   });
 });

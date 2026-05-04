@@ -515,13 +515,13 @@ import type { ImageConfig } from "vinext/server/image-optimization";
 import {
   matchRedirect,
   matchRewrite,
-  matchHeaders,
   requestContextFromRequest,
   applyMiddlewareRequestHeaders,
   isExternalUrl,
   proxyExternalRequest,
   sanitizeDestination,
 } from "vinext/config/config-matchers";
+import { applyConfigHeadersToHeaderRecord } from "vinext/server/request-pipeline";
 
 // @ts-expect-error -- virtual module resolved by vinext at build time
 import { renderPage, handleApiRoute, runMiddleware, vinextConfig } from "virtual:vinext-server-entry";
@@ -749,29 +749,19 @@ export default {
       // Middleware headers take precedence: skip config keys already set
       // by middleware so middleware always wins for the same key.
       if (configHeaders.length) {
-        const matched = matchHeaders(pathname, configHeaders, reqCtx);
-        for (const h of matched) {
-          const lk = h.key.toLowerCase();
-          if (lk === "set-cookie") {
-            const existing = middlewareHeaders[lk];
-            if (Array.isArray(existing)) {
-              existing.push(h.value);
-            } else if (existing) {
-              middlewareHeaders[lk] = [existing as string, h.value];
-            } else {
-              middlewareHeaders[lk] = [h.value];
-            }
-          } else if (lk === "vary" && middlewareHeaders[lk]) {
-            middlewareHeaders[lk] += ", " + h.value;
-          } else if (!(lk in middlewareHeaders)) {
-            // Middleware headers take precedence: only set if middleware
-            // did not already place this key on the response.
-            middlewareHeaders[lk] = h.value;
-          }
-        }
+        applyConfigHeadersToHeaderRecord(middlewareHeaders, {
+          configHeaders,
+          pathname,
+          requestContext: reqCtx,
+        });
       }
 
-      // ��─ 6. Apply beforeFiles rewrites from next.config.js ─────────
+      if (isExternalUrl(resolvedUrl)) {
+        const proxyResponse = await proxyExternalRequest(request, resolvedUrl);
+        return mergeHeaders(proxyResponse, middlewareHeaders, undefined);
+      }
+
+      // ── 6. Apply beforeFiles rewrites from next.config.js ─────────
       if (configRewrites.beforeFiles?.length) {
         const rewritten = matchRewrite(resolvedPathname, configRewrites.beforeFiles, postMwReqCtx);
         if (rewritten) {
@@ -1358,6 +1348,10 @@ export async function deploy(options: DeployOptions): Promise<void> {
           ? "Pre-rendering all routes (output: 'export')..."
           : "Pre-rendering all routes...";
       console.log(`\n  ${label}`);
+      if (nextConfig.enablePrerenderSourceMaps) {
+        process.setSourceMapsEnabled(true);
+        Error.stackTraceLimit = Math.max(Error.stackTraceLimit, 50);
+      }
       await runPrerender({ root: info.root });
     }
   }

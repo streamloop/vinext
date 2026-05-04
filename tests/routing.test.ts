@@ -10,6 +10,7 @@ import {
 } from "../packages/vinext/src/routing/pages-router.js";
 import {
   appRouter,
+  computeRootParamNames,
   matchAppRoute,
   invalidateAppRouteCache,
   type AppRoute,
@@ -45,12 +46,15 @@ function makeTestAppRoute(
     layoutErrorPaths: [],
     notFoundPath: null,
     notFoundPaths: [],
+    forbiddenPaths: [],
     forbiddenPath: null,
+    unauthorizedPaths: [],
     unauthorizedPath: null,
     routeSegments: [],
     layoutTreePositions: [],
     isDynamic: pattern.includes(":"),
     params: [],
+    rootParamNames: [],
   };
 }
 
@@ -328,6 +332,22 @@ describe("appRouter - route discovery", () => {
     expect(apiPatterns).toContain("/api/hello");
   });
 
+  it("rejects page and route handler files at the same app route", async () => {
+    // Next.js docs forbid page.js and route.js at the same normalized route:
+    // https://github.com/vercel/next.js/blob/ae61573e062e900050b8e6b24626e450accc4570/docs/01-app/01-getting-started/15-route-handlers.mdx#L150-L163
+    await withTempDir("vinext-app-page-route-conflict-", async (tmpDir) => {
+      const appDir = path.join(tmpDir, "app");
+      await mkdir(path.join(appDir, "foo"), { recursive: true });
+      await writeFile(path.join(appDir, "foo", "page.tsx"), EMPTY_PAGE);
+      await writeFile(path.join(appDir, "foo", "route.ts"), EMPTY_ROUTE);
+
+      invalidateAppRouteCache();
+      await expect(appRouter(appDir)).rejects.toThrow(
+        "Conflicting route and page at /foo: route at /foo/route and page at /foo/page",
+      );
+    });
+  });
+
   it("discovers layouts from root to leaf", async () => {
     const routes = await appRouter(APP_FIXTURE_DIR);
     const homeRoute = routes.find((r) => r.pattern === "/");
@@ -345,6 +365,54 @@ describe("appRouter - route discovery", () => {
     expect(blogRoute).toBeDefined();
     expect(blogRoute!.isDynamic).toBe(true);
     expect(blogRoute!.params).toEqual(["slug"]);
+  });
+
+  it("discovers dynamic params captured by a nested root layout", async () => {
+    await withTempDir("vinext-app-root-params-", async (tmpDir) => {
+      const appDir = path.join(tmpDir, "app");
+      await mkdir(path.join(appDir, "[lang]", "[locale]", "other", "[slug]"), {
+        recursive: true,
+      });
+      await writeFile(path.join(appDir, "[lang]", "[locale]", "layout.tsx"), EMPTY_PAGE);
+      await writeFile(
+        path.join(appDir, "[lang]", "[locale]", "other", "[slug]", "page.tsx"),
+        EMPTY_PAGE,
+      );
+
+      invalidateAppRouteCache();
+      const routes = await appRouter(appDir);
+      const route = routes.find((r) => r.pattern === "/:lang/:locale/other/:slug");
+
+      expect(route).toBeDefined();
+      expect(route!.params).toEqual(["lang", "locale", "slug"]);
+      expect(route!.rootParamNames).toEqual(["lang", "locale"]);
+    });
+  });
+
+  it("preserves root layout params on synthetic parallel slot routes", async () => {
+    await withTempDir("vinext-app-root-params-parallel-slot-", async (tmpDir) => {
+      const appDir = path.join(tmpDir, "app");
+      await mkdir(path.join(appDir, "[lang]", "@modal", "details"), {
+        recursive: true,
+      });
+      await writeFile(path.join(appDir, "[lang]", "layout.tsx"), EMPTY_PAGE);
+      await writeFile(path.join(appDir, "[lang]", "page.tsx"), EMPTY_PAGE);
+      await writeFile(path.join(appDir, "[lang]", "default.tsx"), EMPTY_PAGE);
+      await writeFile(path.join(appDir, "[lang]", "@modal", "default.tsx"), EMPTY_PAGE);
+      await writeFile(path.join(appDir, "[lang]", "@modal", "details", "page.tsx"), EMPTY_PAGE);
+
+      invalidateAppRouteCache();
+      const routes = await appRouter(appDir);
+      const route = routes.find((r) => r.pattern === "/:lang/details");
+
+      expect(route).toBeDefined();
+      expect(route!.rootParamNames).toEqual(["lang"]);
+    });
+  });
+
+  it("computes root layout params for dynamic and catch-all segments", () => {
+    expect(computeRootParamNames(["[lang]", "[...slug]", "page"], [2])).toEqual(["lang", "slug"]);
+    expect(computeRootParamNames(["[[...rest]]"], [1])).toEqual(["rest"]);
   });
 
   it("sorts static routes before dynamic routes at the same depth", async () => {
@@ -610,6 +678,96 @@ describe("appRouter - route discovery", () => {
     });
   });
 
+  it("rejects (..) intercepting routes at the normalized root", async () => {
+    // Ported from Next.js:
+    // packages/next/src/shared/lib/router/utils/interception-routes.test.ts
+    // https://github.com/vercel/next.js/blob/ae61573e062e900050b8e6b24626e450accc4570/packages/next/src/shared/lib/router/utils/interception-routes.test.ts#L66-L75
+    await withTempDir("vinext-app-intercept-root-parent-marker-", async (tmpDir) => {
+      const appDir = path.join(tmpDir, "app");
+      await mkdir(path.join(appDir, "@modal", "(..)foo"), { recursive: true });
+      await writeFile(path.join(appDir, "page.tsx"), EMPTY_PAGE);
+      await writeFile(path.join(appDir, "@modal", "(..)foo", "page.tsx"), EMPTY_PAGE);
+
+      invalidateAppRouteCache();
+      await expect(appRouter(appDir)).rejects.toThrow(
+        "Cannot use (..) marker at the root level, use (.) instead.",
+      );
+    });
+  });
+
+  it("rejects (..) intercepting routes at the root after route group normalization", async () => {
+    // Next.js validates the normalized intercepting route, so transparent
+    // route groups do not make an upward marker valid at the URL root.
+    // https://github.com/vercel/next.js/blob/ae61573e062e900050b8e6b24626e450accc4570/packages/next/src/shared/lib/router/utils/interception-routes.ts#L60-L95
+    await withTempDir("vinext-app-intercept-group-root-parent-marker-", async (tmpDir) => {
+      const appDir = path.join(tmpDir, "app");
+      await mkdir(path.join(appDir, "(group)", "@modal", "(..)foo"), { recursive: true });
+      await writeFile(path.join(appDir, "(group)", "page.tsx"), EMPTY_PAGE);
+      await writeFile(path.join(appDir, "(group)", "@modal", "(..)foo", "page.tsx"), EMPTY_PAGE);
+
+      invalidateAppRouteCache();
+      await expect(appRouter(appDir)).rejects.toThrow(
+        "Cannot use (..) marker at the root level, use (.) instead.",
+      );
+    });
+  });
+
+  it("rejects (..)(..) intercepting routes at root or one visible level up", async () => {
+    // Ported from Next.js:
+    // packages/next/src/shared/lib/router/utils/interception-routes.test.ts
+    // https://github.com/vercel/next.js/blob/ae61573e062e900050b8e6b24626e450accc4570/packages/next/src/shared/lib/router/utils/interception-routes.test.ts#L66-L75
+    await withTempDir("vinext-app-intercept-two-up-marker-root-", async (tmpDir) => {
+      const appDir = path.join(tmpDir, "app");
+      await mkdir(path.join(appDir, "@modal", "(..)(..)foo"), { recursive: true });
+      await writeFile(path.join(appDir, "page.tsx"), EMPTY_PAGE);
+      await writeFile(path.join(appDir, "@modal", "(..)(..)foo", "page.tsx"), EMPTY_PAGE);
+
+      invalidateAppRouteCache();
+      await expect(appRouter(appDir)).rejects.toThrow(
+        "Cannot use (..)(..) marker at the root level or one level up.",
+      );
+    });
+
+    await withTempDir("vinext-app-intercept-two-up-marker-one-level-", async (tmpDir) => {
+      const appDir = path.join(tmpDir, "app");
+      await mkdir(path.join(appDir, "feed", "@modal", "(..)(..)foo"), { recursive: true });
+      await writeFile(path.join(appDir, "feed", "page.tsx"), EMPTY_PAGE);
+      await writeFile(path.join(appDir, "feed", "@modal", "(..)(..)foo", "page.tsx"), EMPTY_PAGE);
+
+      invalidateAppRouteCache();
+      await expect(appRouter(appDir)).rejects.toThrow(
+        "Cannot use (..)(..) marker at the root level or one level up.",
+      );
+    });
+  });
+
+  it("allows (..) intercepting routes in route groups with one visible parent segment", async () => {
+    // Next.js validates the normalized intercepting route: /(group) is root,
+    // but /shop/(group) has one visible segment and can climb to /.
+    // https://github.com/vercel/next.js/blob/ae61573e062e900050b8e6b24626e450accc4570/packages/next/src/shared/lib/router/utils/interception-routes.ts#L60-L95
+    await withTempDir("vinext-app-intercept-group-with-visible-parent-", async (tmpDir) => {
+      const appDir = path.join(tmpDir, "app");
+      await mkdir(path.join(appDir, "shop", "(group)", "@modal", "(..)foo"), {
+        recursive: true,
+      });
+      await writeFile(path.join(appDir, "shop", "(group)", "page.tsx"), EMPTY_PAGE);
+      await writeFile(
+        path.join(appDir, "shop", "(group)", "@modal", "(..)foo", "page.tsx"),
+        EMPTY_PAGE,
+      );
+
+      invalidateAppRouteCache();
+      const routes = await appRouter(appDir);
+      const shopRoute = routes.find((route) => route.pattern === "/shop");
+      expect(shopRoute).toBeDefined();
+
+      const modalSlot = shopRoute!.parallelSlots.find((slot) => slot.name === "modal");
+      expect(modalSlot).toBeDefined();
+      expect(modalSlot!.interceptingRoutes).toHaveLength(1);
+      expect(modalSlot!.interceptingRoutes[0].targetPattern).toBe("/foo");
+    });
+  });
+
   it("(..) climbs visible route segments, not filesystem dirs (route group between segments)", async () => {
     // Bug: computeInterceptTarget uses path.dirname() which counts filesystem dirs,
     // but (..) should count visible route segments (skipping route groups).
@@ -826,7 +984,7 @@ describe("matchAppRoute - URL matching", () => {
     const result = matchAppRoute("/optional", routes);
     expect(result).not.toBeNull();
     expect(result!.route.pattern).toBe("/optional/:path*");
-    expect(result!.params.path).toEqual([]);
+    expect(result!.params).not.toHaveProperty("path");
   });
 
   it("matches optional catch-all with multiple segments", async () => {
@@ -1360,7 +1518,7 @@ describe("matchAppRoute - URL matching", () => {
     const result = matchAppRoute("/sign-in", routes);
     expect(result).not.toBeNull();
     expect(result!.route.pattern).toBe("/sign-in/:sign-in*");
-    expect(result!.params["sign-in"]).toEqual([]);
+    expect(result!.params).not.toHaveProperty("sign-in");
   });
 
   it("matches hyphenated optional catch-all with segments", async () => {
@@ -1508,7 +1666,7 @@ describe("pagesRouter - hyphenated param names", () => {
     const result = matchRoute("/sign-up", routes);
     expect(result).not.toBeNull();
     expect(result!.route.pattern).toBe("/sign-up/:sign-up*");
-    expect(result!.params["sign-up"]).toEqual([]);
+    expect(result!.params).not.toHaveProperty("sign-up");
   });
 
   it("matches hyphenated optional catch-all with segments", async () => {

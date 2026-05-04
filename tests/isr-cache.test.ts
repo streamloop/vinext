@@ -8,15 +8,22 @@
  * These complement the integration-level ISR tests in features.test.ts
  * by testing the ISR cache layer in isolation.
  */
-import { describe, it, expect, vi, beforeEach } from "vite-plus/test";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
 import {
   isrCacheKey,
+  appIsrHtmlKey,
+  appIsrRscKey,
+  appIsrRouteKey,
+  isrGet,
+  isrSet,
   buildPagesCacheValue,
   buildAppPageCacheValue,
+  normalizeMountedSlotsHeader,
   setRevalidateDuration,
   getRevalidateDuration,
   triggerBackgroundRegeneration,
 } from "../packages/vinext/src/server/isr-cache.js";
+import { buildPageCacheTags } from "../packages/vinext/src/server/implicit-tags.js";
 import { runWithExecutionContext } from "../packages/vinext/src/shims/request-context.js";
 import {
   createRequestContext,
@@ -108,6 +115,64 @@ describe("isrCacheKey", () => {
   });
 });
 
+describe("App Router ISR cache key primitives", () => {
+  const originalBuildId = process.env.__VINEXT_BUILD_ID;
+
+  afterEach(() => {
+    if (originalBuildId === undefined) {
+      delete process.env.__VINEXT_BUILD_ID;
+      return;
+    }
+
+    process.env.__VINEXT_BUILD_ID = originalBuildId;
+  });
+
+  it("builds separate html, rsc, and route keys from the normalized pathname", () => {
+    delete process.env.__VINEXT_BUILD_ID;
+
+    expect(appIsrHtmlKey("/about/")).toBe("app:/about:html");
+    expect(appIsrRscKey("/about/")).toBe("app:/about:rsc");
+    expect(appIsrRouteKey("/api/feed/")).toBe("app:/api/feed:route");
+  });
+
+  it("includes the build id when present", () => {
+    process.env.__VINEXT_BUILD_ID = "build-42";
+
+    expect(appIsrHtmlKey("/dashboard")).toBe("app:build-42:/dashboard:html");
+  });
+
+  it("hashes long pathname keys while preserving the cache entry suffix", () => {
+    delete process.env.__VINEXT_BUILD_ID;
+
+    const key = appIsrRscKey("/" + "a".repeat(250));
+
+    expect(key).toMatch(/^app:__hash:[a-z0-9]+:rsc$/);
+  });
+
+  it("keys mounted-slot RSC variants by normalized mounted-slot header", () => {
+    delete process.env.__VINEXT_BUILD_ID;
+
+    const first = appIsrRscKey("/feed", "modal sidebar");
+    const second = appIsrRscKey("/feed", "sidebar modal");
+
+    expect(first).toBe(second);
+    expect(first).toMatch(/^app:\/feed:rsc:[a-z0-9]+$/);
+  });
+});
+
+describe("normalizeMountedSlotsHeader", () => {
+  it("returns null for missing or blank mounted-slot headers", () => {
+    expect(normalizeMountedSlotsHeader(null)).toBeNull();
+    expect(normalizeMountedSlotsHeader("   \t\n  ")).toBeNull();
+  });
+
+  it("deduplicates and sorts whitespace-separated slot ids", () => {
+    expect(normalizeMountedSlotsHeader(" sidebar  modal sidebar\tcart ")).toBe(
+      "cart modal sidebar",
+    );
+  });
+});
+
 // ─── buildPagesCacheValue ───────────────────────────────────────────────
 
 describe("buildPagesCacheValue", () => {
@@ -175,6 +240,67 @@ describe("setRevalidateDuration / getRevalidateDuration", () => {
   });
 });
 
+// ─── Expire ceiling handling ────────────────────────────────────────────
+
+describe("ISR expire ceiling", () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    setCacheHandler(new MemoryCacheHandler());
+  });
+
+  it("serves stale within expire and treats entries beyond expire as hard misses", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(1_000);
+
+    await isrSet("expire-test", buildPagesCacheValue("<html>cached</html>", {}), 1, [], 3);
+
+    vi.setSystemTime(2_500);
+    const stale = await isrGet("expire-test");
+    expect(stale?.isStale).toBe(true);
+    expect(stale?.value.value?.kind).toBe("PAGES");
+
+    vi.setSystemTime(4_500);
+    await expect(isrGet("expire-test")).resolves.toBeNull();
+  });
+
+  it("preserves legacy revalidate context while writing cache-control metadata", async () => {
+    let setContext: Record<string, unknown> | undefined;
+    setCacheHandler({
+      async get() {
+        return null;
+      },
+      async set(_key, _data, ctx) {
+        setContext = ctx;
+      },
+      async revalidateTag() {},
+    });
+
+    await isrSet("compat-test", buildPagesCacheValue("<html>cached</html>", {}), 60, ["tag"], 300);
+
+    expect(setContext).toEqual({
+      cacheControl: { revalidate: 60, expire: 300 },
+      revalidate: 60,
+      tags: ["tag"],
+    });
+  });
+
+  it("treats cache handlers that report expired entries as hard misses", async () => {
+    setCacheHandler({
+      async get() {
+        return {
+          lastModified: Date.now() - 10_000,
+          cacheState: "expired",
+          value: buildPagesCacheValue("<html>expired</html>", {}),
+        };
+      },
+      async set() {},
+      async revalidateTag() {},
+    });
+
+    await expect(isrGet("expired-handler-entry")).resolves.toBeNull();
+  });
+});
+
 // ─── triggerBackgroundRegeneration ───────────────────────────────────────
 
 describe("triggerBackgroundRegeneration", () => {
@@ -236,6 +362,79 @@ describe("triggerBackgroundRegeneration", () => {
     expect(renderFn2).toHaveBeenCalledOnce();
 
     consoleError.mockRestore();
+  });
+
+  it("reports error via onRequestError handler when errorContext is provided", async () => {
+    const handler = vi.fn();
+    globalThis.__VINEXT_onRequestErrorHandler__ = handler;
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const renderFn = vi.fn().mockRejectedValue(new Error("regen failed"));
+      triggerBackgroundRegeneration("regen-report-error", renderFn, {
+        routerKind: "App Router",
+        routePath: "/blog/[slug]",
+        routeType: "render",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(handler).toHaveBeenCalledOnce();
+      const [error, request, context] = handler.mock.calls[0];
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toBe("regen failed");
+      expect(request).toEqual({ path: "regen-report-error", method: "GET", headers: {} });
+      expect(context).toEqual({
+        routerKind: "App Router",
+        routePath: "/blog/[slug]",
+        routeType: "render",
+        revalidateReason: "stale",
+      });
+    } finally {
+      delete globalThis.__VINEXT_onRequestErrorHandler__;
+      consoleError.mockRestore();
+    }
+  });
+
+  it("does NOT call onRequestError handler when errorContext is omitted", async () => {
+    const handler = vi.fn();
+    globalThis.__VINEXT_onRequestErrorHandler__ = handler;
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const renderFn = vi.fn().mockRejectedValue(new Error("regen failed"));
+      triggerBackgroundRegeneration("regen-no-ctx", renderFn);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(consoleError).toHaveBeenCalled();
+      expect(handler).not.toHaveBeenCalled();
+    } finally {
+      delete globalThis.__VINEXT_onRequestErrorHandler__;
+      consoleError.mockRestore();
+    }
+  });
+
+  it("wraps non-Error throw values in Error before reporting", async () => {
+    const handler = vi.fn();
+    globalThis.__VINEXT_onRequestErrorHandler__ = handler;
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const renderFn = vi.fn().mockRejectedValue("string error");
+      triggerBackgroundRegeneration("regen-string-error", renderFn, {
+        routerKind: "Pages Router",
+        routePath: "/about",
+        routeType: "render",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(handler).toHaveBeenCalledOnce();
+      const [error] = handler.mock.calls[0];
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toBe("string error");
+    } finally {
+      delete globalThis.__VINEXT_onRequestErrorHandler__;
+      consoleError.mockRestore();
+    }
   });
 
   it("different keys run independently", async () => {
@@ -327,26 +526,17 @@ describe("triggerBackgroundRegeneration", () => {
 describe("revalidatePath type parameter", () => {
   let handler: MemoryCacheHandler;
 
-  /**
-   * Mirrors `__pageCacheTags` in app-rsc-entry.ts — keep in sync.
-   */
-  function deriveImplicitTags(pathname: string): string[] {
-    const tags = ["_N_T_/layout"];
-    const segments = pathname.split("/");
-    let built = "";
-    for (let i = 1; i < segments.length; i++) {
-      if (segments[i]) {
-        built += "/" + segments[i];
-        tags.push(`_N_T_${built}/layout`);
-      }
-    }
-    tags.push(`_N_T_${built}/page`);
-    return tags;
+  function staticRouteSegments(pathname: string): string[] {
+    return pathname.split("/").filter(Boolean);
   }
 
   /** Helper: store a FETCH cache entry with path + implicit hierarchy tags. */
-  async function seedEntry(path: string, body: string): Promise<void> {
-    const tags = [path, `_N_T_${path}`, ...deriveImplicitTags(path)];
+  async function seedEntry(
+    path: string,
+    body: string,
+    routeSegments = staticRouteSegments(path),
+  ): Promise<void> {
+    const tags = buildPageCacheTags(path, [], routeSegments, "page");
     const value: CachedFetchValue = {
       kind: "FETCH",
       data: { headers: {}, body, url: path },
@@ -406,6 +596,21 @@ describe("revalidatePath type parameter", () => {
     expect(await handler.get("entry:/about")).toBeNull();
     // /about/team should remain
     expect(await handler.get("entry:/about/team")).not.toBeNull();
+  });
+
+  it("uses route pattern tags for typed dynamic route invalidation", async () => {
+    await seedEntry("/blog/hello", "hello", ["blog", "[slug]"]);
+
+    await revalidatePath("/blog/hello", "layout");
+    expect(await handler.get("entry:/blog/hello")).not.toBeNull();
+
+    await revalidatePath("/blog/[slug]", "layout");
+    expect(await handler.get("entry:/blog/hello")).toBeNull();
+
+    await seedEntry("/blog/hello", "hello", ["blog", "[slug]"]);
+
+    await revalidatePath("/blog/hello");
+    expect(await handler.get("entry:/blog/hello")).toBeNull();
   });
 
   it("handles deeply nested children under a layout prefix", async () => {

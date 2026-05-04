@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import type { Route } from "../routing/pages-router.js";
-import type { CachedPagesValue } from "../shims/cache.js";
+import type { CachedPagesValue, CacheControlMetadata } from "vinext/shims/cache";
+import { buildCachedRevalidateCacheControl } from "./cache-control.js";
 import { buildPagesCacheValue, type ISRCacheEntry } from "./isr-cache.js";
 import {
   buildPagesNextDataScript,
@@ -90,7 +91,9 @@ export type ResolvePagesPageDataOptions = {
     data: CachedPagesValue,
     revalidateSeconds: number,
     tags?: string[],
+    expireSeconds?: number,
   ) => Promise<void>;
+  expireSeconds?: number;
   pageModule: PagesPageModule;
   params: Record<string, unknown>;
   query: Record<string, unknown>;
@@ -101,7 +104,11 @@ export type ResolvePagesPageDataOptions = {
   safeJsonStringify: (value: unknown) => string;
   sanitizeDestination: (destination: string) => string;
   scriptNonce?: string;
-  triggerBackgroundRegeneration: (key: string, renderFn: () => Promise<void>) => void;
+  triggerBackgroundRegeneration: (
+    key: string,
+    renderFn: () => Promise<void>,
+    errorContext?: { routerKind: "Pages Router"; routePath: string; routeType: "render" },
+  ) => void;
   renderIsrPassToStringAsync: (element: ReactNode) => Promise<string>;
 };
 
@@ -154,14 +161,23 @@ function buildPagesCacheResponse(
   cacheState: "HIT" | "STALE",
   fontLinkHeader: string,
   revalidateSeconds?: number,
+  expireSeconds?: number,
+  cacheControl?: CacheControlMetadata,
 ): Response {
+  // Legacy cache entries written before cacheControl metadata existed can still
+  // hit this path without a persisted revalidate value; keep the historic
+  // 60-second fallback for that migration window.
+  const effectiveRevalidateSeconds = cacheControl?.revalidate ?? revalidateSeconds ?? 60;
+  const effectiveExpireSeconds =
+    cacheControl === undefined ? undefined : (cacheControl.expire ?? expireSeconds);
   const headers: Record<string, string> = {
     "Content-Type": "text/html",
     "X-Vinext-Cache": cacheState,
-    "Cache-Control":
-      cacheState === "HIT"
-        ? `s-maxage=${revalidateSeconds ?? 60}, stale-while-revalidate`
-        : "s-maxage=0, stale-while-revalidate",
+    "Cache-Control": buildCachedRevalidateCacheControl(
+      cacheState,
+      effectiveRevalidateSeconds,
+      effectiveExpireSeconds,
+    ),
   };
 
   if (fontLinkHeader) {
@@ -310,51 +326,70 @@ export async function resolvePagesPageData(
           cachedValue.html,
           "HIT",
           options.fontLinkHeader,
-          (cachedValue as CachedPagesValue & { revalidate?: number }).revalidate,
+          undefined,
+          options.expireSeconds,
+          cached.value.cacheControl,
         ),
       };
     }
 
     if (cachedValue?.kind === "PAGES" && cached && cached.isStale && !options.scriptNonce) {
-      options.triggerBackgroundRegeneration(cacheKey, async function () {
-        return options.runInFreshUnifiedContext(async () => {
-          const freshResult = await options.pageModule.getStaticProps?.({
-            params: options.params,
-            locale: options.i18n.locale,
-            locales: options.i18n.locales,
-            defaultLocale: options.i18n.defaultLocale,
-          });
-
-          if (
-            freshResult?.props &&
-            typeof freshResult.revalidate === "number" &&
-            freshResult.revalidate > 0
-          ) {
-            options.applyRequestContexts();
-            const freshHtml = await renderPagesIsrHtml({
-              buildId: options.buildId,
-              cachedHtml: cachedValue.html,
-              createPageElement: options.createPageElement,
-              i18n: options.i18n,
-              pageProps: freshResult.props,
+      options.triggerBackgroundRegeneration(
+        cacheKey,
+        async function () {
+          return options.runInFreshUnifiedContext(async () => {
+            const freshResult = await options.pageModule.getStaticProps?.({
               params: options.params,
-              renderIsrPassToStringAsync: options.renderIsrPassToStringAsync,
-              routePattern: options.routePattern,
-              safeJsonStringify: options.safeJsonStringify,
+              locale: options.i18n.locale,
+              locales: options.i18n.locales,
+              defaultLocale: options.i18n.defaultLocale,
             });
 
-            await options.isrSet(
-              cacheKey,
-              buildPagesCacheValue(freshHtml, freshResult.props),
-              freshResult.revalidate,
-            );
-          }
-        });
-      });
+            if (
+              freshResult?.props &&
+              typeof freshResult.revalidate === "number" &&
+              freshResult.revalidate > 0
+            ) {
+              options.applyRequestContexts();
+              const freshHtml = await renderPagesIsrHtml({
+                buildId: options.buildId,
+                cachedHtml: cachedValue.html,
+                createPageElement: options.createPageElement,
+                i18n: options.i18n,
+                pageProps: freshResult.props,
+                params: options.params,
+                renderIsrPassToStringAsync: options.renderIsrPassToStringAsync,
+                routePattern: options.routePattern,
+                safeJsonStringify: options.safeJsonStringify,
+              });
+
+              await options.isrSet(
+                cacheKey,
+                buildPagesCacheValue(freshHtml, freshResult.props),
+                freshResult.revalidate,
+                undefined,
+                options.expireSeconds,
+              );
+            }
+          });
+        },
+        {
+          routerKind: "Pages Router",
+          routePath: options.routePattern,
+          routeType: "render",
+        },
+      );
 
       return {
         kind: "response",
-        response: buildPagesCacheResponse(cachedValue.html, "STALE", options.fontLinkHeader),
+        response: buildPagesCacheResponse(
+          cachedValue.html,
+          "STALE",
+          options.fontLinkHeader,
+          undefined,
+          options.expireSeconds,
+          cached.value.cacheControl,
+        ),
       };
     }
 

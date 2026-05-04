@@ -20,6 +20,7 @@ import type {
   NavigationState,
   PrivateCacheState,
   RouterState,
+  RootParamsState,
   VinextHeadersShimState,
 } from "./request-state-types.js";
 
@@ -50,7 +51,8 @@ export type UnifiedRequestContext = {
   PrivateCacheState &
   FetchCacheState &
   RouterState &
-  HeadState;
+  HeadState &
+  RootParamsState;
 
 // ---------------------------------------------------------------------------
 // ALS setup — stored on globalThis via Symbol.for so all Vite environments
@@ -85,6 +87,7 @@ export function createRequestContext(opts?: Partial<UnifiedRequestContext>): Uni
   return {
     headersContext: null,
     dynamicUsageDetected: false,
+    invalidDynamicUsageError: null,
     pendingSetCookies: [],
     draftModeCookieHeader: null,
     phase: "render",
@@ -96,10 +99,12 @@ export function createRequestContext(opts?: Partial<UnifiedRequestContext>): Uni
     _privateCache: null,
     currentRequestTags: [],
     currentFetchSoftTags: [],
+    currentFetchCacheMode: null,
     executionContext: _getInheritedExecutionContext(), // inherits from standalone ALS if present
     requestCache: new WeakMap(),
     ssrContext: null,
     ssrHeadChildren: [],
+    rootParams: null,
     ...opts,
   };
 }

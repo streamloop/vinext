@@ -1,7 +1,12 @@
 import type { NextI18nConfig } from "../config/next-config.js";
-import type { HeadersAccessPhase } from "../shims/headers.js";
-import type { ExecutionContextLike } from "../shims/request-context.js";
-import type { CachedRouteValue } from "../shims/cache.js";
+import { setHeadersContext, type HeadersAccessPhase } from "vinext/shims/headers";
+import type { ExecutionContextLike } from "vinext/shims/request-context";
+import type { CachedRouteValue } from "vinext/shims/cache";
+import type { NextRequest } from "vinext/shims/server";
+import {
+  createStaticGenerationHeadersContext,
+  getAppRouteStaticGenerationErrorMessage,
+} from "./app-static-generation.js";
 import {
   isPossibleAppRouteActionRequest,
   resolveAppRouteHandlerSpecialError,
@@ -12,6 +17,7 @@ import {
 import {
   applyRouteHandlerMiddlewareContext,
   applyRouteHandlerRevalidateHeader,
+  assertSupportedAppRouteHandlerResponse,
   buildAppRouteCacheValue,
   finalizeRouteHandlerResponse,
   markRouteHandlerCacheMiss,
@@ -26,7 +32,7 @@ export type AppRouteParams = Record<string, string | string[]>;
 export type AppRouteDynamicUsageFn = () => boolean;
 export type MarkAppRouteDynamicUsageFn = () => void;
 export type AppRouteHandlerFunction = (
-  request: Request,
+  request: NextRequest,
   context: { params: AppRouteParams },
 ) => Response | Promise<Response>;
 export type RouteHandlerCacheSetter = (
@@ -34,6 +40,7 @@ export type RouteHandlerCacheSetter = (
   data: CachedRouteValue,
   revalidateSeconds: number,
   tags: string[],
+  expireSeconds?: number,
 ) => Promise<void>;
 type AppRouteErrorReporter = (
   error: Error,
@@ -45,12 +52,15 @@ export type AppRouteDebugLogger = (event: string, detail: string) => void;
 type RunAppRouteHandlerOptions = {
   basePath?: string;
   consumeDynamicUsage: AppRouteDynamicUsageFn;
+  dynamicConfig?: string;
   handlerFn: AppRouteHandlerFunction;
   i18n?: NextI18nConfig | null;
   markDynamicUsage: MarkAppRouteDynamicUsageFn;
   middlewareRequestHeaders?: Headers | null;
   params: AppRouteParams;
   request: Request;
+  routePattern?: string;
+  setHeadersAccessPhase?: (phase: HeadersAccessPhase) => HeadersAccessPhase;
 };
 
 type RunAppRouteHandlerResult = {
@@ -75,21 +85,43 @@ type ExecuteAppRouteHandlerOptions = {
   method: string;
   middlewareContext: RouteHandlerMiddlewareContext;
   reportRequestError: AppRouteErrorReporter;
+  expireSeconds?: number;
   revalidateSeconds: number | null;
   routePattern: string;
   setHeadersAccessPhase: (phase: HeadersAccessPhase) => HeadersAccessPhase;
 } & RunAppRouteHandlerOptions;
 
+function configureAppRouteStaticGenerationContext(options: RunAppRouteHandlerOptions): void {
+  if (options.dynamicConfig === "force-static" || options.dynamicConfig === "error") {
+    setHeadersContext(
+      createStaticGenerationHeadersContext({
+        dynamicConfig: options.dynamicConfig,
+        routeKind: "route",
+        routePattern: options.routePattern,
+      }),
+    );
+    options.setHeadersAccessPhase?.("route-handler");
+  }
+}
+
 export async function runAppRouteHandler(
   options: RunAppRouteHandlerOptions,
 ): Promise<RunAppRouteHandlerResult> {
   options.consumeDynamicUsage();
+  configureAppRouteStaticGenerationContext(options);
   const trackedRequest = createTrackedAppRouteRequest(options.request, {
     basePath: options.basePath,
     i18n: options.i18n,
     middlewareHeaders: options.middlewareRequestHeaders,
     onDynamicAccess() {
       options.markDynamicUsage();
+    },
+    requestMode:
+      options.dynamicConfig === "force-static" || options.dynamicConfig === "error"
+        ? options.dynamicConfig
+        : "auto",
+    staticGenerationErrorMessage(expression) {
+      return getAppRouteStaticGenerationErrorMessage(options.routePattern, expression);
     },
   });
   const response = await options.handlerFn(trackedRequest.request, {
@@ -108,7 +140,11 @@ export async function executeAppRouteHandler(
   const previousHeadersPhase = options.setHeadersAccessPhase("route-handler");
 
   try {
-    const { dynamicUsedInHandler, response } = await runAppRouteHandler(options);
+    const { dynamicUsedInHandler, response } = await runAppRouteHandler({
+      ...options,
+      dynamicConfig: options.handler.dynamic,
+    });
+    assertSupportedAppRouteHandlerResponse(response);
     const handlerSetCacheControl = response.headers.has("cache-control");
 
     if (dynamicUsedInHandler) {
@@ -128,7 +164,7 @@ export async function executeAppRouteHandler(
       if (revalidateSeconds == null) {
         throw new Error("Expected route handler revalidate seconds");
       }
-      applyRouteHandlerRevalidateHeader(response, revalidateSeconds);
+      applyRouteHandlerRevalidateHeader(response, revalidateSeconds, options.expireSeconds);
     }
 
     if (
@@ -156,7 +192,13 @@ export async function executeAppRouteHandler(
       const routeWritePromise = (async () => {
         try {
           const routeCacheValue = await buildAppRouteCacheValue(routeClone);
-          await options.isrSet(routeKey, routeCacheValue, revalidateSeconds, routeTags);
+          await options.isrSet(
+            routeKey,
+            routeCacheValue,
+            revalidateSeconds,
+            routeTags,
+            options.expireSeconds,
+          );
           options.isrDebug?.("route cache written", routeKey);
         } catch (cacheErr) {
           console.error("[vinext] ISR route cache write error:", cacheErr);
