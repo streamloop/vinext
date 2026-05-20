@@ -13,27 +13,45 @@ import {
   sanitizeDestination,
 } from "../config/config-matchers.js";
 import { headersContextFromRequest } from "vinext/shims/headers";
+import {
+  NEXT_ACTION_HEADER,
+  RSC_ACTION_HEADER,
+  RSC_HEADER,
+  VINEXT_MW_CTX_HEADER,
+} from "./headers.js";
 import { ensureFetchPatch, setCurrentFetchSoftTags } from "vinext/shims/fetch-cache";
+import type { ReactFormState } from "react-dom/client";
 import {
   getRequestExecutionContext,
   type ExecutionContextLike,
 } from "vinext/shims/request-context";
-import { pickRootParams, setRootParams } from "vinext/shims/root-params";
+import { pickRootParams, setRootParams, type RootParams } from "vinext/shims/root-params";
 import { createRequestContext, runWithRequestContext } from "vinext/shims/unified-request-context";
 import { flattenErrorCauses } from "../utils/error-cause.js";
 import { hasBasePath } from "../utils/base-path.js";
 import { applyAppMiddleware, type AppMiddlewareContext } from "./app-middleware.js";
 import { mergeMiddlewareResponseHeaders } from "./app-page-response.js";
 import { handleAppPrerenderEndpoint } from "./app-prerender-endpoints.js";
+import {
+  createRscRedirectLocation,
+  resolveInvalidRscCacheBustingRequest,
+  stripRscCacheBustingSearchParam,
+  stripRscSuffix,
+} from "./app-rsc-cache-busting.js";
 import { finalizeAppRscResponse } from "./app-rsc-response-finalizer.js";
 import { normalizeRscRequest } from "./app-rsc-request-normalization.js";
+import { notFoundResponse } from "./http-error-responses.js";
 import { getScriptNonceFromHeaderSources } from "./csp.js";
 import { buildPageCacheTags } from "./implicit-tags.js";
 import { handleMetadataRouteRequest } from "./metadata-route-response.js";
 import type { MiddlewareModule } from "./middleware-runtime.js";
 import { runWithPrerenderWorkUnit } from "./prerender-work-unit-setup.js";
 import { buildPostMwRequestContext } from "./app-post-middleware-context.js";
+import type { AppRscRenderMode } from "./app-rsc-render-mode.js";
 import {
+  cloneRequestWithHeaders,
+  filterInternalHeaders,
+  applyConfigHeadersToResponse,
   normalizeTrailingSlash,
   resolvePublicFileRoute,
   validateImageUrl,
@@ -51,6 +69,7 @@ type RootParamNamesMap = Parameters<
 type AppRscMiddlewareContext = AppMiddlewareContext;
 
 type AppRscHandlerRoute = {
+  isDynamic: boolean;
   page?: unknown;
   pattern: string;
   rootParamNames?: readonly string[];
@@ -65,16 +84,22 @@ type AppRscRouteMatch<TRoute> = {
 
 type DispatchMatchedPageOptions<TRoute> = {
   cleanPathname: string;
+  formState: ReactFormState | null;
+  actionError?: unknown;
+  actionFailed?: boolean;
   handlerStart: number;
   interceptionContext: string | null;
+  isProgressiveActionRender: boolean;
   isRscRequest: boolean;
   middlewareContext: AppRscMiddlewareContext;
   mountedSlotsHeader: string | null;
   params: AppPageParams;
+  rootParams?: RootParams;
   request: Request;
   route: TRoute;
   scriptNonce?: string;
   searchParams: URLSearchParams;
+  renderMode: AppRscRenderMode;
 };
 
 type DispatchMatchedRouteHandlerOptions<TRoute> = {
@@ -93,6 +118,18 @@ type HandleProgressiveActionRequestOptions = {
   middlewareContext: AppRscMiddlewareContext;
   request: Request;
 };
+
+type ProgressiveActionFormStateResult =
+  | {
+      formState: ReactFormState | null;
+      kind: "form-state";
+    }
+  | {
+      actionError: unknown;
+      actionFailed: true;
+      formState: null;
+      kind: "form-state";
+    };
 
 type HandleServerActionRequestOptions = {
   actionId: string | null;
@@ -145,7 +182,7 @@ type CreateAppRscHandlerOptions<TRoute extends AppRscHandlerRoute> = {
   ensureInstrumentation?: () => Promise<void>;
   handleProgressiveActionRequest: (
     options: HandleProgressiveActionRequestOptions,
-  ) => Promise<Response | null>;
+  ) => Promise<Response | ProgressiveActionFormStateResult | null>;
   handleServerActionRequest: (
     options: HandleServerActionRequestOptions,
   ) => Promise<Response | null>;
@@ -207,6 +244,39 @@ async function applyRewrite(
   return rewritten;
 }
 
+function applyConfigHeadersToMiddlewareRedirect(
+  response: Response,
+  options: {
+    configHeaders: NextHeader[];
+    pathname: string;
+    requestContext: RequestContext;
+  },
+): Response {
+  // Non-redirect middleware responses still pass through finalization, where
+  // config headers are applied once. Redirects skip finalization to avoid
+  // mutating immutable redirect headers, so they need the earlier header layer here.
+  if (response.status < 300 || response.status >= 400) return response;
+  if (!options.configHeaders.length) return response;
+
+  const headers = new Headers();
+  applyConfigHeadersToResponse(headers, {
+    configHeaders: options.configHeaders,
+    pathname: options.pathname,
+    requestContext: options.requestContext,
+  });
+
+  if (!headers.entries().next().done) {
+    mergeMiddlewareResponseHeaders(headers, response.headers);
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  }
+
+  return response;
+}
+
 async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   options: CreateAppRscHandlerOptions<TRoute>,
   request: Request,
@@ -222,7 +292,8 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   const normalized = normalizeRscRequest(request, options.basePath);
   if (normalized instanceof Response) return normalized;
 
-  const { url, isRscRequest, interceptionContextHeader, mountedSlotsHeader } = normalized;
+  const { url, isRscRequest, interceptionContextHeader, mountedSlotsHeader, renderMode } =
+    normalized;
   let { pathname, cleanPathname } = normalized;
 
   const prerenderEndpointResponse = await handleAppPrerenderEndpoint(request, {
@@ -244,7 +315,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   );
   if (trailingSlashRedirect) return trailingSlashRedirect;
 
-  const redirectPathname = pathname.endsWith(".rsc") ? pathname.slice(0, -4) : pathname;
+  const redirectPathname = stripRscSuffix(pathname);
   const redirect = matchRedirect(
     redirectPathname,
     options.configRedirects,
@@ -254,11 +325,21 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     const destination = sanitizeDestination(
       redirectDestinationWithBasePath(redirect.destination, options.basePath),
     );
+    const location =
+      isRscRequest && request.headers.get(RSC_HEADER) === "1"
+        ? await createRscRedirectLocation(destination, request)
+        : destination;
     return new Response(null, {
       status: redirect.permanent ? 308 : 307,
-      headers: { Location: destination },
+      headers: { Location: location },
     });
   }
+
+  const rscCacheBustingRedirect = await resolveInvalidRscCacheBustingRequest({
+    isRscRequest,
+    request,
+  });
+  if (rscCacheBustingRedirect) return rscCacheBustingRedirect;
 
   const middlewareContext: AppRscMiddlewareContext = {
     headers: null,
@@ -276,7 +357,13 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       module: options.middlewareModule,
       request,
     });
-    if (middlewareResult.kind === "response") return middlewareResult.response;
+    if (middlewareResult.kind === "response") {
+      return applyConfigHeadersToMiddlewareRedirect(middlewareResult.response, {
+        configHeaders: options.configHeaders,
+        pathname: cleanPathname,
+        requestContext: preMiddlewareRequestContext,
+      });
+    }
 
     cleanPathname = middlewareResult.cleanPathname;
     if (middlewareResult.search !== null) {
@@ -326,23 +413,36 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     return publicFileResponse;
   }
 
+  if (isRscRequest) {
+    stripRscCacheBustingSearchParam(url);
+  }
+
   options.setNavigationContext({
     pathname: cleanPathname,
     searchParams: url.searchParams,
     params: {},
   });
 
-  const actionId = request.headers.get("x-rsc-action") ?? request.headers.get("next-action");
+  const actionId =
+    request.headers.get(RSC_ACTION_HEADER) ?? request.headers.get(NEXT_ACTION_HEADER);
   const contentType = request.headers.get("content-type") || "";
 
-  const progressiveActionResponse = await options.handleProgressiveActionRequest({
+  const progressiveActionResult = await options.handleProgressiveActionRequest({
     actionId,
     cleanPathname,
     contentType,
     middlewareContext,
     request,
   });
-  if (progressiveActionResponse) return progressiveActionResponse;
+  if (progressiveActionResult instanceof Response) return progressiveActionResult;
+  const isProgressiveActionRender = progressiveActionResult?.kind === "form-state";
+  const formState = isProgressiveActionRender ? progressiveActionResult.formState : null;
+  const failedProgressiveActionResult =
+    isProgressiveActionRender && "actionFailed" in progressiveActionResult
+      ? progressiveActionResult
+      : null;
+  const actionFailed = failedProgressiveActionResult !== null;
+  const actionError = failedProgressiveActionResult?.actionError;
 
   const serverActionResponse = await options.handleServerActionRequest({
     actionId,
@@ -357,19 +457,24 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   });
   if (serverActionResponse) return serverActionResponse;
 
-  const afterFilesRewrite = await applyRewrite(
-    {
-      clearRequestContext: options.clearRequestContext,
-      request,
-      requestContext: postMiddlewareRequestContext,
-      rewrites: options.configRewrites.afterFiles,
-    },
-    cleanPathname,
-  );
-  if (afterFilesRewrite instanceof Response) return afterFilesRewrite;
-  if (afterFilesRewrite) cleanPathname = afterFilesRewrite;
-
   let match = options.matchRoute(cleanPathname);
+  if (!match || match.route.isDynamic) {
+    const afterFilesRewrite = await applyRewrite(
+      {
+        clearRequestContext: options.clearRequestContext,
+        request,
+        requestContext: postMiddlewareRequestContext,
+        rewrites: options.configRewrites.afterFiles,
+      },
+      cleanPathname,
+    );
+    if (afterFilesRewrite instanceof Response) return afterFilesRewrite;
+    if (afterFilesRewrite) {
+      cleanPathname = afterFilesRewrite;
+      match = options.matchRoute(cleanPathname);
+    }
+  }
+
   if (!match) {
     const fallbackRewrite = await applyRewrite(
       {
@@ -399,19 +504,19 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       return pagesFallbackResponse;
     }
 
-    const notFoundResponse = await options.renderNotFound({
+    const renderedNotFoundResponse = await options.renderNotFound({
       isRscRequest,
       middlewareContext,
       request,
       route: null,
       scriptNonce,
     });
-    if (notFoundResponse) return notFoundResponse;
+    if (renderedNotFoundResponse) return renderedNotFoundResponse;
 
     options.clearRequestContext();
     const headers = new Headers();
     mergeMiddlewareResponseHeaders(headers, middlewareContext.headers);
-    return new Response("Not Found", { status: 404, headers });
+    return notFoundResponse({ headers });
   }
 
   const { route, params } = match;
@@ -420,7 +525,8 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     searchParams: url.searchParams,
     params,
   });
-  setRootParams(pickRootParams(params, route.rootParamNames));
+  const rootParams = pickRootParams(params, route.rootParamNames);
+  setRootParams(rootParams);
 
   if (route.routeHandler) {
     setCurrentFetchSoftTags(
@@ -438,24 +544,49 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
 
   return options.dispatchMatchedPage({
     cleanPathname,
+    formState,
+    actionError,
+    actionFailed,
     handlerStart,
     interceptionContext: interceptionContextHeader,
+    isProgressiveActionRender,
     isRscRequest,
     middlewareContext,
     mountedSlotsHeader,
     params,
+    rootParams,
     request,
     route,
     scriptNonce,
     searchParams: url.searchParams,
+    renderMode,
   });
 }
 
 export function createAppRscHandler<TRoute extends AppRscHandlerRoute>(
   options: CreateAppRscHandlerOptions<TRoute>,
 ): (request: Request, ctx: unknown) => Promise<Response> {
-  return async function appRscHandler(request, ctx) {
+  return async function appRscHandler(rawRequest, ctx) {
     await options.ensureInstrumentation?.();
+
+    // Strip forged internal headers at the App Router request boundary.
+    // Must happen BEFORE headersContextFromRequest() and
+    // requestContextFromRequest() so the captured context never contains
+    // attacker-controlled internal headers. This is the correct boundary
+    // for pure App Router requests; in hybrid app+pages mode the connect
+    // handler already filtered headers upstream and x-vinext-mw-ctx
+    // (not in INTERNAL_HEADERS) carries the forwarded middleware context.
+    // srvx's NodeRequestHeaders reads from rawHeaders for iteration but falls
+    // back to req.headers for .get() / .has(). In the dev server we add
+    // x-vinext-mw-ctx to req.headers after the Request is built, so it is
+    // visible to .get() but lost when filterInternalHeaders iterates. Read it
+    // BEFORE iterating so applyForwardedMiddlewareContext can skip middleware.
+    const mwCtx = rawRequest.headers.get(VINEXT_MW_CTX_HEADER);
+    const filteredHeaders = filterInternalHeaders(rawRequest.headers);
+    if (mwCtx !== null) {
+      filteredHeaders.set(VINEXT_MW_CTX_HEADER, mwCtx);
+    }
+    const request = cloneRequestWithHeaders(rawRequest, filteredHeaders);
 
     const executionContext = isExecutionContextLike(ctx)
       ? ctx

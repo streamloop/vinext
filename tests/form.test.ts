@@ -105,7 +105,15 @@ function createWindowStub() {
     replaceState,
     scrollTo,
     window: {
-      __VINEXT_RSC_NAVIGATE__: navigate,
+      [Symbol.for("vinext.navigationRuntime")]: {
+        bootstrap: {
+          routeManifest: null,
+          rsc: undefined,
+        },
+        functions: {
+          navigate,
+        },
+      },
       history: {
         pushState,
         replaceState,
@@ -262,7 +270,7 @@ describe("Form client GET interception", () => {
       '<Form> received an `action` that contains search params: "/search?lang=en". This is not supported, and they will be ignored. If you need to pass in additional search params, use an `<input type="hidden" />` instead.',
     );
     expect(event.preventDefault).toHaveBeenCalledOnce();
-    // navigateClientSide delegates URL push to __VINEXT_RSC_NAVIGATE__ (two-phase commit)
+    // navigateClientSide delegates URL push to the App Router navigation runtime.
     expect(navigate).toHaveBeenCalledWith(
       "/search?q=react",
       0,

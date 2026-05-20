@@ -9,9 +9,11 @@ import { createRequire } from "node:module";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import { PHASE_DEVELOPMENT_SERVER, PHASE_PRODUCTION_BUILD } from "vinext/shims/constants";
+import commonjs from "vite-plugin-commonjs";
+import { PHASE_DEVELOPMENT_SERVER } from "vinext/shims/constants";
 import { normalizePageExtensions } from "../routing/file-matcher.js";
 import { isExternalUrl } from "./config-matchers.js";
+import { loadTsconfigPathAliasesForRoot } from "./tsconfig-paths.js";
 
 /**
  * Parse a body size limit value (string or number) into bytes.
@@ -128,6 +130,14 @@ export type NextConfig = {
   env?: Record<string, string>;
   /** Base URL path prefix */
   basePath?: string;
+  /**
+   * Prefix applied to every emitted JS/CSS/image/static asset URL.
+   * Accepts a path prefix (e.g. `/custom-asset-prefix`) or an absolute
+   * URL (e.g. `https://cdn.example.com`). Distinct from `basePath`:
+   * `basePath` affects route URLs; `assetPrefix` only affects asset URLs.
+   * @see https://nextjs.org/docs/app/api-reference/config/next-config-js/assetPrefix
+   */
+  assetPrefix?: string;
   /** Whether to add trailing slashes */
   trailingSlash?: boolean;
   /** Internationalization routing config */
@@ -169,6 +179,8 @@ export type NextConfig = {
     imageSizes?: number[];
     /** Allow SVG images through the image optimization endpoint. SVG can contain scripts, so only enable if you trust all image sources. */
     dangerouslyAllowSVG?: boolean;
+    /** Allow image optimization for hostnames that resolve to private IP addresses. This is a security risk (SSRF) — only enable for private networks when you understand the risk. */
+    dangerouslyAllowLocalIP?: boolean;
     /** Content-Disposition header for image responses. Defaults to "inline". */
     contentDispositionType?: "inline" | "attachment";
     /** Content-Security-Policy header for image responses. Defaults to "script-src 'none'; frame-src 'none'; sandbox;" */
@@ -221,6 +233,8 @@ export type NextConfig = {
    * Must return a non-empty string, or null to use the default random ID.
    */
   generateBuildId?: () => string | null | Promise<string | null>;
+  /** Identifier for deployment-aware cache keys and version skew protection. */
+  deploymentId?: string;
   /** Any other options */
   [key: string]: unknown;
 };
@@ -238,6 +252,20 @@ export type NextConfigInput = NextConfig | NextConfigFactory;
 export type ResolvedNextConfig = {
   env: Record<string, string>;
   basePath: string;
+  /**
+   * Resolved `assetPrefix` from next.config.
+   *
+   * Empty string when unset. Trailing slashes are trimmed. May be either:
+   *  - a path prefix beginning with `/` (e.g. `"/custom-asset-prefix"`), or
+   *  - an absolute URL with `http(s)://` origin (e.g. `"https://cdn.example.com"`
+   *    or `"https://cdn.example.com/sub"`).
+   *
+   * Mirrors Next.js semantics — `assetPrefix` controls emitted asset URLs
+   * only; route URLs continue to live under `basePath`.
+   *
+   * @see https://nextjs.org/docs/app/api-reference/config/next-config-js/assetPrefix
+   */
+  assetPrefix: string;
   trailingSlash: boolean;
   output: "" | "export" | "standalone";
   pageExtensions: string[];
@@ -275,6 +303,8 @@ export type ResolvedNextConfig = {
   enablePrerenderSourceMaps: boolean;
   /** Resolved build ID (from generateBuildId, or a random UUID if not provided). */
   buildId: string;
+  /** Resolved deployment ID from next.config.js or NEXT_DEPLOYMENT_ID. */
+  deploymentId: string | undefined;
   /**
    * Path to a custom cache handler module. file:// URLs are resolved to
    * filesystem paths via fileURLToPath() during config resolution.
@@ -292,9 +322,31 @@ export type ResolvedNextConfig = {
    * change without modifying source — useful for cache-busting after CDN poisoning.
    */
   hashSalt: string;
+  /**
+   * Raw `sassOptions` object from next.config (or `null` when unset). vinext
+   * passes the relevant keys through to Vite's `css.preprocessorOptions.scss`
+   * so SCSS variables defined via `additionalData` / `prependData`, partials
+   * resolved via `includePaths` / `loadPaths`, and a custom `implementation`
+   * all behave the same as in Next.js.
+   *
+   * Kept loose (`Record<string, unknown> | null`) to match Next.js's typing —
+   * the object is forwarded to Sass and may contain any modern Sass option.
+   */
+  sassOptions: Record<string, unknown> | null;
 };
 
-const CONFIG_FILES = ["next.config.ts", "next.config.mjs", "next.config.js", "next.config.cjs"];
+// Mirrors Next.js's accepted set in packages/next/src/shared/lib/constants.ts
+// (`.js`/`.mjs`/`.ts`/`.mts`) and adds `.cjs` for parity with vinext's own
+// loader, which has historically accepted CJS configs as well. The order is
+// significant: findNextConfigPath returns the first match, so prefer the more
+// modern flavours first.
+const CONFIG_FILES = [
+  "next.config.ts",
+  "next.config.mts",
+  "next.config.mjs",
+  "next.config.js",
+  "next.config.cjs",
+];
 const DEFAULT_EXPIRE_TIME = 31_536_000;
 
 /**
@@ -362,14 +414,195 @@ async function resolveConfigValue(
 }
 
 /**
+ * Named export attached by `cjsGlobalsInjectorPlugin` when the source
+ * statically looks like it assigns to `module.exports`. Holds the wrapper
+ * `module` object so {@link unwrapConfig} can read back the user's CJS-style
+ * export. Pure-ESM configs skip the wrapper entirely and rely on the ESM
+ * `default` export instead.
+ */
+const VINEXT_CJS_EXPORTS_KEY = "__vinext_cjs_exports";
+
+/**
+ * Companion named export pointing at the initial empty `{}` that the wrapper
+ * is constructed with. Lets {@link unwrapConfig} distinguish "user reassigned
+ * or mutated module.exports" from "module.exports is still the untouched
+ * empty wrapper" — the latter happens when {@link reassignsModuleExports}
+ * matches inside a string or comment (a harmless false positive that should
+ * still fall through to the ESM `default` export).
+ */
+const VINEXT_CJS_INITIAL_KEY = "__vinext_cjs_initial_exports";
+
+/**
  * Unwrap the config value from a loaded module namespace.
+ *
+ * Prefers `module.exports` (CJS style) when the config file reassigned it,
+ * otherwise falls back to `default`/the namespace itself. Mirrors Next.js's
+ * behaviour, where the config is loaded through `Module._compile` and CJS
+ * assignments override any ESM-style exports.
+ *
+ * The presence of the `__vinext_cjs_exports` named export is the static
+ * signal (set by `cjsGlobalsInjectorPlugin` when `reassignsModuleExports`
+ * matched) that this file might use CJS-style exports. We then disambiguate
+ * "user actually touched module.exports" from "static heuristic was a false
+ * positive" by comparing identity against the initial empty wrapper: if
+ * `module.exports` is still the original `{}`, fall back to ESM `default`.
  */
 async function unwrapConfig(
   // oxlint-disable-next-line typescript/no-explicit-any
   mod: any,
   phase: string = PHASE_DEVELOPMENT_SERVER,
 ): Promise<NextConfig> {
+  const cjsModule = mod?.[VINEXT_CJS_EXPORTS_KEY];
+  const cjsExports = cjsModule?.exports;
+  const cjsInitial = mod?.[VINEXT_CJS_INITIAL_KEY];
+  const userTouchedExports =
+    cjsExports !== undefined &&
+    cjsExports !== null &&
+    // Either reassigned outright, or mutated keys on the initial object.
+    (cjsExports !== cjsInitial ||
+      (typeof cjsExports === "object" && Object.keys(cjsExports).length > 0));
+  if (userTouchedExports) {
+    return await resolveConfigValue(cjsExports, phase);
+  }
   return await resolveConfigValue(mod.default ?? mod, phase);
+}
+
+/**
+ * Resolve a path through filesystem symlinks, falling back to the original
+ * path when the file does not exist (e.g. virtual ids, query-suffixed ids).
+ */
+function safeRealpath(p: string): string {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+/**
+ * Whole-word substring check for any of the CJS-style globals that the
+ * injector plugin would shim. Used to skip the transform entirely for the
+ * common case where the config is pure ESM (no `__filename`, `__dirname`,
+ * `require`, `module`, or `exports` references).
+ *
+ * False positives are harmless: a comment, string literal, or unrelated
+ * identifier like `node:module` will trigger the transform unnecessarily,
+ * but the resulting injection is idempotent and the loaded config is
+ * unaffected. False negatives would be a correctness bug, so we err on the
+ * side of matching too eagerly.
+ *
+ * Note: `\bexports\b` does not match `export default` (different word
+ * boundaries), and `\brequire\b` does not match `requireSomething`.
+ */
+export function referencesCjsGlobals(source: string): boolean {
+  return /\b(?:__filename|__dirname|require|module|exports)\b/.test(source);
+}
+
+/**
+ * Static heuristic: returns true when the source appears to assign to
+ * `module.exports` — either via `module.exports = …`, `module.exports.foo = …`,
+ * or `module.exports[…] = …`. Used to decide whether the injector plugin
+ * needs to wire up the wrapper `module` object so {@link unwrapConfig} can
+ * read back the user's CJS-style export.
+ *
+ * Pure-ESM configs skip the wrapper entirely, which means a faster transform
+ * (no extra `export const` line) and a simpler unwrap path (no need to
+ * disambiguate "initial empty object" from "user reassigned to {}").
+ *
+ * Like {@link referencesCjsGlobals}, false positives are harmless: at worst
+ * we emit an unused `__vinext_cjs_exports` named export, and `unwrapConfig`
+ * still prefers it (it points at an empty object, which then gets treated
+ * as the config — equivalent to today's sentinel logic for pure-ESM files
+ * that happen to mention `module.exports` only in a string).
+ */
+export function reassignsModuleExports(source: string): boolean {
+  // Match `module.exports` followed by `=` (not `==` / `===`), `.identifier =`,
+  // or `[...] =`. Whitespace allowed around the dot.
+  return /\bmodule\s*\.\s*exports\b\s*(?:=(?!=)|\.\s*[A-Za-z_$][\w$]*\s*=(?!=)|\[)/.test(source);
+}
+
+/**
+ * Vite plugin that prepends CJS-style globals (`__filename`, `__dirname`,
+ * `module`, `exports`, `require`) to the next.config.* source before
+ * Vite's module runner evaluates it.
+ *
+ * Next.js's `next.config.ts` loader (packages/next/src/build/next-config-ts/
+ * transpile-config.ts → require-hook.ts) feeds the file through Node's
+ * `Module._compile`, which provides these CJS globals even when the source
+ * uses ESM syntax. Upstream test fixtures in `test/e2e/app-dir/next-config-ts*`
+ * rely on that, e.g. `node-api-cjs/next.config.ts` reads
+ * `fs.readFileSync(path.join(__dirname, 'foo.txt'), 'utf8')`. vinext loads
+ * configs through Vite's ESM-only module runner, so we inject the same
+ * globals as plain `const` declarations.
+ *
+ * For configs that don't reference any CJS global (the common case — every
+ * upstream `next-config-ts` fixture except `node-api-cjs` is pure ESM) we
+ * skip the transform entirely; see {@link referencesCjsGlobals}.
+ *
+ * `module.exports` reassignment is preserved by exposing the injected
+ * `module` object as a named export (see {@link VINEXT_CJS_EXPORTS_KEY}) and
+ * reading it back in {@link unwrapConfig}.
+ */
+function cjsGlobalsInjectorPlugin(configPath: string): {
+  name: string;
+  enforce: "pre";
+  // oxlint-disable-next-line typescript/no-explicit-any
+  transform(this: unknown, code: string, id: string): any;
+} {
+  // Resolve symlinks once so we can compare against the (possibly
+  // symlink-resolved) id Vite passes to `transform`. On macOS, `/var/folders`
+  // is a symlink to `/private/var/folders`, so the temp-dir path in tests
+  // would otherwise mismatch.
+  const normalizedTarget = safeRealpath(path.resolve(configPath));
+  return {
+    name: "vinext:next-config-cjs-globals",
+    enforce: "pre",
+    transform(code: string, id: string) {
+      // Vite may pass an id with a query suffix (?v=...) or as a file URL.
+      const idPath = id.startsWith("file://") ? fileURLToPath(id) : id.split("?")[0];
+      const resolvedId = safeRealpath(path.resolve(idPath));
+      if (resolvedId !== normalizedTarget) return null;
+
+      // Fast path: skip the transform when the source contains no bareword
+      // reference to any of the shimmed globals. The vast majority of
+      // `next.config.ts` files are pure ESM (`export default { ... }`) and
+      // pay no cost from this plugin.
+      if (!referencesCjsGlobals(code)) return null;
+
+      const dirname = path.dirname(normalizedTarget);
+      // JSON.stringify produces safe JS string literals for paths.
+      const filenameLiteral = JSON.stringify(normalizedTarget);
+      const dirnameLiteral = JSON.stringify(dirname);
+      const requireBaseLiteral = JSON.stringify(path.join(dirname, "package.json"));
+
+      // Only wire up the wrapper `module` object — and the corresponding
+      // named export read by unwrapConfig — when the source statically looks
+      // like it assigns to module.exports. Pure-ESM configs avoid the extra
+      // export and the unwrap-by-wrapper code path.
+      const needsModuleWrapper = reassignsModuleExports(code);
+      const moduleLines = needsModuleWrapper
+        ? `const __vinextInitialExports = {};\n` +
+          `const module = { exports: __vinextInitialExports };\n` +
+          `const exports = module.exports;\n` +
+          `export const ${VINEXT_CJS_EXPORTS_KEY} = module;\n` +
+          `export const ${VINEXT_CJS_INITIAL_KEY} = __vinextInitialExports;\n`
+        : "";
+
+      // Preamble runs after ESM imports are hoisted; the const bindings shadow
+      // any global lookups the source would otherwise perform.
+      const preamble =
+        `import { createRequire as __vinextCreateRequire } from "node:module";\n` +
+        `const __filename = ${filenameLiteral};\n` +
+        `const __dirname = ${dirnameLiteral};\n` +
+        `const require = __vinextCreateRequire(${requireBaseLiteral});\n` +
+        moduleLines;
+
+      return {
+        code: preamble + code,
+        map: null,
+      };
+    },
+  };
 }
 
 export function findNextConfigPath(root: string): string | null {
@@ -390,13 +623,62 @@ export async function resolveNextConfigInput(
 }
 
 /**
+ * Load a CJS-flavoured next.config.{js,cjs} via createRequire.
+ *
+ * For `.cjs` (or `.js` in a non-type-module package) Node's loader picks the
+ * right format automatically and `require()` just works. For `.js` in a
+ * `"type": "module"` package, Node infers ESM from package.json and the file
+ * fails with `require is not defined`. In that case we copy the source to a
+ * sibling temp `.cjs` (where the explicit extension forces CJS regardless of
+ * the parent type field) and require *that*. Relative imports inside the
+ * config still resolve against the original directory.
+ */
+async function loadConfigViaRequire(
+  configPath: string,
+  root: string,
+  phase: string,
+): Promise<NextConfig> {
+  const require = createRequire(path.join(root, "package.json"));
+  try {
+    return await unwrapConfig(require(configPath), phase);
+  } catch (e) {
+    if (!isCjsError(e) || !configPath.endsWith(".js")) throw e;
+    return await loadConfigViaCjsTempCopy(configPath, root, phase);
+  }
+}
+
+async function loadConfigViaCjsTempCopy(
+  configPath: string,
+  root: string,
+  phase: string,
+): Promise<NextConfig> {
+  const dir = path.dirname(configPath);
+  // Hidden + uniquely-named to avoid clashing with user files or being picked
+  // up by next.js's own config scanner if a concurrent next dev is running.
+  const tmpPath = path.join(dir, `.vinext-next-config.${process.pid}.${Date.now()}.cjs`);
+  fs.copyFileSync(configPath, tmpPath);
+  try {
+    const require = createRequire(path.join(root, "package.json"));
+    return await unwrapConfig(require(tmpPath), phase);
+  } finally {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // Best-effort cleanup; a stray tmp file is harmless.
+    }
+  }
+}
+
+/**
  * Find and load the next.config file from the project root.
  * Returns null if no config file is found.
  *
  * Attempts Vite's module runner first so TS configs and extensionless local
  * imports (e.g. `import "./env"`) resolve consistently. If loading fails due
  * to CJS constructs (`require`, `module.exports`), falls back to `createRequire`
- * so common CJS plugin wrappers (nextra, @next/mdx, etc.) still work.
+ * so common CJS plugin wrappers (nextra, @next/mdx, etc.) still work, including
+ * `next.config.js` files written in CJS syntax inside a `"type": "module"`
+ * package (the common shape after `vinext init`).
  */
 export async function loadNextConfig(
   root: string,
@@ -407,6 +689,18 @@ export async function loadNextConfig(
 
   const filename = path.basename(configPath);
 
+  // Mirror Next.js: read `compilerOptions.paths` from the project's
+  // tsconfig.json so aliased imports inside next.config.ts (e.g.
+  // `import { foo } from '@/foo'`) resolve at config-load time. Next.js
+  // passes these to SWC; we pass them to Vite's resolver as `resolve.alias`.
+  // See packages/next/src/build/next-config-ts/transpile-config.ts.
+  const tsconfigAliases = loadTsconfigPathAliasesForRoot(root);
+
+  // Symlink-resolved config path, used by the `commonjs()` filter below to
+  // exclude the config file itself. macOS uses /private/var symlinks, so
+  // string-compare without realpath would falsely include the config.
+  const normalizedConfigPath = safeRealpath(path.resolve(configPath));
+
   try {
     // Load config via Vite's module runner (TS + extensionless import support)
     const { runnerImport } = await import("vite");
@@ -414,6 +708,50 @@ export async function loadNextConfig(
       root,
       logLevel: "error",
       clearScreen: false,
+      resolve: {
+        alias: tsconfigAliases,
+        // Include `.cjs` and `.cts` so `vite-plugin-commonjs` recognises
+        // those extensions (the plugin keys off `config.resolve.extensions`,
+        // which on Vite defaults to `[.mjs, .js, .mts, .ts, .jsx, .tsx,
+        // .json]` — no CJS extensions). This also lets the runner's resolver
+        // find `./foo` style imports that resolve to a `.cjs`/`.cts` sibling.
+        extensions: [".mjs", ".js", ".cjs", ".mts", ".ts", ".cts", ".jsx", ".tsx", ".json"],
+      },
+      // Only inject CJS globals for TypeScript config flavours. Next.js
+      // applies its `Module._compile` / SWC pipeline (which exposes the
+      // CJS globals) exclusively to `.ts`/`.mts`/`.cts`; legacy `.js`/`.cjs`
+      // configs are loaded through Node and already have `require`/`module`,
+      // and `.mjs` configs are explicitly ESM-only.
+      //
+      // Pair that with `vite-plugin-commonjs` (the same plugin used for
+      // application code in index.ts) so sibling imports like `.cjs`/`.cts`,
+      // or `.js`/`.ts` files that assign to `module.exports`, are converted
+      // to ESM before Vite's runner evaluates them. The default `filter`
+      // skips `node_modules`; we opt back in so bare-import packages
+      // imported by next.config.* (e.g. CJS plugin wrappers) keep working —
+      // this mirrors how Next.js's SWC pipeline handles those imports too.
+      //
+      // The config file itself is excluded from `commonjs()`: when it needs
+      // CJS globals it goes through `cjsGlobalsInjectorPlugin`, which sets
+      // up a specific `__vinext_cjs_exports` wiring that `unwrapConfig` reads
+      // back. Letting both plugins inject `module = { exports: {} }` for the
+      // same source produces an `Identifier 'module' has already been
+      // declared` syntax error.
+      plugins: [
+        ...(/\.[cm]?ts$/.test(configPath) ? [cjsGlobalsInjectorPlugin(configPath)] : []),
+        commonjs({
+          filter: (id: string) => {
+            const idPath = id.startsWith("file://") ? fileURLToPath(id) : id.split("?")[0];
+            const resolvedId = safeRealpath(path.resolve(idPath));
+            if (resolvedId === normalizedConfigPath) return false;
+            // Returning `true` forces the transform to run even for ids
+            // inside `node_modules` (default behaviour skips them);
+            // `undefined` falls through to the plugin's default for
+            // user code.
+            return id.includes("node_modules") ? true : undefined;
+          },
+        }),
+      ],
     });
     return await unwrapConfig(mod, phase);
   } catch (e) {
@@ -421,9 +759,7 @@ export async function loadNextConfig(
     // createRequire which provides a proper CommonJS environment.
     if (isCjsError(e) && (filename.endsWith(".js") || filename.endsWith(".cjs"))) {
       try {
-        const require = createRequire(path.join(root, "package.json"));
-        const mod = require(configPath);
-        return await unwrapConfig(mod, phase);
+        return await loadConfigViaRequire(configPath, root, phase);
       } catch (e2) {
         warnConfigLoadFailure(filename, e2 as Error);
         throw e2;
@@ -478,6 +814,70 @@ async function resolveBuildId(
 }
 
 /**
+ * Normalize the `assetPrefix` option from next.config.
+ *
+ * Accepts both absolute URLs (`https://cdn.example.com[/subpath]`) and
+ * path prefixes (`/custom-asset-prefix`). Trailing slashes are trimmed.
+ * Empty/whitespace-only strings are treated as unset and return `""`.
+ *
+ * Path prefixes that omit the leading slash get one added so they always
+ * begin with `/` — this matches how Next.js routes match against them.
+ *
+ * Non-string values are rejected to surface config mistakes early.
+ *
+ * @see https://nextjs.org/docs/app/api-reference/config/next-config-js/assetPrefix
+ */
+export function normalizeAssetPrefix(value: unknown): string {
+  if (value === undefined || value === null || value === "") return "";
+
+  if (typeof value !== "string") {
+    throw new Error(
+      `Invalid \`assetPrefix\` configuration: must be a string, got ${typeof value}. ` +
+        `Accepts a path prefix ("/custom-asset-prefix") or an absolute URL ` +
+        `("https://cdn.example.com").`,
+    );
+  }
+
+  // Avoid `replace(/\/+$/, "")` — CodeQL flags it as polynomial backtracking
+  // on uncontrolled input. An explicit loop has the same effect with linear time.
+  let trimmed = value.trim();
+  while (trimmed.endsWith("/")) trimmed = trimmed.slice(0, -1);
+  if (trimmed === "") return "";
+
+  // Absolute URL — keep origin verbatim, validate parseability so a typo
+  // surfaces at config-load time instead of as a confusing build error.
+  if (/^https?:\/\//i.test(trimmed)) {
+    if (!URL.canParse(trimmed)) {
+      throw new Error(`Invalid \`assetPrefix\` configuration: "${value}" is not a parseable URL.`);
+    }
+    return trimmed;
+  }
+
+  // Path prefix — always begin with "/", consistent with basePath.
+  return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+}
+
+function resolveDeploymentId(configDeploymentId: unknown): string | undefined {
+  const deploymentId =
+    configDeploymentId !== undefined ? configDeploymentId : process.env.NEXT_DEPLOYMENT_ID;
+  if (deploymentId === undefined || deploymentId === "") return undefined;
+
+  if (typeof deploymentId !== "string") {
+    throw new Error(
+      "Invalid `deploymentId` configuration: must be a string. https://nextjs.org/docs/messages/deploymentid-not-a-string",
+    );
+  }
+
+  if (!/^[a-zA-Z0-9_-]+$/.test(deploymentId)) {
+    throw new Error(
+      "Invalid `deploymentId` configuration: contains invalid characters. Only alphanumeric characters, hyphens, and underscores are allowed. https://nextjs.org/docs/messages/deploymentid-invalid-characters",
+    );
+  }
+
+  return deploymentId;
+}
+
+/**
  * Converts a cache handler path to a filesystem path.
  * ESM's import.meta.resolve() returns file:// URLs which break when concatenated
  * with path operations like path.join or path.relative.
@@ -501,9 +901,11 @@ export async function resolveNextConfig(
 ): Promise<ResolvedNextConfig> {
   if (!config) {
     const buildId = await resolveBuildId(undefined);
+    const deploymentId = resolveDeploymentId(undefined);
     const resolved: ResolvedNextConfig = {
       env: {},
       basePath: "",
+      assetPrefix: "",
       trailingSlash: false,
       output: "",
       pageExtensions: normalizePageExtensions(),
@@ -526,6 +928,8 @@ export async function resolveNextConfig(
       enablePrerenderSourceMaps: true,
       hashSalt: process.env.NEXT_HASH_SALT ?? "",
       buildId,
+      deploymentId,
+      sassOptions: null,
     };
     detectNextIntlConfig(root, resolved);
     return resolved;
@@ -670,6 +1074,7 @@ export async function resolveNextConfig(
   const buildId = await resolveBuildId(
     config.generateBuildId as (() => string | null | Promise<string | null>) | undefined,
   );
+  const deploymentId = resolveDeploymentId(config.deploymentId);
 
   // Resolve cacheHandler path — handle file:// URLs from import.meta.resolve()
   const cacheHandler: string | undefined =
@@ -684,6 +1089,7 @@ export async function resolveNextConfig(
   const resolved: ResolvedNextConfig = {
     env: config.env ?? {},
     basePath: config.basePath ?? "",
+    assetPrefix: normalizeAssetPrefix(config.assetPrefix),
     trailingSlash: config.trailingSlash ?? false,
     output: output === "export" || output === "standalone" ? output : "",
     pageExtensions,
@@ -706,11 +1112,34 @@ export async function resolveNextConfig(
     enablePrerenderSourceMaps: config.enablePrerenderSourceMaps ?? true,
     hashSalt,
     buildId,
+    deploymentId,
+    sassOptions:
+      config.sassOptions && typeof config.sassOptions === "object"
+        ? (config.sassOptions as Record<string, unknown>)
+        : null,
   };
 
   // Auto-detect next-intl (lowest priority — explicit aliases from
   // webpack/turbopack already in `aliases` take precedence)
   detectNextIntlConfig(root, resolved);
+
+  // Parity with Next.js: when `basePath` is configured but `assetPrefix` is
+  // not, fall back to using `basePath` as the asset prefix. Without this, an
+  // app deployed under a basePath would serve its routes correctly but emit
+  // its assets from `<basePath>/assets/...` (Vite's default `base + assetsDir`
+  // composition) rather than from the Next.js-canonical
+  // `<basePath>/_next/static/...`.
+  //
+  // Mirrors Next.js: packages/next/src/server/config.ts:509-532
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/config.ts
+  // Conditions copied verbatim:
+  //   - `basePath !== ""` (skips when basePath is unset)
+  //   - `basePath !== "/"` (Next.js rejects this earlier, but we mirror the
+  //     guard so we don't silently produce `assetPrefix === "/"`)
+  //   - `assetPrefix === ""` (user did not explicitly opt out by setting it)
+  if (resolved.basePath !== "" && resolved.basePath !== "/" && resolved.assetPrefix === "") {
+    resolved.assetPrefix = resolved.basePath;
+  }
 
   return resolved;
 }

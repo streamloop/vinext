@@ -6,7 +6,7 @@ export default function GalleryPage() {
       <h1>Photo Gallery</h1>
       <ul>
         <li>
-          <Link href="/photos/42" id="gallery-photo-42-link">
+          <Link href="/photos/42" id="gallery-photo-42-link" prefetch={true}>
             Photo 42
           </Link>
         </li>

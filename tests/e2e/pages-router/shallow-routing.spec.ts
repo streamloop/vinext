@@ -146,6 +146,28 @@ test.describe("Shallow routing (Pages Router)", () => {
     );
   });
 
+  test("dynamic route params update on shallow push across the same route template", async ({
+    page,
+  }) => {
+    // Ported from Next.js: test/e2e/middleware-rewrites/test/index.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/middleware-rewrites/test/index.test.ts
+    await page.goto(`${BASE}/posts/42`);
+    await expect(page.locator('[data-testid="post-title"]')).toHaveText("Post: 42");
+    await waitForHydration(page);
+
+    await page.evaluate(() =>
+      (window as any).next.router.push("/posts/43", undefined, {
+        shallow: true,
+      }),
+    );
+
+    await expect(page).toHaveURL(`${BASE}/posts/43`);
+    await expect(page.locator('[data-testid="post-title"]')).toHaveText("Post: 42");
+    await expect(page.locator('[data-testid="query"]')).toHaveText("Query ID: 43");
+    await expect(page.locator('[data-testid="pathname"]')).toHaveText("Pathname: /posts/[id]");
+    await expect(page.locator('[data-testid="as-path"]')).toHaveText("As Path: /posts/43");
+  });
+
   test("router.query preserves repeated search params and router.asPath preserves hash", async ({
     page,
   }) => {

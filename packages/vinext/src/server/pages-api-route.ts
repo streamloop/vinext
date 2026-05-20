@@ -1,5 +1,6 @@
+import "./server-globals.js";
 import type { Route } from "../routing/pages-router.js";
-import { addQueryParam } from "../utils/query.js";
+import { mergeRouteParamsIntoQuery, parseQueryString } from "../utils/query.js";
 import {
   createPagesReqRes,
   parsePagesApiBody,
@@ -8,9 +9,23 @@ import {
   type PagesReqResResponse,
   PagesApiBodyParseError,
 } from "./pages-node-compat.js";
+import { internalServerErrorResponse } from "./http-error-responses.js";
+import { isEdgeApiRuntime } from "./edge-api-runtime.js";
+
+type PagesApiRouteConfig = {
+  runtime?: string;
+};
+
+type PagesNodeApiRouteHandler = (
+  req: PagesReqResRequest,
+  res: PagesReqResResponse,
+) => void | Promise<void>;
+
+type PagesEdgeApiRouteHandler = (request: Request) => Response | Promise<Response>;
 
 type PagesApiRouteModule = {
-  default?: (req: PagesReqResRequest, res: PagesReqResResponse) => void | Promise<void>;
+  config?: PagesApiRouteConfig;
+  default?: PagesNodeApiRouteHandler | PagesEdgeApiRouteHandler;
 };
 
 export type PagesApiRouteMatch = {
@@ -28,17 +43,19 @@ type HandlePagesApiRouteOptions = {
 };
 
 function buildPagesApiQuery(url: string, params: PagesRequestQuery): PagesRequestQuery {
-  const query: PagesRequestQuery = { ...params };
-  const search = url.split("?")[1];
-  if (!search) {
-    return query;
-  }
+  return mergeRouteParamsIntoQuery(parseQueryString(url), params);
+}
 
-  for (const [key, value] of new URLSearchParams(search)) {
-    addQueryParam(query, key, value);
-  }
+function isEdgeApiRouteModule(
+  module: PagesApiRouteModule,
+): module is PagesApiRouteModule & { default: PagesEdgeApiRouteHandler } {
+  return typeof module.default === "function" && isEdgeApiRuntime(module.config?.runtime);
+}
 
-  return query;
+function isNodeApiRouteModule(
+  module: PagesApiRouteModule,
+): module is PagesApiRouteModule & { default: PagesNodeApiRouteHandler } {
+  return typeof module.default === "function" && !isEdgeApiRuntime(module.config?.runtime);
 }
 
 export async function handlePagesApiRoute(options: HandlePagesApiRouteOptions): Promise<Response> {
@@ -47,12 +64,23 @@ export async function handlePagesApiRoute(options: HandlePagesApiRouteOptions): 
   }
 
   const { route, params } = options.match;
-  const handler = route.module.default;
-  if (typeof handler !== "function") {
-    return new Response("API route does not export a default function", { status: 500 });
-  }
 
   try {
+    if (isEdgeApiRouteModule(route.module)) {
+      const response = await route.module.default(options.request);
+      if (response instanceof Response) {
+        return response;
+      }
+
+      throw new Error("Edge API route did not return a Response");
+    }
+
+    // This is redundant at runtime after the edge branch for function exports, but it
+    // keeps the Node handler ABI narrowed without a production type assertion.
+    if (!isNodeApiRouteModule(route.module)) {
+      return new Response("API route does not export a default function", { status: 500 });
+    }
+
     const query = buildPagesApiQuery(options.url, params);
     const body = await parsePagesApiBody(options.request);
     const { req, res, responsePromise } = createPagesReqRes({
@@ -62,7 +90,7 @@ export async function handlePagesApiRoute(options: HandlePagesApiRouteOptions): 
       url: options.url,
     });
 
-    await handler(req, res);
+    await route.module.default(req, res);
     res.end();
     return await responsePromise;
   } catch (error) {
@@ -77,6 +105,6 @@ export async function handlePagesApiRoute(options: HandlePagesApiRouteOptions): 
       error instanceof Error ? error : new Error(String(error)),
       route.pattern,
     );
-    return new Response("Internal Server Error", { status: 500 });
+    return internalServerErrorResponse();
   }
 }

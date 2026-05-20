@@ -6,6 +6,8 @@ import {
   detectNextIntlConfig,
   loadNextConfig,
   parseBodySizeLimit,
+  reassignsModuleExports,
+  referencesCjsGlobals,
   resolveNextConfig,
   type ResolvedNextConfig,
 } from "../packages/vinext/src/config/next-config.js";
@@ -36,10 +38,84 @@ describe("invalid config files", () => {
     fs.writeFileSync(path.join(tmpDir, "package.json"), `{ "type": "module" }`);
     fs.writeFileSync(
       path.join(tmpDir, "next.config.js"),
-      `const path = require('path');\n module.exports = {};\n`,
+      // Syntactically invalid in any module system.
+      `module.exports = { invalid: } ;\n`,
     );
 
     await expect(loadNextConfig(tmpDir, PHASE_PRODUCTION_BUILD)).rejects.toThrow();
+  });
+});
+
+describe("loadNextConfig with CJS next.config.js under type:module", () => {
+  // Real-world shape from the Next.js deploy suite: `vinext init` flips
+  // package.json to `"type": "module"`, but the test fixture's
+  // `next.config.js` is still written in CJS (module.exports + require).
+  // vinext must load it as CJS instead of forcing the project to rewrite the
+  // file to ESM.
+
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = makeTempDir();
+    fs.writeFileSync(path.join(tmpDir, "package.json"), `{ "type": "module" }`);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    if (tmpDir) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("loads module.exports + require() from a .js file", async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.js"),
+      `const path = require('node:path');\n` +
+        `module.exports = { basePath: path.join('/', 'docs') };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.basePath).toBe("/docs");
+  });
+
+  it("supports __dirname and __filename in a CJS .js config", async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.js"),
+      `module.exports = { env: { DIRNAME_SET: String(typeof __dirname === 'string'), FILENAME_SET: String(typeof __filename === 'string') } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.DIRNAME_SET).toBe("true");
+    expect(config?.env?.FILENAME_SET).toBe("true");
+  });
+
+  it("supports require(mod)(args) plugin-wrapper pattern", async () => {
+    // Mirrors @next/bundle-analyzer / nextra plugin shape — the value
+    // returned from require() is called with options and re-exported.
+    fs.writeFileSync(
+      path.join(tmpDir, "wrap.cjs"),
+      `module.exports = (opts) => (config) => ({ ...config, env: { ...(config.env || {}), WRAPPED: opts.tag } });\n`,
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.js"),
+      `const withWrap = require('./wrap.cjs')({ tag: 'yes' });\n` +
+        `module.exports = withWrap({ basePath: '/app' });\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.basePath).toBe("/app");
+    expect(config?.env?.WRAPPED).toBe("yes");
+  });
+
+  it("does not leave temp .cjs files in the project root", async () => {
+    fs.writeFileSync(path.join(tmpDir, "next.config.js"), `module.exports = { basePath: '/x' };\n`);
+
+    await loadNextConfig(tmpDir);
+
+    const stray = fs
+      .readdirSync(tmpDir)
+      .filter((name) => name.startsWith(".vinext-next-config.") && name.endsWith(".cjs"));
+    expect(stray).toEqual([]);
   });
 });
 
@@ -84,6 +160,315 @@ describe("loadNextConfig phase argument", () => {
 
     const config = await loadNextConfig(tmpDir, PHASE_PRODUCTION_BUILD);
     expect(config?.env?.STATIC).toBe("yes");
+  });
+});
+
+describe("loadNextConfig with CJS globals in next.config.ts", () => {
+  // Ported from Next.js: test/e2e/app-dir/next-config-ts/node-api-cjs/
+  //   https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/next-config-ts/node-api-cjs/next.config.ts
+  // and test/e2e/app-dir/next-config-ts/import-js-extensions-cjs/.
+  // Next.js's transpile-config.ts transforms next.config.ts to CommonJS via SWC
+  // and evaluates it through Node's `Module._compile`, which exposes the CJS
+  // globals (`__filename`, `__dirname`, `module`, `require`, `exports`) even
+  // when the source uses ESM syntax. vinext mirrors that behaviour so that
+  // upstream fixtures referencing these globals continue to load.
+  let tmpDir: string;
+
+  afterEach(() => {
+    if (tmpDir) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("exposes __dirname inside next.config.ts", async () => {
+    tmpDir = makeTempDir();
+    fs.writeFileSync(path.join(tmpDir, "foo.txt"), "foo");
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `import fs from "node:fs";\nimport path from "node:path";\nconst foo = fs.readFileSync(path.join(__dirname, "foo.txt"), "utf8");\nexport default { env: { FOO: foo } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.FOO).toBe("foo");
+  });
+
+  it("exposes __filename inside next.config.ts", async () => {
+    tmpDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `export default { env: { NAME: __filename } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    const name = config?.env?.NAME;
+    expect(typeof name).toBe("string");
+    expect((name as string).endsWith("next.config.ts")).toBe(true);
+  });
+
+  it("exposes a working require() inside next.config.ts", async () => {
+    tmpDir = makeTempDir();
+    fs.writeFileSync(path.join(tmpDir, "data.json"), `{"value":"json-data"}`);
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `const data = require("./data.json");\nexport default { env: { VAL: data.value } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.VAL).toBe("json-data");
+  });
+
+  it("exposes a CommonJS module/exports object inside next.config.ts", async () => {
+    tmpDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `module.exports = { env: { VIA: "module.exports" } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.VIA).toBe("module.exports");
+  });
+
+  it("loads a pure-ESM next.config.ts without injecting CJS shims", async () => {
+    // No __filename / __dirname / require / module / exports references —
+    // the injector transform should short-circuit. We only assert
+    // functional behaviour: the export const that the transform would add
+    // (__vinext_cjs_exports) is invisible to user code anyway, so the
+    // observable contract is just "ESM config loads correctly".
+    tmpDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `export default { env: { PURE: "esm" } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.PURE).toBe("esm");
+  });
+});
+
+describe("referencesCjsGlobals", () => {
+  it("returns false for pure-ESM source", () => {
+    expect(referencesCjsGlobals(`export default { env: { FOO: "bar" } };\n`)).toBe(false);
+    expect(
+      referencesCjsGlobals(
+        `import type { NextConfig } from "next";\nconst nextConfig: NextConfig = {};\nexport default nextConfig;\n`,
+      ),
+    ).toBe(false);
+    expect(referencesCjsGlobals(`export { nextConfig as default };\n`)).toBe(false);
+  });
+
+  it("returns true when any CJS global is referenced", () => {
+    expect(referencesCjsGlobals(`const x = __filename;`)).toBe(true);
+    expect(referencesCjsGlobals(`const x = __dirname;`)).toBe(true);
+    expect(referencesCjsGlobals(`const x = require("./foo");`)).toBe(true);
+    expect(referencesCjsGlobals(`module.exports = { a: 1 };`)).toBe(true);
+    expect(referencesCjsGlobals(`exports.foo = 1;`)).toBe(true);
+  });
+
+  it("does not match identifiers that merely contain a global as a substring", () => {
+    expect(referencesCjsGlobals(`const requireSomething = 1;`)).toBe(false);
+    expect(referencesCjsGlobals(`const myModule = 1;`)).toBe(false);
+    expect(referencesCjsGlobals(`const exporter = 1;`)).toBe(false);
+    // `export default` is a different word boundary from `exports`.
+    expect(referencesCjsGlobals(`export default {};`)).toBe(false);
+  });
+
+  it("matches inside strings and comments (acceptable false positive)", () => {
+    // Substring match is intentionally loose: a wasted transform is the
+    // worst case, never a correctness bug.
+    expect(referencesCjsGlobals(`// __dirname is shimmed`)).toBe(true);
+    expect(referencesCjsGlobals(`const s = "module.exports = 1";`)).toBe(true);
+  });
+});
+
+describe("reassignsModuleExports", () => {
+  it("returns true for direct module.exports reassignment", () => {
+    expect(reassignsModuleExports(`module.exports = { foo: 1 };`)).toBe(true);
+    expect(reassignsModuleExports(`module . exports = X;`)).toBe(true);
+  });
+
+  it("returns true for property mutation", () => {
+    expect(reassignsModuleExports(`module.exports.foo = 1;`)).toBe(true);
+    expect(reassignsModuleExports(`module.exports["foo"] = 1;`)).toBe(true);
+    expect(reassignsModuleExports(`module.exports[name] = 1;`)).toBe(true);
+  });
+
+  it("returns false for pure-ESM source", () => {
+    expect(reassignsModuleExports(`export default { foo: 1 };`)).toBe(false);
+    expect(reassignsModuleExports(`const x = module;`)).toBe(false);
+    expect(reassignsModuleExports(`import x from "node:module";`)).toBe(false);
+  });
+
+  it("does not match comparisons or reads", () => {
+    expect(reassignsModuleExports(`if (module.exports === foo) {}`)).toBe(false);
+    expect(reassignsModuleExports(`const x = module.exports;`)).toBe(false);
+    expect(reassignsModuleExports(`const x = module.exports.foo;`)).toBe(false);
+  });
+});
+
+describe("loadNextConfig CJS vs ESM unwrap", () => {
+  // Exercises the static reassignsModuleExports detection end-to-end:
+  // pure-ESM configs go through the ESM `default` path, configs that
+  // reassign module.exports get unwrapped from the injected wrapper.
+  let tmpDir: string;
+
+  afterEach(() => {
+    if (tmpDir) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns ESM default for a pure-ESM config", async () => {
+    tmpDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `export default { env: { SHAPE: "esm-default" } };\n`,
+    );
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.SHAPE).toBe("esm-default");
+  });
+
+  it("returns module.exports = X for a config that reassigns module.exports", async () => {
+    tmpDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `module.exports = { env: { SHAPE: "reassigned" } };\n`,
+    );
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.SHAPE).toBe("reassigned");
+  });
+
+  it("accumulates module.exports.foo = ... assignments", async () => {
+    tmpDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `module.exports.env = { SHAPE: "mutated" };\nmodule.exports.basePath = "/m";\n`,
+    );
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.SHAPE).toBe("mutated");
+    expect(config?.basePath).toBe("/m");
+  });
+
+  it("falls back to ESM default when module.exports reference is only a false positive", async () => {
+    // Ports the heuristic-false-positive case: the substring matcher
+    // could see `module.exports = ` inside a string and decide to emit
+    // the wrapper. The unwrap path checks identity against the initial
+    // empty exports object and falls back to the ESM default.
+    tmpDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `const doc = "module.exports = legacy";\nexport default { env: { SHAPE: "fallback", DOC: doc } };\n`,
+    );
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.SHAPE).toBe("fallback");
+    expect(config?.env?.DOC).toBe("module.exports = legacy");
+  });
+});
+
+describe("loadNextConfig with tsconfig path aliases", () => {
+  // Ported from Next.js: test/e2e/app-dir/next-config-ts/import-alias-paths-only/
+  //   https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/next-config-ts/import-alias-paths-only/
+  // and import-alias-paths-with-baseurl/.
+  // Next.js's transpile-config.ts reads compilerOptions.paths from tsconfig.json
+  // and passes them to SWC so that next.config.ts can import via tsconfig
+  // aliases. vinext mirrors this by passing tsconfig paths to Vite as
+  // resolve.alias when calling runnerImport.
+
+  let tmpDir: string;
+
+  afterEach(() => {
+    if (tmpDir) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves '@/*' imports in next.config.ts from tsconfig paths (no baseUrl)", async () => {
+    tmpDir = makeTempDir();
+
+    fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, "src", "foo.ts"), `export const foo = "foo";\n`);
+    fs.writeFileSync(
+      path.join(tmpDir, "tsconfig.json"),
+      JSON.stringify({
+        compilerOptions: {
+          paths: {
+            "@/*": ["./src/*"],
+          },
+        },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `import { foo } from "@/foo";\nexport default { env: { FOO: foo } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.FOO).toBe("foo");
+  });
+
+  it("resolves '@/*' imports when baseUrl is set", async () => {
+    tmpDir = makeTempDir();
+
+    fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, "src", "bar.ts"), `export const bar = "bar";\n`);
+    fs.writeFileSync(
+      path.join(tmpDir, "tsconfig.json"),
+      JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+          paths: {
+            "@/*": ["src/*"],
+          },
+        },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `import { bar } from "@/bar";\nexport default { env: { BAR: bar } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.BAR).toBe("bar");
+  });
+
+  it("follows tsconfig 'extends' when resolving paths", async () => {
+    tmpDir = makeTempDir();
+
+    fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, "src", "baz.ts"), `export const baz = "baz";\n`);
+    fs.writeFileSync(
+      path.join(tmpDir, "tsconfig.base.json"),
+      JSON.stringify({
+        compilerOptions: {
+          paths: {
+            "@/*": ["./src/*"],
+          },
+        },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "tsconfig.json"),
+      JSON.stringify({
+        extends: "./tsconfig.base.json",
+      }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `import { baz } from "@/baz";\nexport default { env: { BAZ: baz } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.BAZ).toBe("baz");
+  });
+
+  it("loads config without tsconfig.json (no aliases needed)", async () => {
+    tmpDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `export default { env: { PLAIN: "yes" } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.PLAIN).toBe("yes");
   });
 });
 
@@ -459,6 +844,49 @@ describe("resolveNextConfig expireTime", () => {
   });
 });
 
+// Ported from Next.js: packages/next/src/server/config.ts:528-531
+// https://github.com/vercel/next.js/blob/canary/packages/next/src/server/config.ts
+describe("resolveNextConfig basePath → assetPrefix parity fallback", () => {
+  it("falls back to basePath when assetPrefix is empty", async () => {
+    const resolved = await resolveNextConfig({ basePath: "/app" });
+    expect(resolved.basePath).toBe("/app");
+    expect(resolved.assetPrefix).toBe("/app");
+  });
+
+  it("does not override an explicitly set assetPrefix", async () => {
+    const resolved = await resolveNextConfig({
+      basePath: "/app",
+      assetPrefix: "/cdn",
+    });
+    expect(resolved.basePath).toBe("/app");
+    expect(resolved.assetPrefix).toBe("/cdn");
+  });
+
+  it("preserves absolute-URL assetPrefix even when basePath is also set", async () => {
+    const resolved = await resolveNextConfig({
+      basePath: "/app",
+      assetPrefix: "https://cdn.example.com",
+    });
+    expect(resolved.assetPrefix).toBe("https://cdn.example.com");
+  });
+
+  it("leaves assetPrefix empty when basePath is also empty", async () => {
+    const resolved = await resolveNextConfig({});
+    expect(resolved.basePath).toBe("");
+    expect(resolved.assetPrefix).toBe("");
+  });
+
+  it("does not fall back when basePath is literal `/` (parity with Next.js)", async () => {
+    // Next.js rejects basePath === "/" earlier in its config pipeline;
+    // vinext passes the value through but the fallback explicitly skips
+    // it to avoid producing assetPrefix === "/" (which would collide
+    // with the root URL).
+    const resolved = await resolveNextConfig({ basePath: "/" });
+    expect(resolved.basePath).toBe("/");
+    expect(resolved.assetPrefix).toBe("");
+  });
+});
+
 describe("detectNextIntlConfig", () => {
   let tmpDir: string;
 
@@ -471,6 +899,7 @@ describe("detectNextIntlConfig", () => {
   function makeResolved(overrides: Partial<ResolvedNextConfig> = {}): ResolvedNextConfig {
     return {
       env: {},
+      assetPrefix: "",
       basePath: "",
       trailingSlash: false,
       output: "",
@@ -494,6 +923,8 @@ describe("detectNextIntlConfig", () => {
       enablePrerenderSourceMaps: true,
       expireTime: 31_536_000,
       buildId: "test-build-id",
+      deploymentId: undefined,
+      sassOptions: null,
       ...overrides,
     };
   }
@@ -732,6 +1163,62 @@ describe("generateBuildId", () => {
     const b = await resolveNextConfig({ generateBuildId: fn });
     expect(a.buildId).toBe("stable-id");
     expect(b.buildId).toBe("stable-id");
+  });
+});
+
+describe("deploymentId", () => {
+  const OLD_ENV = process.env.NEXT_DEPLOYMENT_ID;
+
+  afterEach(() => {
+    if (OLD_ENV === undefined) {
+      delete process.env.NEXT_DEPLOYMENT_ID;
+    } else {
+      process.env.NEXT_DEPLOYMENT_ID = OLD_ENV;
+    }
+  });
+
+  it("defaults to undefined when no deployment ID is configured", async () => {
+    delete process.env.NEXT_DEPLOYMENT_ID;
+
+    const config = await resolveNextConfig(null);
+
+    expect(config.deploymentId).toBeUndefined();
+  });
+
+  it("uses NEXT_DEPLOYMENT_ID when next.config.js does not set deploymentId", async () => {
+    process.env.NEXT_DEPLOYMENT_ID = "env-deployment";
+
+    const config = await resolveNextConfig({});
+
+    expect(config.deploymentId).toBe("env-deployment");
+  });
+
+  it("lets next.config.js deploymentId take precedence over NEXT_DEPLOYMENT_ID", async () => {
+    process.env.NEXT_DEPLOYMENT_ID = "env-deployment";
+
+    const config = await resolveNextConfig({ deploymentId: "config-deployment" });
+
+    expect(config.deploymentId).toBe("config-deployment");
+  });
+
+  it("treats an empty next.config.js deploymentId as unset even when NEXT_DEPLOYMENT_ID is set", async () => {
+    process.env.NEXT_DEPLOYMENT_ID = "env-deployment";
+
+    const config = await resolveNextConfig({ deploymentId: "" });
+
+    expect(config.deploymentId).toBeUndefined();
+  });
+
+  it("throws when deploymentId contains invalid characters", async () => {
+    await expect(resolveNextConfig({ deploymentId: "bad value" })).rejects.toThrow(
+      "Invalid `deploymentId` configuration: contains invalid characters",
+    );
+  });
+
+  it("throws when deploymentId is not a string", async () => {
+    await expect(resolveNextConfig({ deploymentId: 42 as unknown as string })).rejects.toThrow(
+      "Invalid `deploymentId` configuration: must be a string",
+    );
   });
 });
 

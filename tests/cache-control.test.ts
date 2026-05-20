@@ -29,6 +29,12 @@ describe("cache-control helpers", () => {
     );
   });
 
+  it("uses static cache-control for cached indefinite responses", () => {
+    expect(buildCachedRevalidateCacheControl("HIT", Infinity)).toBe(
+      "s-maxage=31536000, stale-while-revalidate",
+    );
+  });
+
   it("preserves legacy STALE cached response headers when expire is unknown", () => {
     expect(buildCachedRevalidateCacheControl("STALE", 60)).toBe(
       "s-maxage=0, stale-while-revalidate",

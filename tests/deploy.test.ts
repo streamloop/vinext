@@ -15,6 +15,7 @@ import {
   renameCJSConfigs,
   buildWranglerDeployArgs,
   parseDeployArgs,
+  resolveWranglerBin,
   isPackageResolvable,
   viteConfigHasCloudflarePlugin,
   hasWranglerConfig,
@@ -95,6 +96,53 @@ describe("buildWranglerDeployArgs", () => {
   });
 });
 
+// ─── Wrangler bin resolution (Windows shim handling) ────────────────────────
+
+describe("resolveWranglerBin", () => {
+  it("uses bare name on non-Windows platforms", () => {
+    mkdir(tmpDir, "node_modules/.bin");
+    writeFile(tmpDir, "node_modules/.bin/wrangler", "#!/usr/bin/env node");
+
+    const resolved = resolveWranglerBin(tmpDir, "linux");
+    expect(resolved).toBe(path.join(tmpDir, "node_modules", ".bin", "wrangler"));
+  });
+
+  it("prefers .CMD shim on Windows when present", () => {
+    mkdir(tmpDir, "node_modules/.bin");
+    writeFile(tmpDir, "node_modules/.bin/wrangler", "#!/usr/bin/env node");
+    writeFile(tmpDir, "node_modules/.bin/wrangler.CMD", "@ECHO off");
+
+    const resolved = resolveWranglerBin(tmpDir, "win32");
+    expect(resolved).toBe(path.join(tmpDir, "node_modules", ".bin", "wrangler.CMD"));
+  });
+
+  it("falls back to bare name on Windows if no .CMD shim exists", () => {
+    mkdir(tmpDir, "node_modules/.bin");
+    writeFile(tmpDir, "node_modules/.bin/wrangler", "#!/usr/bin/env node");
+
+    const resolved = resolveWranglerBin(tmpDir, "win32");
+    expect(resolved).toBe(path.join(tmpDir, "node_modules", ".bin", "wrangler"));
+  });
+
+  it("walks up to a hoisted workspace node_modules on Windows", () => {
+    mkdir(tmpDir, "apps/web");
+    mkdir(tmpDir, "node_modules/.bin");
+    writeFile(tmpDir, "node_modules/.bin/wrangler.CMD", "@ECHO off");
+
+    const resolved = resolveWranglerBin(path.join(tmpDir, "apps", "web"), "win32");
+    expect(resolved).toBe(path.join(tmpDir, "node_modules", ".bin", "wrangler.CMD"));
+  });
+
+  it("returns platform-appropriate fallback path when nothing is found", () => {
+    expect(resolveWranglerBin(tmpDir, "win32")).toBe(
+      path.join(tmpDir, "node_modules", ".bin", "wrangler.CMD"),
+    );
+    expect(resolveWranglerBin(tmpDir, "linux")).toBe(
+      path.join(tmpDir, "node_modules", ".bin", "wrangler"),
+    );
+  });
+});
+
 // ─── Deploy CLI arg parsing ─────────────────────────────────────────────────
 
 describe("parseDeployArgs", () => {
@@ -144,6 +192,30 @@ describe("parseDeployArgs", () => {
     expect(parsed.tprCoverage).toBe(95);
     expect(parsed.tprLimit).toBe(500);
     expect(parsed.tprWindow).toBe(48);
+  });
+
+  it("parses --prerender-concurrency with space-separated value", () => {
+    expect(parseDeployArgs(["--prerender-concurrency", "4"]).prerenderConcurrency).toBe(4);
+  });
+
+  it("parses --prerender-concurrency=value form", () => {
+    expect(parseDeployArgs(["--prerender-concurrency=4"]).prerenderConcurrency).toBe(4);
+  });
+
+  it("throws for missing --prerender-concurrency value", () => {
+    expect(() => parseDeployArgs(["--prerender-concurrency"])).toThrow();
+  });
+
+  it("throws for invalid --prerender-concurrency value", () => {
+    expect(() => parseDeployArgs(["--prerender-concurrency", "abc"])).toThrow(
+      '--prerender-concurrency expects a positive integer, but got "abc".',
+    );
+  });
+
+  it("throws for zero --prerender-concurrency value", () => {
+    expect(() => parseDeployArgs(["--prerender-concurrency=0"])).toThrow(
+      '--prerender-concurrency expects a positive integer, but got "0".',
+    );
   });
 
   it("trims whitespace from --env value", () => {
@@ -521,6 +593,8 @@ describe("generatePagesRouterWorkerEntry", () => {
     expect(content).toContain("configRewrites.afterFiles");
     expect(content).toContain("configRewrites.fallback");
     expect(content).toContain("matchRewrite(resolvedPathname");
+    expect(content).toContain("matchPageRoute");
+    expect(content).toContain("matchPageRoute(resolvedPathname, request)");
   });
 
   it("applies next.config.js custom headers", () => {
@@ -546,7 +620,8 @@ describe("generatePagesRouterWorkerEntry", () => {
   it("handles trailing slash normalization", () => {
     const content = generatePagesRouterWorkerEntry();
     expect(content).toContain("trailingSlash");
-    expect(content).toContain("hasTrailing");
+    expect(content).toContain("normalizeTrailingSlash");
+    expect(content).toContain('from "vinext/server/request-pipeline"');
   });
 
   it("routes /api/ to handleApiRoute using resolved URL", () => {
@@ -576,12 +651,8 @@ describe("generatePagesRouterWorkerEntry", () => {
 
   it("includes an open-redirect guard that rejects encoded backslash and slash", () => {
     const content = generatePagesRouterWorkerEntry();
-    // The generated worker inlines isOpenRedirectShaped. Regression for
-    // VULN-126915 — the guard must handle both literal (\\, //) and
-    // percent-encoded (%5C, %2F) variants in the leading segment.
-    expect(content).toContain("function isOpenRedirectShaped");
-    expect(content).toContain('"%5c"');
-    expect(content).toContain('"%2f"');
+    expect(content).toContain("isOpenRedirectShaped");
+    expect(content).toContain('from "vinext/server/request-pipeline"');
     expect(content).toContain("isOpenRedirectShaped(pathname)");
   });
 

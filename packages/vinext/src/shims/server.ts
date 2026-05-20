@@ -9,10 +9,17 @@
  * rather than bug-for-bug parity with Next.js internals.
  */
 
+import {
+  MIDDLEWARE_NEXT_HEADER,
+  MIDDLEWARE_REWRITE_HEADER,
+  MIDDLEWARE_SET_COOKIE_HEADER,
+} from "../server/headers.js";
 import { encodeMiddlewareRequestHeaders } from "../server/middleware-request-headers.js";
+import { serializeSetCookie, validateCookieName } from "./internal/cookie-serialize.js";
 import { parseCookieHeader } from "./internal/parse-cookie-header.js";
 import { getRequestExecutionContext } from "./request-context.js";
 import { assertSafeNavigationUrl } from "./url-safety.js";
+import { stripBasePath } from "../utils/base-path.js";
 
 // ---------------------------------------------------------------------------
 // Inlined cache-scope guard for after()
@@ -93,18 +100,12 @@ export class NextRequest extends Request {
     // Strip nextConfig before passing to super() — it's vinext-internal,
     // not a valid RequestInit property.
     const { nextConfig: _nextConfig, ...requestInit } = init ?? {};
-    // Handle the case where input is a Request object - we need to extract URL and init
-    // to avoid Node.js undici issues with passing Request objects directly to super()
     if (input instanceof Request) {
-      const req = input;
-      super(req.url, {
-        method: req.method,
-        headers: req.headers,
-        body: req.body,
-        // @ts-expect-error - duplex is not in RequestInit type but needed for streams
-        duplex: req.body ? "half" : undefined,
-        ...requestInit,
-      });
+      // Keep caller-owned request bodies readable after wrapping. Middleware and
+      // route-handler plumbing may need the source Request after this wrapper runs.
+      const requestInput =
+        requestInit.body === undefined && input.body && !input.bodyUsed ? input.clone() : input;
+      super(requestInput, requestInit);
     } else {
       super(input, requestInit);
     }
@@ -252,7 +253,7 @@ export class NextResponse<_Body = unknown> extends Response {
    */
   static rewrite(destination: string | URL, init?: MiddlewareResponseInit): NextResponse {
     const headers = new Headers(init?.headers);
-    headers.set("x-middleware-rewrite", validateURL(destination));
+    headers.set(MIDDLEWARE_REWRITE_HEADER, validateURL(destination));
     if (init?.request?.headers) {
       encodeMiddlewareRequestHeaders(headers, init.request.headers);
     }
@@ -265,7 +266,7 @@ export class NextResponse<_Body = unknown> extends Response {
    */
   static next(init?: MiddlewareResponseInit): NextResponse {
     const headers = new Headers(init?.headers);
-    headers.set("x-middleware-next", "1");
+    headers.set(MIDDLEWARE_NEXT_HEADER, "1");
     if (init?.request?.headers) {
       encodeMiddlewareRequestHeaders(headers, init.request.headers);
     }
@@ -310,10 +311,7 @@ export class NextURL {
   /** Strip basePath prefix from the internal pathname. */
   private _stripBasePath(): void {
     if (!this._basePath) return;
-    const { pathname } = this._url;
-    if (pathname === this._basePath || pathname.startsWith(this._basePath + "/")) {
-      this._url.pathname = pathname.slice(this._basePath.length) || "/";
-    }
+    this._url.pathname = stripBasePath(this._url.pathname, this._basePath);
   }
 
   /** Extract locale from pathname, stripping it from the internal URL. */
@@ -645,28 +643,6 @@ export function sealRequestCookies(cookies: RequestCookies): RequestCookies {
   });
 }
 
-/**
- * RFC 6265 §4.1.1: cookie-name is a token (RFC 2616 §2.2).
- * Allowed: any visible ASCII (0x21-0x7E) except separators: ()<>@,;:\"/[]?={}
- */
-const VALID_COOKIE_NAME_RE =
-  /^[\x21\x23-\x27\x2A\x2B\x2D\x2E\x30-\x39\x41-\x5A\x5E-\x7A\x7C\x7E]+$/;
-
-function validateCookieName(name: string): void {
-  if (!name || !VALID_COOKIE_NAME_RE.test(name)) {
-    throw new Error(`Invalid cookie name: ${JSON.stringify(name)}`);
-  }
-}
-
-function validateCookieAttributeValue(value: string, attributeName: string): void {
-  for (let i = 0; i < value.length; i++) {
-    const code = value.charCodeAt(i);
-    if (code <= 0x1f || code === 0x7f || value[i] === ";") {
-      throw new Error(`Invalid cookie ${attributeName} value: ${JSON.stringify(value)}`);
-    }
-  }
-}
-
 export class ResponseCookies {
   private _headers: Headers;
   /** Internal map keyed by cookie name — single source of truth. */
@@ -700,21 +676,8 @@ export class ResponseCookies {
     const [name, value, opts] = parseCookieSetArgs(args);
     validateCookieName(name);
 
-    const parts = [`${name}=${encodeURIComponent(value)}`];
-    const path = opts?.path ?? "/";
-    validateCookieAttributeValue(path, "Path");
-    parts.push(`Path=${path}`);
-    if (opts?.domain) {
-      validateCookieAttributeValue(opts.domain, "Domain");
-      parts.push(`Domain=${opts.domain}`);
-    }
-    if (opts?.maxAge !== undefined) parts.push(`Max-Age=${opts.maxAge}`);
-    if (opts?.expires) parts.push(`Expires=${opts.expires.toUTCString()}`);
-    if (opts?.httpOnly) parts.push("HttpOnly");
-    if (opts?.secure) parts.push("Secure");
-    if (opts?.sameSite) parts.push(`SameSite=${opts.sameSite}`);
-
-    this._parsed.set(name, { serialized: parts.join("; "), entry: { name, value } });
+    const serialized = serializeSetCookie(name, value, opts);
+    this._parsed.set(name, { serialized, entry: { name, value } });
     this._syncHeaders();
     return this;
   }
@@ -802,11 +765,11 @@ class MiddlewareResponseCookies extends ResponseCookies {
   private _syncMiddlewareCookieHeader(): void {
     const cookies = this._responseHeaders.getSetCookie();
     if (cookies.length === 0) {
-      this._responseHeaders.delete("x-middleware-set-cookie");
+      this._responseHeaders.delete(MIDDLEWARE_SET_COOKIE_HEADER);
       return;
     }
 
-    this._responseHeaders.set("x-middleware-set-cookie", cookies.join(","));
+    this._responseHeaders.set(MIDDLEWARE_SET_COOKIE_HEADER, cookies.join(","));
   }
 }
 
@@ -960,7 +923,9 @@ export function after<T>(task: Promise<T> | (() => T | Promise<T>)): void {
  * and sets Cache-Control: no-store on the response.
  */
 export async function connection(): Promise<void> {
-  const { markDynamicUsage, throwIfInsideCacheScope } = await import("./headers.js");
+  const { markDynamicUsage, markRenderRequestApiUsage, throwIfInsideCacheScope } =
+    await import("./headers.js");
+  markRenderRequestApiUsage("connection");
   throwIfInsideCacheScope("connection()");
   markDynamicUsage();
 }

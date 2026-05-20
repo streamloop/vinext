@@ -2,10 +2,12 @@ import type { NextI18nConfig } from "../config/next-config.js";
 import { isExternalUrl, proxyExternalRequest } from "../config/config-matchers.js";
 import { applyMiddlewareRequestHeaders, setHeadersContext } from "vinext/shims/headers";
 import { setNavigationContext } from "vinext/shims/navigation";
+import { FLIGHT_HEADERS, VINEXT_MW_CTX_HEADER } from "./headers.js";
 import { buildRequestHeadersFromMiddlewareResponse } from "./middleware-request-headers.js";
 import { mergeMiddlewareResponseHeaders } from "./middleware-response-headers.js";
 import { executeMiddleware, type MiddlewareModule } from "./middleware-runtime.js";
-import { processMiddlewareHeaders } from "./request-pipeline.js";
+import { cloneRequestWithHeaders, processMiddlewareHeaders } from "./request-pipeline.js";
+import { internalServerErrorResponse } from "./http-error-responses.js";
 
 export type AppMiddlewareContext = {
   headers: Headers | null;
@@ -40,8 +42,30 @@ type ForwardedMiddlewareContext = {
   s?: unknown;
 };
 
+// Re-exported from headers.ts for backward compatibility.
+export { FLIGHT_HEADERS } from "./headers.js";
+
+const FLIGHT_HEADER_SET = new Set(FLIGHT_HEADERS);
+
 function isForwardedMiddlewareContext(value: unknown): value is ForwardedMiddlewareContext {
   return !!value && typeof value === "object";
+}
+
+function requestWithoutFlightHeaders(request: Request): Request {
+  let hasFlightHeader = false;
+  const headers = new Headers();
+
+  for (const [key, value] of request.headers) {
+    if (FLIGHT_HEADER_SET.has(key.toLowerCase())) {
+      hasFlightHeader = true;
+    } else {
+      headers.append(key, value);
+    }
+  }
+
+  if (!hasFlightHeader) return request;
+  const source = request.body ? request.clone() : request;
+  return cloneRequestWithHeaders(source, headers);
 }
 
 function appendForwardedHeader(headers: Headers, value: unknown): void {
@@ -81,7 +105,9 @@ function requestWithMiddlewareRequestHeaders(
   middlewareHeaders: Headers | null,
 ): Request {
   const nextHeaders = middlewareHeaders
-    ? buildRequestHeadersFromMiddlewareResponse(request.headers, middlewareHeaders)
+    ? buildRequestHeadersFromMiddlewareResponse(request.headers, middlewareHeaders, {
+        preserveCredentialHeaders: true,
+      })
     : null;
   if (!nextHeaders) return request;
 
@@ -110,11 +136,19 @@ export async function proxyExternalMiddlewareRewrite(
   setNavigationContext(null);
 
   const proxyResponse = await proxyExternalRequest(proxyRequest, rewriteUrl);
-  if (!context.headers) return proxyResponse;
+  const headers = new Headers(proxyResponse.headers);
+  processMiddlewareHeaders(headers);
+
+  if (!context.headers) {
+    return new Response(proxyResponse.body, {
+      status: proxyResponse.status,
+      statusText: proxyResponse.statusText,
+      headers,
+    });
+  }
 
   const middlewareHeaders = new Headers(context.headers);
   processMiddlewareHeaders(middlewareHeaders);
-  const headers = new Headers(proxyResponse.headers);
   mergeMiddlewareResponseHeaders(headers, middlewareHeaders);
   return new Response(proxyResponse.body, {
     status: proxyResponse.status,
@@ -131,7 +165,7 @@ function applyForwardedMiddlewareContext(
     return { applied: false };
   }
 
-  const header = request.headers.get("x-vinext-mw-ctx");
+  const header = request.headers.get(VINEXT_MW_CTX_HEADER);
   if (!header) return { applied: false };
 
   try {
@@ -161,22 +195,23 @@ export async function applyAppMiddleware(
   options: ApplyAppMiddlewareOptions,
 ): Promise<ApplyAppMiddlewareResult> {
   const forwarded = applyForwardedMiddlewareContext(options.request, options.context);
+  const middlewareRequest = requestWithoutFlightHeaders(options.request);
   let cleanPathname = options.cleanPathname;
   let search: string | null = null;
 
   if (forwarded.rewriteUrl) {
     try {
-      if (isExternalMiddlewareRewrite(forwarded.rewriteUrl, options.request)) {
+      if (isExternalMiddlewareRewrite(forwarded.rewriteUrl, middlewareRequest)) {
         return {
           kind: "response",
           response: await proxyExternalMiddlewareRewrite(
-            options.request,
+            middlewareRequest,
             forwarded.rewriteUrl,
             options.context,
           ),
         };
       }
-      const rewriteParsed = new URL(forwarded.rewriteUrl, options.request.url);
+      const rewriteParsed = new URL(forwarded.rewriteUrl, middlewareRequest.url);
       cleanPathname = rewriteParsed.pathname;
       search = rewriteParsed.search;
     } catch (e) {
@@ -192,7 +227,7 @@ export async function applyAppMiddleware(
       isProxy: options.isProxy,
       module: options.module,
       normalizedPathname: cleanPathname,
-      request: options.request,
+      request: middlewareRequest,
     });
 
     if (!result.continue) {
@@ -202,11 +237,15 @@ export async function applyAppMiddleware(
       if (result.response) {
         return { kind: "response", response: result.response };
       }
-      return { kind: "response", response: new Response("Internal Server Error", { status: 500 }) };
+      return { kind: "response", response: internalServerErrorResponse() };
     }
 
     if (result.responseHeaders) {
       options.context.headers = new Headers(result.responseHeaders);
+    }
+
+    if (result.status !== undefined) {
+      options.context.status = result.status;
     }
 
     if (result.rewriteUrl) {
@@ -217,13 +256,13 @@ export async function applyAppMiddleware(
         return {
           kind: "response",
           response: await proxyExternalMiddlewareRewrite(
-            options.request,
+            middlewareRequest,
             result.rewriteUrl,
             options.context,
           ),
         };
       }
-      const rewriteParsed = new URL(result.rewriteUrl, options.request.url);
+      const rewriteParsed = new URL(result.rewriteUrl, middlewareRequest.url);
       cleanPathname = rewriteParsed.pathname;
       search = rewriteParsed.search;
     }

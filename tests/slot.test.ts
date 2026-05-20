@@ -115,6 +115,47 @@ describe("slot primitives", () => {
     expect(html).toBe("");
   });
 
+  it("Slot does not treat empty objects as transport metadata", async () => {
+    const mod = await import("../packages/vinext/src/shims/slot.js");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      await expect(
+        renderHtml(
+          createContextProvider(
+            mod.ElementsContext,
+            { "slot:modal:/": {} },
+            React.createElement(mod.Slot, { id: "slot:modal:/" }),
+          ),
+        ),
+      ).rejects.toThrow(/Objects are not valid|object/i);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it("warns in development when transport metadata appears under a render entry", async () => {
+    const mod = await import("../packages/vinext/src/shims/slot.js");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const html = await renderHtml(
+        createContextProvider(
+          mod.ElementsContext,
+          { "slot:metadata-warning:/": { "layout:/": "s" } },
+          React.createElement(mod.Slot, { id: "slot:metadata-warning:/" }),
+        ),
+      );
+
+      expect(html).toBe("");
+      expect(warn).toHaveBeenCalledWith(
+        "[vinext] Transport metadata value found under App Router render entry: slot:metadata-warning:/",
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("warns in development when a non-slot entry is absent", async () => {
     const mod = await import("../packages/vinext/src/shims/slot.js");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -215,7 +256,7 @@ describe("slot primitives", () => {
     expect(normalized["slot:modal:/"]).toBe(mod.UNMATCHED_SLOT);
   });
 
-  it("mergeElements shallow-merges previous and next elements", async () => {
+  it("mergeElements preserves approved non-slot elements", async () => {
     const { mergeElements } = await import("../packages/vinext/src/shims/slot.js");
 
     const merged = mergeElements(
@@ -227,15 +268,34 @@ describe("slot primitives", () => {
         "page:/blog/hello": React.createElement("div", null, "page"),
         "slot:modal:/": React.createElement("div", null, "next slot"),
       },
+      { preserveElementIds: ["layout:/"] },
     );
 
-    expect(Object.keys(merged)).toEqual(["layout:/", "slot:modal:/", "page:/blog/hello"]);
+    expect(Object.keys(merged).sort()).toEqual(["layout:/", "page:/blog/hello", "slot:modal:/"]);
     expect(merged["layout:/"]).toBeDefined();
     expect(merged["page:/blog/hello"]).toBeDefined();
     expect(merged["slot:modal:/"]).not.toBeNull();
   });
 
-  it("mergeElements preserves previous slot content when next marks it unmatched", async () => {
+  it("mergeElements drops absent non-slot elements without approved persistence", async () => {
+    const { mergeElements } = await import("../packages/vinext/src/shims/slot.js");
+
+    const merged = mergeElements(
+      {
+        "layout:/": React.createElement("div", null, "layout"),
+        "page:/dashboard": React.createElement("div", null, "dashboard"),
+      },
+      {
+        "page:/settings": React.createElement("div", null, "settings"),
+      },
+    );
+
+    expect(Object.hasOwn(merged, "layout:/")).toBe(false);
+    expect(Object.hasOwn(merged, "page:/dashboard")).toBe(false);
+    expect(Object.hasOwn(merged, "page:/settings")).toBe(true);
+  });
+
+  it("mergeElements does not infer unmatched slot preservation from the wire marker", async () => {
     const { mergeElements } = await import("../packages/vinext/src/shims/slot.js");
 
     const previousSlotContent = React.createElement("div", null, "previous modal");
@@ -249,14 +309,63 @@ describe("slot primitives", () => {
         "page:/blog": React.createElement("div", null, "blog page"),
         "slot:modal:/": UNMATCHED_SLOT,
       },
+      { preserveElementIds: ["layout:/"] },
     );
 
-    // The slot should keep its previous content, not become UNMATCHED_SLOT.
-    // This matches Next.js soft navigation behavior: unmatched parallel slots
-    // preserve their previous subtree instead of showing 404.
-    expect(merged["slot:modal:/"]).toBe(previousSlotContent);
+    expect(merged["slot:modal:/"]).toBe(UNMATCHED_SLOT);
     expect(merged["page:/blog"]).toBeDefined();
     expect(merged["layout:/"]).toBeDefined();
+  });
+
+  it("mergeElements preserves previous slot content for planner-approved default/unmatched slots", async () => {
+    const { mergeElements } = await import("../packages/vinext/src/shims/slot.js");
+
+    const previousSlotContent = React.createElement("div", null, "previous modal");
+    const defaultSlotContent = React.createElement("div", null, "default modal");
+    const mergedFromUnmatched = mergeElements(
+      {
+        "layout:/": React.createElement("div", null, "layout"),
+        "slot:modal:/": previousSlotContent,
+      },
+      {
+        "page:/blog": React.createElement("div", null, "blog page"),
+        "slot:modal:/": UNMATCHED_SLOT,
+      },
+      { preserveElementIds: ["layout:/"], preservePreviousSlotIds: ["slot:modal:/"] },
+    );
+    const mergedFromDefault = mergeElements(
+      {
+        "layout:/": React.createElement("div", null, "layout"),
+        "slot:modal:/": previousSlotContent,
+      },
+      {
+        "page:/blog": React.createElement("div", null, "blog page"),
+        "slot:modal:/": defaultSlotContent,
+      },
+      { preserveElementIds: ["layout:/"], preservePreviousSlotIds: ["slot:modal:/"] },
+    );
+
+    expect(mergedFromUnmatched["slot:modal:/"]).toBe(previousSlotContent);
+    expect(mergedFromDefault["slot:modal:/"]).toBe(previousSlotContent);
+  });
+
+  it("mergeElements preserves a present null default slot when the planner approves it", async () => {
+    const { mergeElements } = await import("../packages/vinext/src/shims/slot.js");
+
+    const merged = mergeElements(
+      {
+        "layout:/": React.createElement("div", null, "layout"),
+        "slot:modal:/": null,
+      },
+      {
+        "page:/blog": React.createElement("div", null, "blog page"),
+        "slot:modal:/": UNMATCHED_SLOT,
+      },
+      { preserveElementIds: ["layout:/"], preservePreviousSlotIds: ["slot:modal:/"] },
+    );
+
+    expect(Object.hasOwn(merged, "slot:modal:/")).toBe(true);
+    expect(merged["slot:modal:/"]).toBeNull();
   });
 
   it("mergeElements allows UNMATCHED_SLOT for slots absent from previous state", async () => {
@@ -271,6 +380,7 @@ describe("slot primitives", () => {
         "page:/blog": React.createElement("div", null, "blog"),
         "slot:modal:/": UNMATCHED_SLOT,
       },
+      { preserveElementIds: ["layout:/"] },
     );
 
     // No previous value to preserve — the sentinel passes through.
@@ -296,7 +406,7 @@ describe("slot primitives", () => {
     expect(Object.hasOwn(merged, "slot:modal:/feed")).toBe(false);
   });
 
-  it("mergeElements on traversal: UNMATCHED_SLOT in next is restored from prev and not cleared", async () => {
+  it("mergeElements keeps unmatched slot markers on traversal without planner approval", async () => {
     const { mergeElements, UNMATCHED_SLOT } = await import("../packages/vinext/src/shims/slot.js");
 
     const realContent = React.createElement("div", null, "modal content");
@@ -312,14 +422,11 @@ describe("slot primitives", () => {
         // @ts-expect-error - typescript is not correctly inferring the type of the symbol
         "slot:modal:/feed": UNMATCHED_SLOT,
       },
-      true,
+      { clearAbsentSlots: true, preserveElementIds: ["layout:/"] },
     );
 
-    // The slot IS present in next (as UNMATCHED_SLOT), so clearAbsentSlots does not
-    // delete it. The UNMATCHED_SLOT preservation loop then restores the real prev
-    // content because prev had a non-sentinel value.
     expect(Object.hasOwn(merged, "slot:modal:/feed")).toBe(true);
-    expect(merged["slot:modal:/feed"]).toBe(realContent);
+    expect(merged["slot:modal:/feed"]).toBe(UNMATCHED_SLOT);
   });
 
   it("mergeElements preserves absent slots when clearAbsentSlots is not set", async () => {
@@ -338,6 +445,47 @@ describe("slot primitives", () => {
 
     // Without clearAbsentSlots, absent slots survive (soft nav to child route)
     expect(Object.hasOwn(merged, "slot:team:/dashboard")).toBe(true);
+  });
+
+  it("mergeElements drops absent slots when legacy absent-slot preservation is fenced", async () => {
+    const { mergeElements } = await import("../packages/vinext/src/shims/slot.js");
+
+    const merged = mergeElements(
+      {
+        "layout:/": React.createElement("div", null, "layout"),
+        "page:/dashboard": React.createElement("div", null, "dashboard"),
+        "slot:team:/dashboard": React.createElement("div", null, "team panel"),
+      },
+      {
+        "page:/dashboard/settings": React.createElement("div", null, "settings"),
+      },
+      { preserveAbsentSlots: false },
+    );
+
+    expect(Object.hasOwn(merged, "slot:team:/dashboard")).toBe(false);
+  });
+
+  it("mergeElements preserves explicitly approved mounted slots without wire absence semantics", async () => {
+    const { mergeElements } = await import("../packages/vinext/src/shims/slot.js");
+
+    const mountedSlot = React.createElement("div", null, "team panel");
+    const merged = mergeElements(
+      {
+        "layout:/": React.createElement("div", null, "layout"),
+        "layout:/dashboard": React.createElement("div", null, "dashboard layout"),
+        "page:/dashboard": React.createElement("div", null, "dashboard"),
+        "slot:team:/dashboard": mountedSlot,
+      },
+      {
+        "page:/dashboard/settings": React.createElement("div", null, "settings"),
+      },
+      {
+        preserveAbsentSlots: false,
+        preserveElementIds: ["layout:/", "layout:/dashboard", "slot:team:/dashboard"],
+      },
+    );
+
+    expect(merged["slot:team:/dashboard"]).toBe(mountedSlot);
   });
 
   it("Slot renders element from resolved context", async () => {

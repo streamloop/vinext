@@ -5,6 +5,7 @@ inputs:
   node-version:
     description: Node.js version to use
     required: false
+    default: "24"
   cache:
     description: Whether to enable caching for Vite+ dependencies
     required: false
@@ -18,7 +19,7 @@ runs:
   using: composite
   steps:
     - name: Setup Vite+
-      uses: voidzero-dev/setup-vp@dc86dedacad12dfe5b3e525b735a327fcd1f6477 # v1
+      uses: voidzero-dev/setup-vp@b4d143e0e2de7151ab45dbc4b52b553025d123f2 # v1
       with:
         node-version: ${{ inputs.node-version }}
         cache: ${{ inputs.cache }}

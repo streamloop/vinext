@@ -7,7 +7,7 @@
  *
  * 1. RSC scripts are interleaved between HTML flush cycles
  * 2. No RSC scripts are injected mid-HTML-chunk (DOM corruption case)
- * 3. The __VINEXT_RSC_DONE__ signal appears after all content
+ * 3. The navigation runtime RSC done signal appears after all content
  * 4. Head injection happens correctly
  * 5. Multiple HTML chunks in the same macrotask are batched correctly
  */
@@ -16,6 +16,7 @@ import {
   createRscEmbedTransform,
   createTickBufferedTransform,
 } from "../packages/vinext/src/server/app-ssr-stream.js";
+import { createSsrErrorMetaRenderer } from "../packages/vinext/src/server/app-ssr-error-meta.js";
 
 /**
  * Create a ReadableStream from an array of string chunks, with optional
@@ -100,6 +101,10 @@ async function collectStreamChunks(stream: ReadableStream<Uint8Array>): Promise<
   return chunks;
 }
 
+const RSC_RUNTIME_KEY = 'Symbol.for("vinext.navigationRuntime")';
+const RSC_RUNTIME_PUSH = ".rsc.push(";
+const RSC_RUNTIME_DONE = ".done=true";
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 describe("Tick-buffered RSC streaming (behavioral)", () => {
@@ -129,9 +134,9 @@ describe("Tick-buffered RSC streaming (behavioral)", () => {
     const output = await collectStream(htmlStream.pipeThrough(transform));
 
     // RSC scripts should be present in output
-    expect(output).toContain("__VINEXT_RSC_CHUNKS__");
+    expect(output).toContain(RSC_RUNTIME_PUSH);
     // Done signal should be present
-    expect(output).toContain("__VINEXT_RSC_DONE__=true");
+    expect(output).toContain(RSC_RUNTIME_DONE);
     // HTML content should be intact
     expect(output).toContain("<div id='root'>");
     expect(output).toContain("<div>Suspense resolved</div>");
@@ -150,10 +155,9 @@ describe("Tick-buffered RSC streaming (behavioral)", () => {
     const transform = createTickBufferedTransform(rscEmbed);
     const output = await collectStream(htmlStream.pipeThrough(transform));
 
-    expect(output).toContain('<script nonce="vinext-test-nonce">self.__VINEXT_RSC_CHUNKS__=');
-    expect(output).toContain(
-      '<script nonce="vinext-test-nonce">self.__VINEXT_RSC_DONE__=true</script>',
-    );
+    expect(output).toContain(`<script nonce="vinext-test-nonce">((self[${RSC_RUNTIME_KEY}]`);
+    expect(output).toContain(`<script nonce="vinext-test-nonce">((self[${RSC_RUNTIME_KEY}]`);
+    expect(output).toContain(RSC_RUNTIME_DONE);
   });
 
   it("does not inject scripts mid-HTML-chunk (DOM corruption prevention)", async () => {
@@ -187,7 +191,7 @@ describe("Tick-buffered RSC streaming (behavioral)", () => {
     expect(output).toContain("<svg><linearGradient id='g1'></linearGradient></svg>");
 
     // RSC scripts should still be present (after the HTML, not mid-element)
-    expect(output).toContain("__VINEXT_RSC_CHUNKS__");
+    expect(output).toContain(RSC_RUNTIME_PUSH);
 
     // Verify no <script> tag appears between the split HTML fragments
     // by checking that the linearGradient element is contiguous
@@ -220,7 +224,7 @@ describe("Tick-buffered RSC streaming (behavioral)", () => {
 
     // RSC scripts should appear AFTER all the HTML chunks
     const htmlEnd = output.indexOf("<div>chunk2</div>") + "<div>chunk2</div>".length;
-    const scriptStart = output.indexOf("__VINEXT_RSC_CHUNKS__");
+    const scriptStart = output.indexOf(RSC_RUNTIME_PUSH);
     expect(scriptStart).toBeGreaterThan(htmlEnd);
   });
 
@@ -271,14 +275,14 @@ describe("Tick-buffered RSC streaming (behavioral)", () => {
     expect(output).toContain("<div>Boundary 2</div>");
 
     // RSC scripts should be present for all chunks
-    expect(output).toContain("__VINEXT_RSC_CHUNKS__");
+    expect(output).toContain(RSC_RUNTIME_PUSH);
 
     // Done signal at the end
-    expect(output).toContain("__VINEXT_RSC_DONE__=true");
+    expect(output).toContain(RSC_RUNTIME_DONE);
 
     // The done signal should come AFTER all HTML content
     const lastHtmlPos = output.indexOf("</html>");
-    const donePos = output.indexOf("__VINEXT_RSC_DONE__=true");
+    const donePos = output.indexOf(RSC_RUNTIME_DONE);
     expect(donePos).toBeGreaterThan(lastHtmlPos);
   });
 
@@ -411,10 +415,49 @@ describe("Tick-buffered RSC streaming (behavioral)", () => {
 
     const shellStylePos = output.indexOf('data-styled="shell"');
     const trailingStylePos = output.indexOf('data-styled="trailing"');
-    const donePos = output.indexOf("__VINEXT_RSC_DONE__=true");
+    const donePos = output.indexOf(RSC_RUNTIME_DONE);
     expect(shellStylePos).toBeGreaterThan(-1);
     expect(trailingStylePos).toBeGreaterThan(shellStylePos);
     expect(trailingStylePos).toBeLessThan(donePos);
+  });
+
+  it("emits SSR-captured redirect meta tags after the shell has already flushed", async () => {
+    // Ported from Next.js: test/e2e/app-dir/navigation/navigation.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/navigation/navigation.test.ts
+    const rsc = createMockRscStream();
+    rsc.close();
+
+    const rscEmbed = createRscEmbedTransform(rsc.stream);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const errorMetaRenderer = createSsrErrorMetaRenderer();
+    const encoder = new TextEncoder();
+    const htmlStream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(encoder.encode("<html><head></head><body><main>shell</main>"));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        errorMetaRenderer.capture(
+          Object.assign(new Error("NEXT_REDIRECT"), {
+            digest: "NEXT_REDIRECT;replace;/redirect/result;307",
+          }),
+        );
+        controller.enqueue(encoder.encode("<template>resolved boundary</template></body></html>"));
+        controller.close();
+      },
+    });
+
+    const transform = createTickBufferedTransform(rscEmbed, () => errorMetaRenderer.flush());
+    const output = await collectStream(htmlStream.pipeThrough(transform));
+
+    const shellPos = output.indexOf("<main>shell</main>");
+    const redirectMetaPos = output.indexOf(
+      '<meta id="__next-page-redirect" http-equiv="refresh" content="1;url=/redirect/result" />',
+    );
+    const boundaryPos = output.indexOf("<template>resolved boundary</template>");
+
+    expect(shellPos).toBeGreaterThan(-1);
+    expect(redirectMetaPos).toBeGreaterThan(shellPos);
+    expect(redirectMetaPos).toBeLessThan(boundaryPos);
   });
 
   it("still injects head content even without </head> in stream", async () => {
@@ -436,7 +479,7 @@ describe("Tick-buffered RSC streaming (behavioral)", () => {
     expect(output).toContain('name="fallback"');
   });
 
-  it("emits __VINEXT_RSC_DONE__ signal even with empty RSC stream", async () => {
+  it("emits navigation runtime RSC done signal even with empty RSC stream", async () => {
     const rsc = createMockRscStream();
     rsc.close(); // Close immediately — no RSC chunks
 
@@ -449,9 +492,9 @@ describe("Tick-buffered RSC streaming (behavioral)", () => {
     const output = await collectStream(htmlStream.pipeThrough(transform));
 
     // Done signal must always be present so the browser knows streaming is complete
-    expect(output).toContain("__VINEXT_RSC_DONE__=true");
+    expect(output).toContain(RSC_RUNTIME_DONE);
     // No RSC chunks should be present
-    expect(output).not.toContain("__VINEXT_RSC_CHUNKS__");
+    expect(output).not.toContain(RSC_RUNTIME_PUSH);
   });
 
   it("handles RSC chunks arriving after HTML stream closes", async () => {
@@ -476,9 +519,9 @@ describe("Tick-buffered RSC streaming (behavioral)", () => {
     // HTML should be present
     expect(output).toContain("Shell");
     // The late RSC chunk should still be emitted (finalize waits for RSC stream)
-    expect(output).toContain("__VINEXT_RSC_CHUNKS__");
+    expect(output).toContain(RSC_RUNTIME_PUSH);
     // Done signal must be present
-    expect(output).toContain("__VINEXT_RSC_DONE__=true");
+    expect(output).toContain(RSC_RUNTIME_DONE);
   });
 
   it("preserves RSC chunk ordering", async () => {
@@ -500,7 +543,7 @@ describe("Tick-buffered RSC streaming (behavioral)", () => {
     const output = await collectStream(htmlStream.pipeThrough(transform));
 
     // Extract RSC script contents to verify ordering
-    const scriptRegex = /__VINEXT_RSC_CHUNKS__\.push\(([^)]+)\)/g;
+    const scriptRegex = /\.rsc\.push\(([^)]+)\)/g;
     const matches: string[] = [];
     let match;
     while ((match = scriptRegex.exec(output)) !== null) {
@@ -559,17 +602,16 @@ describe("Tick-buffered RSC streaming (behavioral)", () => {
     }
 
     // All RSC chunks should be present (initial + 5 boundaries = 6 total)
-    // Count .push() calls, not raw occurrences of __VINEXT_RSC_CHUNKS__
-    // (each script tag contains __VINEXT_RSC_CHUNKS__ multiple times in the init pattern)
-    const scriptCount = (output.match(/__VINEXT_RSC_CHUNKS__\.push\(/g) || []).length;
+    // Count RSC chunk push calls, not runtime initialization occurrences.
+    const scriptCount = (output.match(/\.rsc\.push\(/g) || []).length;
     expect(scriptCount).toBe(6);
 
     // Done signal at the end
-    expect(output).toContain("__VINEXT_RSC_DONE__=true");
+    expect(output).toContain(RSC_RUNTIME_DONE);
 
     // Done signal should be the last script
-    const lastChunksPos = output.lastIndexOf("__VINEXT_RSC_CHUNKS__");
-    const donePos = output.indexOf("__VINEXT_RSC_DONE__");
+    const lastChunksPos = output.lastIndexOf(RSC_RUNTIME_PUSH);
+    const donePos = output.indexOf(RSC_RUNTIME_DONE);
     expect(donePos).toBeGreaterThan(lastChunksPos);
   });
 
@@ -591,7 +633,7 @@ describe("Tick-buffered RSC streaming (behavioral)", () => {
     const output = await collectStream(htmlStream.pipeThrough(transform));
 
     // The output should contain the RSC chunk
-    expect(output).toContain("__VINEXT_RSC_CHUNKS__");
+    expect(output).toContain(RSC_RUNTIME_PUSH);
 
     // RSC data is now stored as a JSON text string. safeJsonStringify escapes
     // <, >, and & characters so that </script> in the RSC data cannot break

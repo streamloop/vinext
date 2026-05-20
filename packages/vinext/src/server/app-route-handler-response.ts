@@ -1,5 +1,15 @@
 import type { CachedRouteValue, CacheControlMetadata } from "vinext/shims/cache";
-import { buildCachedRevalidateCacheControl, NEVER_CACHE_CONTROL } from "./cache-control.js";
+import {
+  buildCachedRevalidateCacheControl,
+  NEVER_CACHE_CONTROL,
+  STATIC_CACHE_CONTROL,
+} from "./cache-control.js";
+import {
+  MIDDLEWARE_HEADER_PREFIX,
+  MIDDLEWARE_NEXT_HEADER,
+  MIDDLEWARE_REWRITE_HEADER,
+  VINEXT_CACHE_HEADER,
+} from "./headers.js";
 import { mergeMiddlewareResponseHeaders } from "./middleware-response-headers.js";
 import { processMiddlewareHeaders } from "./request-pipeline.js";
 
@@ -29,7 +39,7 @@ const APP_ROUTE_NEXT_ERROR =
 
 function hasMiddlewareHeader(headers: Headers): boolean {
   for (const key of headers.keys()) {
-    if (key.startsWith("x-middleware-")) return true;
+    if (key.startsWith(MIDDLEWARE_HEADER_PREFIX)) return true;
   }
   return false;
 }
@@ -45,6 +55,12 @@ function buildRouteHandlerCacheControl(
     // with a 0 value, via applyRouteHandlerRevalidateHeader. In all such
     // cases the author opted out of caching entirely.
     return NEVER_CACHE_CONTROL;
+  }
+
+  if (revalidateSeconds === Infinity) {
+    // revalidate = false / Infinity means "cache indefinitely" — emit the
+    // same static Cache-Control used by pages, not a dynamic SWR value.
+    return STATIC_CACHE_CONTROL;
   }
 
   return buildCachedRevalidateCacheControl(cacheState, revalidateSeconds, expireSeconds);
@@ -71,11 +87,11 @@ export function applyRouteHandlerMiddlewareContext(
 export function assertSupportedAppRouteHandlerResponse(response: Response): void {
   // NextResponse.next() and rewrite() are middleware control-flow signals.
   // Once an App Route handler has returned, Next.js rejects those responses.
-  if (response.headers.has("x-middleware-rewrite")) {
+  if (response.headers.has(MIDDLEWARE_REWRITE_HEADER)) {
     throw new Error(APP_ROUTE_REWRITE_ERROR);
   }
 
-  if (response.headers.get("x-middleware-next") === "1") {
+  if (response.headers.get(MIDDLEWARE_NEXT_HEADER) === "1") {
     throw new Error(APP_ROUTE_NEXT_ERROR);
   }
 }
@@ -94,7 +110,7 @@ export function buildRouteHandlerCachedResponse(
       headers.set(key, value);
     }
   }
-  headers.set("X-Vinext-Cache", options.cacheState);
+  headers.set(VINEXT_CACHE_HEADER, options.cacheState);
   const revalidateSeconds = options.cacheControl?.revalidate ?? options.revalidateSeconds;
   const expireSeconds =
     options.cacheControl === undefined
@@ -123,7 +139,7 @@ export function applyRouteHandlerRevalidateHeader(
 }
 
 export function markRouteHandlerCacheMiss(response: Response): void {
-  response.headers.set("X-Vinext-Cache", "MISS");
+  response.headers.set(VINEXT_CACHE_HEADER, "MISS");
 }
 
 function getSetCookieName(cookie: string): string | null {
@@ -181,9 +197,9 @@ export async function buildAppRouteCacheValue(response: Response): Promise<Cache
   response.headers.forEach((value, key) => {
     if (
       key === "set-cookie" ||
-      key === "x-vinext-cache" ||
+      key === VINEXT_CACHE_HEADER.toLowerCase() ||
       key === "cache-control" ||
-      key.startsWith("x-middleware-")
+      key.startsWith(MIDDLEWARE_HEADER_PREFIX)
     ) {
       return;
     }

@@ -14,7 +14,9 @@ type ParsedArgs = {
   turbopack?: boolean;
   experimental?: boolean;
   prerenderAll?: boolean;
+  prerenderConcurrency?: number;
   precompress?: boolean;
+  positionals?: string[];
 };
 
 // Matches long flags (--foo) and single-letter short flags (-x).
@@ -69,6 +71,17 @@ function parsePort(raw: string, flag: string): number {
   return parsed;
 }
 
+export function parsePositiveIntegerArg(raw: string, flag: string): number {
+  if (raw === "") {
+    throw new Error(`${flag} requires a value, but none was provided.`);
+  }
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${flag} expects a positive integer, but got "${raw}".`);
+  }
+  return parsed;
+}
+
 /**
  * Parse CLI arguments into a structured object.
  *
@@ -80,6 +93,11 @@ function parsePort(raw: string, flag: string): number {
  */
 export function parseArgs(args: string[]): ParsedArgs {
   const result: ParsedArgs = {};
+  const addPositional = (arg: string): void => {
+    result.positionals ??= [];
+    result.positionals.push(arg);
+  };
+
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
 
@@ -104,6 +122,13 @@ export function parseArgs(args: string[]): ParsedArgs {
       case "--prerender-all":
         result.prerenderAll = true;
         break;
+
+      case "--prerender-concurrency": {
+        const raw = takeValue(arg, args, i);
+        i++;
+        result.prerenderConcurrency = parsePositiveIntegerArg(raw, arg);
+        break;
+      }
 
       case "--precompress":
         result.precompress = true;
@@ -138,6 +163,17 @@ export function parseArgs(args: string[]): ParsedArgs {
           }
           result.hostname = hostRaw;
           break;
+        }
+        const prerenderConcurrencyRaw = tryEqualsForm(arg, "prerender-concurrency");
+        if (prerenderConcurrencyRaw !== null) {
+          result.prerenderConcurrency = parsePositiveIntegerArg(
+            prerenderConcurrencyRaw,
+            "--prerender-concurrency",
+          );
+          break;
+        }
+        if (!FLAG_PATTERN.test(arg)) {
+          addPositional(arg);
         }
         break;
       }

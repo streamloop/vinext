@@ -19,6 +19,7 @@
  */
 
 import { forwardRef, useActionState, type FormHTMLAttributes, type ForwardedRef } from "react";
+import { hasAppNavigationRuntime } from "../client/navigation-runtime.js";
 import { navigateClientSide } from "./navigation.js";
 import { isDangerousScheme } from "./url-safety.js";
 import { toSameOriginPath } from "./url-utils.js";
@@ -223,7 +224,7 @@ const Form = forwardRef(function Form(props: FormProps, ref: ForwardedRef<HTMLFo
     const url = createFormSubmitDestinationUrl(effectiveAction, e.currentTarget, submitter);
 
     // Navigate client-side
-    if (typeof window.__VINEXT_RSC_NAVIGATE__ === "function") {
+    if (hasAppNavigationRuntime()) {
       // App Router: use the shared navigator so URL/history publish stays
       // aligned with the committed RSC tree.
       await navigateClientSide(url, replace ? "replace" : "push", scroll);
@@ -239,12 +240,21 @@ const Form = forwardRef(function Form(props: FormProps, ref: ForwardedRef<HTMLFo
 
     // App Router: scroll is handled inside navigateClientSide (called above).
     // Pages Router: scroll manually since pushState/popstate doesn't auto-scroll.
-    if (typeof window.__VINEXT_RSC_NAVIGATE__ !== "function" && scroll) {
+    if (!hasAppNavigationRuntime() && scroll) {
       window.scrollTo(0, 0);
     }
   }
 
-  return <form ref={ref} action={action} onSubmit={handleSubmit} {...rest} />;
+  return (
+    <form
+      ref={ref}
+      action={action}
+      onSubmit={(event) => {
+        void handleSubmit(event);
+      }}
+      {...rest}
+    />
+  );
 });
 
 export default Form;

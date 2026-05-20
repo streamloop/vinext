@@ -10,14 +10,17 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from "vite-plus/test";
 import fs from "node:fs";
+import { createServer, type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { buildPagesFixture, buildAppFixture, buildCloudflareAppFixture } from "./helpers.js";
 import {
+  extractRscPayloadFromPrerenderedHtml,
   resolveParentParams,
   type PrerenderRouteResult,
   type StaticParamsMap,
 } from "../packages/vinext/src/build/prerender.js";
+import { safeJsonStringify } from "../packages/vinext/src/server/html.js";
 import type { AppRoute } from "../packages/vinext/src/routing/app-router.js";
 
 const PAGES_FIXTURE = path.resolve(import.meta.dirname, "./fixtures/pages-basic");
@@ -36,6 +39,384 @@ function findRoute(
 ): PrerenderRouteResult | undefined {
   return results.find((r) => r.route === route || ("path" in r && r.path === route));
 }
+
+function listen(server: Server): Promise<number> {
+  return new Promise((resolve, reject) => {
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (typeof address === "object" && address !== null) {
+        resolve(address.port);
+      } else {
+        reject(new Error("test server did not expose a TCP port"));
+      }
+    });
+  });
+}
+
+function closeServer(server: Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
+const RSC_RUNTIME_BOOTSTRAP_EXPRESSION =
+  '((self[Symbol.for("vinext.navigationRuntime")]??={bootstrap:{routeManifest:null},functions:{}}).bootstrap.rsc??={rsc:[]})';
+
+function runtimeRscChunkScript(chunk: string | [3, string]): string {
+  return `<script>${RSC_RUNTIME_BOOTSTRAP_EXPRESSION}.rsc.push(${safeJsonStringify(chunk)})</script>`;
+}
+
+function runtimeRscDoneScript(): string {
+  return `<script>${RSC_RUNTIME_BOOTSTRAP_EXPRESSION}.done=true</script>`;
+}
+
+function legacyRscChunkScript(chunk: string | [3, string]): string {
+  return (
+    "<script>self.__VINEXT_RSC_CHUNKS__=self.__VINEXT_RSC_CHUNKS__||[];" +
+    `self.__VINEXT_RSC_CHUNKS__.push(${safeJsonStringify(chunk)})</script>`
+  );
+}
+
+function legacyRscDoneScript(): string {
+  return "<script>self.__VINEXT_RSC_DONE__=true</script>";
+}
+
+// ─── App Router RSC payload extraction ───────────────────────────────────────
+
+describe("extractRscPayloadFromPrerenderedHtml", () => {
+  function decodeExtractedPayload(html: string): string | null {
+    const payload = extractRscPayloadFromPrerenderedHtml(html);
+    return payload === null ? null : new TextDecoder().decode(payload);
+  }
+
+  it("reconstructs streamed RSC chunks from inline bootstrap scripts", () => {
+    const chunks = [
+      '0:D{"name":"layout"}\n',
+      '1:["$","div",null,{"children":"hello ) world"}]\n',
+      '2:["$","span",null,{"children":"</script><script>alert(1)</script>"}]\n',
+    ];
+    const html =
+      "<html><body>" +
+      chunks.map((chunk) => runtimeRscChunkScript(chunk)).join("") +
+      runtimeRscDoneScript() +
+      "</body></html>";
+
+    expect(decodeExtractedPayload(html)).toBe(chunks.join(""));
+  });
+
+  it("keeps parsing legacy streamed RSC chunk scripts", () => {
+    const chunks = ['0:D{"name":"layout"}\n', '1:["$","div",null,{"children":"legacy"}]\n'];
+    const html =
+      "<html><body>" +
+      chunks.map((chunk) => legacyRscChunkScript(chunk)).join("") +
+      legacyRscDoneScript() +
+      "</body></html>";
+
+    expect(decodeExtractedPayload(html)).toBe(chunks.join(""));
+  });
+
+  it("reconstructs binary RSC chunks from inline bootstrap scripts", () => {
+    // Ported from Next.js: test/e2e/app-dir/binary/rsc-binary.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/binary/rsc-binary.test.ts
+    const html =
+      "<html><body>" +
+      runtimeRscChunkScript("0:text\n") +
+      runtimeRscChunkScript([3, "/wABAgM="]) +
+      runtimeRscDoneScript() +
+      "</body></html>";
+
+    const payload = extractRscPayloadFromPrerenderedHtml(html);
+
+    expect(payload).toEqual(
+      new Uint8Array([...new TextEncoder().encode("0:text\n"), 255, 0, 1, 2, 3]),
+    );
+  });
+
+  it("throws when the done marker is missing", () => {
+    const html = "<html><body>" + runtimeRscChunkScript("0:[]\n") + "</body></html>";
+
+    expect(() => extractRscPayloadFromPrerenderedHtml(html)).toThrow(/missing RSC done marker/);
+  });
+
+  it("does not treat marker-looking RSC payload text as the done control script", () => {
+    const html =
+      "<html><body>" + runtimeRscChunkScript('0:["__VINEXT_RSC_DONE__=true"]\n') + "</body></html>";
+
+    expect(() => extractRscPayloadFromPrerenderedHtml(html)).toThrow(/missing RSC done marker/);
+  });
+
+  it("ignores non-chunk runtime scripts that start with the bootstrap expression", () => {
+    const html =
+      "<html><body>" +
+      `<script>${RSC_RUNTIME_BOOTSTRAP_EXPRESSION}.metadata={}</script>` +
+      runtimeRscChunkScript("0:[]\n") +
+      runtimeRscDoneScript() +
+      "</body></html>";
+
+    expect(decodeExtractedPayload(html)).toBe("0:[]\n");
+  });
+
+  it("rejects chunk scripts with trailing code after the payload push", () => {
+    const html =
+      "<html><body>" +
+      `<script>${RSC_RUNTIME_BOOTSTRAP_EXPRESSION}.rsc.push(${safeJsonStringify("0:[]\n")})alert(1)</script>` +
+      runtimeRscDoneScript() +
+      "</body></html>";
+
+    // JSON.parse rejects the slice (which includes the `)` and `alert(1` after
+    // the JSON-encoded string), so this is reported as malformed JSON rather
+    // than a separate "trailing code" diagnostic.
+    expect(() => extractRscPayloadFromPrerenderedHtml(html)).toThrow(
+      "[vinext] Malformed prerender RSC embed: invalid chunk JSON",
+    );
+  });
+
+  it("rejects chunk scripts with invalid JSON", () => {
+    const html =
+      "<html><body>" +
+      `<script>${RSC_RUNTIME_BOOTSTRAP_EXPRESSION}.rsc.push("\\uZZZZ")</script>` +
+      runtimeRscDoneScript() +
+      "</body></html>";
+
+    expect(() => extractRscPayloadFromPrerenderedHtml(html)).toThrow(
+      "[vinext] Malformed prerender RSC embed: invalid chunk JSON",
+    );
+  });
+
+  it("returns null when no chunk scripts and no done marker are present (middleware short-circuit)", () => {
+    // Middleware that returns a custom 200 HTML body bypasses the App Router
+    // pipeline entirely — no chunks, no done marker. The driver detects this
+    // null and falls back to a second invocation with `RSC: 1`.
+    expect(extractRscPayloadFromPrerenderedHtml("<html><body>legacy</body></html>")).toBeNull();
+  });
+
+  it("throws when only the done marker is present without any chunks", () => {
+    // Half-emitted embed (done marker but no chunks) is a real bug — partial
+    // emission shouldn't fall back silently.
+    const html = `<html><body>${runtimeRscDoneScript()}</body></html>`;
+
+    expect(() => extractRscPayloadFromPrerenderedHtml(html)).toThrow(
+      "[vinext] Malformed prerender RSC embed: done marker present without chunk scripts",
+    );
+  });
+});
+
+describe("prerenderApp — RSC extraction", () => {
+  it("writes the .rsc file from rendered HTML without a second RSC request", async () => {
+    const root = tmpDir("vinext-prerender-rsc-dedupe-");
+    const outDir = path.join(root, "out");
+    const appDir = path.join(root, "app");
+    const pagePath = path.join(appDir, "page.tsx");
+    fs.mkdirSync(appDir, { recursive: true });
+    fs.writeFileSync(
+      pagePath,
+      "export const dynamic = 'force-static';\nexport default function Page() { return null; }\n",
+    );
+
+    const rscPayload = '0:["$","div",null,{"children":"from html"}]\n';
+    let rscRequestCount = 0;
+    const server = createServer((req, res) => {
+      if (req.headers.rsc === "1" || req.headers.accept === "text/x-component") {
+        rscRequestCount++;
+        res.statusCode = 500;
+        res.end("unexpected RSC request");
+        return;
+      }
+
+      if (req.url === "/__vinext_nonexistent_for_404__") {
+        res.statusCode = 404;
+        res.end("<html><body>not found</body></html>");
+        return;
+      }
+
+      res.setHeader("content-type", "text/html");
+      res.end(
+        "<html><body>" +
+          runtimeRscChunkScript(rscPayload) +
+          runtimeRscDoneScript() +
+          "</body></html>",
+      );
+    });
+
+    const port = await listen(server);
+    try {
+      const { prerenderApp } = await import("../packages/vinext/src/build/prerender.js");
+      const { appRouter } = await import("../packages/vinext/src/routing/app-router.js");
+      const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
+      const routes = await appRouter(appDir);
+      const config = await resolveNextConfig({});
+
+      const prerenderResult = await prerenderApp({
+        mode: "default",
+        rscBundlePath: path.join(root, "dist", "server", "index.js"),
+        routes,
+        outDir,
+        config,
+        _prodServer: { server, port },
+      });
+
+      expect(findRoute(prerenderResult.routes, "/")).toMatchObject({
+        route: "/",
+        status: "rendered",
+      });
+      expect(fs.readFileSync(path.join(outDir, "index.rsc"), "utf-8")).toBe(rscPayload);
+      expect(rscRequestCount).toBe(0);
+    } finally {
+      await closeServer(server);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to a second RSC: 1 invocation when middleware short-circuits with custom HTML", async () => {
+    // Middleware that returns a 200 HTML body bypasses the App Router
+    // pipeline — the response contains no embed chunks. The driver must
+    // recover by issuing a second invocation with `RSC: 1` and use whatever
+    // that returns as the .rsc file.
+    const root = tmpDir("vinext-prerender-rsc-fallback-");
+    const outDir = path.join(root, "out");
+    const appDir = path.join(root, "app");
+    const pagePath = path.join(appDir, "page.tsx");
+    fs.mkdirSync(appDir, { recursive: true });
+    fs.writeFileSync(
+      pagePath,
+      "export const dynamic = 'force-static';\nexport default function Page() { return null; }\n",
+    );
+
+    const middlewareHtml = "<html><body>middleware short-circuit</body></html>";
+    const fallbackRscPayload = '0:["$","div",null,{"children":"from fallback"}]\n';
+    let pageRequestCount = 0;
+    let rscRequestCount = 0;
+    const server = createServer((req, res) => {
+      const isRsc = req.headers.rsc === "1" || req.headers.accept === "text/x-component";
+
+      if (req.url === "/__vinext_nonexistent_for_404__") {
+        res.statusCode = 404;
+        res.end("<html><body>not found</body></html>");
+        return;
+      }
+
+      if (isRsc) {
+        rscRequestCount++;
+        res.setHeader("content-type", "text/x-component");
+        res.end(fallbackRscPayload);
+        return;
+      }
+
+      // Page request: middleware short-circuits with plain HTML and no
+      // RSC embed chunks — exercising the fallback path.
+      pageRequestCount++;
+      res.setHeader("content-type", "text/html");
+      res.end(middlewareHtml);
+    });
+
+    const port = await listen(server);
+    try {
+      const { prerenderApp } = await import("../packages/vinext/src/build/prerender.js");
+      const { appRouter } = await import("../packages/vinext/src/routing/app-router.js");
+      const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
+      const routes = await appRouter(appDir);
+      const config = await resolveNextConfig({});
+
+      const prerenderResult = await prerenderApp({
+        mode: "default",
+        rscBundlePath: path.join(root, "dist", "server", "index.js"),
+        routes,
+        outDir,
+        config,
+        _prodServer: { server, port },
+      });
+
+      expect(findRoute(prerenderResult.routes, "/")).toMatchObject({
+        route: "/",
+        status: "rendered",
+      });
+
+      // HTML on disk is the middleware response.
+      expect(fs.readFileSync(path.join(outDir, "index.html"), "utf-8")).toBe(middlewareHtml);
+      // .rsc on disk is the fallback RSC: 1 response.
+      expect(fs.readFileSync(path.join(outDir, "index.rsc"), "utf-8")).toBe(fallbackRscPayload);
+
+      // Exactly one page request and one RSC fallback request per route.
+      expect(pageRequestCount).toBe(1);
+      expect(rscRequestCount).toBe(1);
+    } finally {
+      await closeServer(server);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("errors without writing .rsc when the middleware short-circuit fallback RSC request fails", async () => {
+    const root = tmpDir("vinext-prerender-rsc-fallback-failure-");
+    const outDir = path.join(root, "out");
+    const appDir = path.join(root, "app");
+    const pagePath = path.join(appDir, "page.tsx");
+    fs.mkdirSync(appDir, { recursive: true });
+    fs.writeFileSync(
+      pagePath,
+      "export const dynamic = 'force-static';\nexport default function Page() { return null; }\n",
+    );
+
+    const middlewareHtml = "<html><body>middleware short-circuit</body></html>";
+    let pageRequestCount = 0;
+    let rscRequestCount = 0;
+    const server = createServer((req, res) => {
+      const isRsc = req.headers.rsc === "1" || req.headers.accept === "text/x-component";
+
+      if (req.url === "/__vinext_nonexistent_for_404__") {
+        res.statusCode = 404;
+        res.end("<html><body>not found</body></html>");
+        return;
+      }
+
+      if (isRsc) {
+        rscRequestCount++;
+        res.statusCode = 500;
+        res.end("fallback failed");
+        return;
+      }
+
+      pageRequestCount++;
+      res.setHeader("content-type", "text/html");
+      res.end(middlewareHtml);
+    });
+
+    const port = await listen(server);
+    try {
+      const { prerenderApp } = await import("../packages/vinext/src/build/prerender.js");
+      const { appRouter } = await import("../packages/vinext/src/routing/app-router.js");
+      const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
+      const routes = await appRouter(appDir);
+      const config = await resolveNextConfig({});
+
+      const prerenderResult = await prerenderApp({
+        mode: "default",
+        rscBundlePath: path.join(root, "dist", "server", "index.js"),
+        routes,
+        outDir,
+        config,
+        _prodServer: { server, port },
+      });
+
+      const route = findRoute(prerenderResult.routes, "/");
+      expect(route).toMatchObject({
+        route: "/",
+        status: "error",
+      });
+      if (route?.status !== "error") throw new Error("expected route to fail prerender");
+      expect(route.error).toContain("[vinext] prerenderApp: RSC fallback returned 500 for /");
+      expect(fs.existsSync(path.join(outDir, "index.rsc"))).toBe(false);
+      expect(pageRequestCount).toBe(1);
+      expect(rscRequestCount).toBe(1);
+    } finally {
+      await closeServer(server);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 // ─── Pages Router ─────────────────────────────────────────────────────────────
 
@@ -131,6 +512,42 @@ describe("prerenderPages — default mode (pages-basic)", () => {
         status: "rendered",
         revalidate: false,
       });
+    }
+  });
+
+  // Next.js accepts both `paths: Array<{ params }>` and `paths: Array<string>`
+  // from getStaticPaths. The string-path variant is documented at
+  // https://nextjs.org/docs/pages/api-reference/functions/get-static-paths and
+  // implemented in .nextjs-ref/packages/next/src/build/static-paths/pages.ts
+  // (the `typeof entry === 'string'` branch around line 89).
+  it("renders dynamic routes from getStaticPaths with string paths", () => {
+    const slugs = ["hello-world", "another-one"];
+    for (const slug of slugs) {
+      const r = findRoute(results, `/string-paths/${slug}`);
+      expect(r).toMatchObject({
+        route: "/string-paths/:slug",
+        path: `/string-paths/${slug}`,
+        status: "rendered",
+        revalidate: false,
+      });
+      if (r?.status === "rendered") {
+        expect(r.outputFiles).toContain(`string-paths/${slug}.html`);
+      }
+    }
+  });
+
+  // Next.js rejects entries with a missing `params` key — see
+  //   .nextjs-ref/packages/next/src/build/static-paths/pages.ts (around line 169)
+  //   "A required parameter (X) was not provided as a string received undefined"
+  // We must NOT crash the whole prerender phase on this; surface it as a
+  // per-route error result, the same shape we use elsewhere.
+  it("surfaces missing-params entries as a per-route error (does not crash)", () => {
+    const errored = results.find(
+      (r) => r.route === "/missing-params/:slug" && r.status === "error",
+    );
+    expect(errored).toBeDefined();
+    if (errored && errored.status === "error") {
+      expect(errored.error).toMatch(/missing the `params` key|params is undefined/);
     }
   });
 
@@ -478,6 +895,31 @@ describe("prerenderApp — default mode (app-basic)", () => {
     expect(r).toMatchObject({ route: "/dashboard", status: "rendered", revalidate: false });
   });
 
+  it("renders layout-only routes whose content comes from parallel slots", () => {
+    // Ported from Next.js: test/e2e/app-dir/parallel-routes-and-interception/parallel-routes-and-interception.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/parallel-routes-and-interception/parallel-routes-and-interception.test.ts
+    const parent = findRoute(results, "/parallel-nested/home");
+    expect(parent).toMatchObject({
+      route: "/parallel-nested/home",
+      status: "rendered",
+      revalidate: false,
+    });
+
+    const nested = findRoute(results, "/parallel-nested/home/nested");
+    expect(nested).toMatchObject({
+      route: "/parallel-nested/home/nested",
+      status: "rendered",
+      revalidate: false,
+    });
+
+    const defaultOnly = findRoute(results, "/slot-collision");
+    expect(defaultOnly).toMatchObject({
+      route: "/slot-collision",
+      status: "rendered",
+      revalidate: false,
+    });
+  });
+
   it("skips /headers-test (unknown route that calls headers())", () => {
     const r = findRoute(results, "/headers-test");
     // headers-test calls headers() — should be skipped as dynamic
@@ -799,53 +1241,86 @@ function mockRoute(pattern: string, opts: { pagePath?: string | null } = {}): Ap
   };
 }
 
-function routeIndexFrom(routes: AppRoute[]): ReadonlyMap<string, AppRoute> {
-  return new Map(routes.map((r) => [r.pattern, r]));
-}
-
 describe("resolveParentParams", () => {
   it("returns empty array when route has no parent dynamic segments", async () => {
     const route = mockRoute("/blog/:slug");
-    const result = await resolveParentParams(route, routeIndexFrom([route]), {});
+    const result = await resolveParentParams(route, {});
     expect(result).toEqual([]);
   });
 
-  it("returns empty array when parent route has no pagePath", async () => {
-    const parent = mockRoute("/shop/:category", { pagePath: null });
+  it("returns empty array when no parent generateStaticParams is registered", async () => {
     const child = mockRoute("/shop/:category/:item");
-    const result = await resolveParentParams(child, routeIndexFrom([parent, child]), {});
+    const result = await resolveParentParams(child, {});
     expect(result).toEqual([]);
+  });
+
+  it("resolves layout-level parent generateStaticParams without requiring a parent page", async () => {
+    // Ported from Next.js: test/e2e/app-dir/app-root-params-getters/generate-static-params.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/app-root-params-getters/generate-static-params.test.ts
+    const child = mockRoute("/:lang/:locale/other/:slug");
+    const staticParamsMap: StaticParamsMap = {
+      "/:lang/:locale": async () => [
+        { lang: "en", locale: "us" },
+        { lang: "es", locale: "es" },
+      ],
+    };
+
+    const result = await resolveParentParams(child, staticParamsMap);
+
+    expect(result).toEqual([
+      { lang: "en", locale: "us" },
+      { lang: "es", locale: "es" },
+    ]);
   });
 
   it("returns empty array when parent has no generateStaticParams", async () => {
-    const parent = mockRoute("/shop/:category");
     const child = mockRoute("/shop/:category/:item");
     const staticParamsMap: StaticParamsMap = {};
-    const result = await resolveParentParams(
-      child,
-      routeIndexFrom([parent, child]),
-      staticParamsMap,
-    );
+    const result = await resolveParentParams(child, staticParamsMap);
     expect(result).toEqual([]);
   });
 
+  it("skips missing parent providers but bails on malformed non-array results", async () => {
+    const child = mockRoute("/shop/:category/:item/:slug");
+    const calls: Record<string, string | string[]>[] = [];
+    const itemGenerateStaticParams = async ({
+      params,
+    }: {
+      params: Record<string, string | string[]>;
+    }) => {
+      calls.push(params);
+      return [{ item: "shoes" }];
+    };
+    const staticParamsMap: StaticParamsMap = {
+      "/shop/:category": async () => null,
+      "/shop/:category/:item": itemGenerateStaticParams,
+    };
+
+    const missingProviderResult = await resolveParentParams(child, staticParamsMap);
+
+    expect(missingProviderResult).toEqual([{ item: "shoes" }]);
+    expect(calls).toEqual([{}]);
+
+    calls.length = 0;
+    const malformedProviderResult = await resolveParentParams(child, {
+      "/shop/:category": async () => undefined,
+      "/shop/:category/:item": itemGenerateStaticParams,
+    });
+
+    expect(malformedProviderResult).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+
   it("resolves single parent dynamic segment", async () => {
-    const parent = mockRoute("/shop/:category");
     const child = mockRoute("/shop/:category/:item");
     const staticParamsMap: StaticParamsMap = {
       "/shop/:category": async () => [{ category: "electronics" }, { category: "clothing" }],
     };
-    const result = await resolveParentParams(
-      child,
-      routeIndexFrom([parent, child]),
-      staticParamsMap,
-    );
+    const result = await resolveParentParams(child, staticParamsMap);
     expect(result).toEqual([{ category: "electronics" }, { category: "clothing" }]);
   });
 
   it("resolves two levels of parent dynamic segments", async () => {
-    const grandparent = mockRoute("/a/:b");
-    const parent = mockRoute("/a/:b/c/:d");
     const child = mockRoute("/a/:b/c/:d/:e");
     const staticParamsMap: StaticParamsMap = {
       "/a/:b": async () => [{ b: "1" }, { b: "2" }],
@@ -854,11 +1329,7 @@ describe("resolveParentParams", () => {
         return [{ d: "y" }, { d: "z" }];
       },
     };
-    const result = await resolveParentParams(
-      child,
-      routeIndexFrom([grandparent, parent, child]),
-      staticParamsMap,
-    );
+    const result = await resolveParentParams(child, staticParamsMap);
     expect(result).toEqual([
       { b: "1", d: "x" },
       { b: "2", d: "y" },
@@ -867,42 +1338,32 @@ describe("resolveParentParams", () => {
   });
 
   it("skips static segments between dynamic parents", async () => {
-    const parent = mockRoute("/shop/:category");
     const child = mockRoute("/shop/:category/details/:item");
     const staticParamsMap: StaticParamsMap = {
       "/shop/:category": async () => [{ category: "shoes" }],
     };
-    const result = await resolveParentParams(
-      child,
-      routeIndexFrom([parent, child]),
-      staticParamsMap,
-    );
+    const result = await resolveParentParams(child, staticParamsMap);
     expect(result).toEqual([{ category: "shoes" }]);
   });
 
   it("returns empty array for a fully static route", async () => {
     const route = mockRoute("/about/contact");
-    const result = await resolveParentParams(route, routeIndexFrom([route]), {});
+    const result = await resolveParentParams(route, {});
     expect(result).toEqual([]);
   });
 
   it("returns empty array for a single-segment dynamic route", async () => {
     const route = mockRoute("/:id");
-    const result = await resolveParentParams(route, routeIndexFrom([route]), {});
+    const result = await resolveParentParams(route, {});
     expect(result).toEqual([]);
   });
 
   it("resolves parent with catch-all child segment", async () => {
-    const parent = mockRoute("/shop/:category");
     const child = mockRoute("/shop/:category/:rest+");
     const staticParamsMap: StaticParamsMap = {
       "/shop/:category": async () => [{ category: "electronics" }],
     };
-    const result = await resolveParentParams(
-      child,
-      routeIndexFrom([parent, child]),
-      staticParamsMap,
-    );
+    const result = await resolveParentParams(child, staticParamsMap);
     expect(result).toEqual([{ category: "electronics" }]);
   });
 });

@@ -1,7 +1,13 @@
-import { hasBasePath, stripBasePath } from "../utils/base-path.js";
+import { hasBasePath, stripBasePath, removeTrailingSlash } from "../utils/base-path.js";
 import type { NextHeader } from "../config/next-config.js";
 import type { RequestContext } from "../config/config-matchers.js";
 import { matchHeaders } from "../config/config-matchers.js";
+import {
+  INTERNAL_HEADERS,
+  MIDDLEWARE_HEADER_PREFIX,
+  VINEXT_STATIC_FILE_HEADER,
+} from "./headers.js";
+import { forbiddenResponse, notFoundResponse } from "./http-error-responses.js";
 
 /**
  * Shared request pipeline utilities.
@@ -14,6 +20,9 @@ import { matchHeaders } from "../config/config-matchers.js";
  * These utilities handle the common request lifecycle steps: protocol-
  * relative URL guards, basePath stripping, trailing slash normalization,
  * and CSRF origin validation.
+ *
+ * Plain-text error response builders (forbidden / not-found / etc.) live in
+ * `./http-error-responses.ts`.
  */
 
 /**
@@ -40,7 +49,7 @@ import { matchHeaders } from "../config/config-matchers.js";
  */
 export function guardProtocolRelativeUrl(rawPathname: string): Response | null {
   if (isOpenRedirectShaped(rawPathname)) {
-    return new Response("404 Not Found", { status: 404 });
+    return notFoundResponse();
   }
   return null;
 }
@@ -120,6 +129,12 @@ type ResolvePublicFileRouteOptions = {
   publicFiles: ReadonlySet<string>;
   request: Request;
 };
+
+const FILE_LIKE_PATHNAME_RE = /\.[^/]+\/?$/;
+
+function isWellKnownPathname(pathname: string): boolean {
+  return pathname === "/.well-known" || pathname.startsWith("/.well-known/");
+}
 
 function findHeaderRecordKey(headers: HeaderRecord, lowerName: string): string | undefined {
   for (const key of Object.keys(headers)) {
@@ -204,7 +219,7 @@ export function createStaticFileSignal(
   context: StaticFileSignalContext,
 ): Response {
   const headers = new Headers({
-    "x-vinext-static-file": encodeURIComponent(pathname),
+    [VINEXT_STATIC_FILE_HEADER]: encodeURIComponent(pathname),
   });
   if (context.headers) {
     for (const [key, value] of context.headers) {
@@ -231,6 +246,33 @@ export function resolvePublicFileRoute(options: ResolvePublicFileRouteOptions): 
   return createStaticFileSignal(options.cleanPathname, options.middlewareContext);
 }
 
+export function normalizeTrailingSlashPathname(
+  pathname: string,
+  trailingSlash: boolean,
+): string | null {
+  if (pathname === "/" || pathname === "/api" || pathname.startsWith("/api/")) {
+    return null;
+  }
+
+  const hasTrailing = pathname.endsWith("/");
+
+  if (trailingSlash) {
+    // Next.js emits two internal redirect rules for trailingSlash:true:
+    // file-looking paths lose a trailing slash, non-file paths gain one, and
+    // /.well-known stays untouched for RFC-defined discovery URLs.
+    if (isWellKnownPathname(pathname)) return null;
+    if (FILE_LIKE_PATHNAME_RE.test(pathname)) {
+      const normalized = removeTrailingSlash(pathname);
+      return normalized === pathname ? null : normalized;
+    }
+    if (!hasTrailing && !pathname.endsWith(".rsc")) return `${pathname}/`;
+    return null;
+  }
+
+  if (hasTrailing) return removeTrailingSlash(pathname);
+  return null;
+}
+
 /**
  * Check if the pathname needs a trailing slash redirect, and return the
  * redirect Response if so.
@@ -239,6 +281,8 @@ export function resolvePublicFileRoute(options: ResolvePublicFileRouteOptions): 
  * - `/api` routes are never redirected
  * - The root path `/` is never redirected
  * - If `trailingSlash` is true, redirect `/about` → `/about/`
+ * - If `trailingSlash` is true, redirect file-looking `/file.ext/` → `/file.ext`
+ * - If `trailingSlash` is true, do not redirect `/.well-known/*`
  * - If `trailingSlash` is false (default), redirect `/about/` → `/about`
  *
  * @param pathname - The basePath-stripped pathname
@@ -261,24 +305,14 @@ export function normalizeTrailingSlash(
   // browser would resolve as protocol-relative, even if a caller somehow
   // bypassed the upstream guard.
   if (isOpenRedirectShaped(pathname)) {
-    return new Response("404 Not Found", { status: 404 });
+    return notFoundResponse();
   }
-  const hasTrailing = pathname.endsWith("/");
-  // RSC (client-side navigation) requests arrive as /path.rsc — don't
-  // redirect those to /path.rsc/ when trailingSlash is enabled.
-  if (trailingSlash && !hasTrailing && !pathname.endsWith(".rsc")) {
-    return new Response(null, {
-      status: 308,
-      headers: { Location: basePath + pathname + "/" + search },
-    });
-  }
-  if (!trailingSlash && hasTrailing) {
-    return new Response(null, {
-      status: 308,
-      headers: { Location: basePath + pathname.replace(/\/+$/, "") + search },
-    });
-  }
-  return null;
+  const normalizedPathname = normalizeTrailingSlashPathname(pathname, trailingSlash);
+  if (normalizedPathname === null) return null;
+  return new Response(null, {
+    status: 308,
+    headers: { Location: basePath + normalizedPathname + search },
+  });
 }
 
 /**
@@ -312,14 +346,14 @@ export function validateCsrfOrigin(
     console.warn(
       `[vinext] CSRF origin "null" blocked for server action. To allow requests from sandboxed contexts, add "null" to experimental.serverActions.allowedOrigins.`,
     );
-    return new Response("Forbidden", { status: 403, headers: { "Content-Type": "text/plain" } });
+    return forbiddenResponse();
   }
 
   let originHost: string;
   try {
     originHost = new URL(originHeader).host.toLowerCase();
   } catch {
-    return new Response("Forbidden", { status: 403, headers: { "Content-Type": "text/plain" } });
+    return forbiddenResponse();
   }
 
   // Only use the Host header for origin comparison — never trust
@@ -341,7 +375,7 @@ export function validateCsrfOrigin(
   console.warn(
     `[vinext] CSRF origin mismatch: origin "${originHost}" does not match host "${hostHeader}". Blocking server action request.`,
   );
-  return new Response("Forbidden", { status: 403, headers: { "Content-Type": "text/plain" } });
+  return forbiddenResponse();
 }
 
 /**
@@ -458,6 +492,7 @@ function matchWildcardDomain(domain: string, pattern: string): boolean {
   while (patternParts.length) {
     const patternPart = patternParts.pop();
     const domainPart = domainParts.pop();
+    if (patternPart === undefined) return false;
 
     switch (patternPart) {
       case "":
@@ -535,7 +570,7 @@ export function processMiddlewareHeaders(headers: Headers): void {
   const keysToDelete: string[] = [];
 
   for (const key of headers.keys()) {
-    if (key.startsWith("x-middleware-")) {
+    if (key.startsWith(MIDDLEWARE_HEADER_PREFIX)) {
       keysToDelete.push(key);
     }
   }
@@ -543,4 +578,89 @@ export function processMiddlewareHeaders(headers: Headers): void {
   for (const key of keysToDelete) {
     headers.delete(key);
   }
+}
+
+/**
+ * Headers that are only used internally by Next.js and must not be honored
+ * from external requests. An attacker could forge these to influence routing
+ * or impersonate internal data fetches.
+ *
+ * @see `./headers.ts` for the canonical definition.
+ */
+export { INTERNAL_HEADERS } from "./headers.js";
+
+type RequestInitWithCf = RequestInit & { cf?: unknown };
+
+/**
+ * Strip internal headers from an inbound request so they cannot be forged by
+ * an external attacker to influence routing or impersonate internal state.
+ *
+ * Must be called at every request entry point BEFORE middleware, routing,
+ * or any handler logic accesses the request headers.
+ *
+ * Returns a new Headers object with internal headers removed. The input
+ * is never mutated — Request.headers is immutable in Workers/miniflare
+ * environments (see applyMiddlewareRequestHeaders in config-matchers.ts
+ * for the same cloning pattern).
+ *
+ * @param headers - The source Headers (never modified)
+ * @returns A new Headers with INTERNAL_HEADERS removed
+ */
+export function filterInternalHeaders(headers: Headers): Headers {
+  const filtered = new Headers();
+  for (const [key, value] of headers) {
+    if (!INTERNAL_HEADERS.includes(key.toLowerCase())) {
+      filtered.append(key, value);
+    }
+  }
+  return filtered;
+}
+
+function getRequestCf(request: Request): unknown {
+  const cf = Reflect.get(request, "cf");
+  return cf === undefined ? undefined : cf;
+}
+
+/**
+ * Clone a Request while overriding headers, preserving metadata when possible.
+ *
+ * Some runtimes (Workers) allow `new Request(request, { headers })` which
+ * retains redirect/signal/cf data. Others (Node/undici across realms) can throw
+ * when cloning a foreign Request instance. In that case, fall back to building
+ * a RequestInit with best-effort metadata.
+ */
+export function cloneRequestWithHeaders(request: Request, headers: Headers): Request {
+  let cloned: Request;
+  try {
+    cloned = new Request(request, { headers });
+  } catch {
+    const init: RequestInitWithCf = {
+      method: request.method,
+      headers,
+      body: request.body ?? undefined,
+      redirect: request.redirect,
+      signal: request.signal,
+      integrity: request.integrity,
+      cache: request.cache,
+      mode: request.mode,
+      credentials: request.credentials,
+      referrer: request.referrer,
+      referrerPolicy: request.referrerPolicy,
+    };
+    if (request.body) {
+      // @ts-expect-error — duplex needed for streaming request bodies
+      init.duplex = "half";
+    }
+    cloned = new Request(request.url, init);
+  }
+  const cf = getRequestCf(request);
+  if (cf !== undefined) {
+    // new Request() does not copy Workers-specific cf, so re-attach it.
+    Object.defineProperty(cloned, "cf", {
+      value: cf,
+      enumerable: true,
+      configurable: true,
+    });
+  }
+  return cloned;
 }

@@ -6,6 +6,11 @@ import {
   resolveAppPageHtmlResponsePolicy,
   resolveAppPageRscResponsePolicy,
 } from "../packages/vinext/src/server/app-page-response.js";
+import {
+  VINEXT_RSC_COMPATIBILITY_ID_HEADER,
+  VINEXT_RSC_VARY_HEADER,
+} from "../packages/vinext/src/server/app-rsc-cache-busting.js";
+import { withEnvVar } from "./env-test-helpers.js";
 
 function createBody(text: string): ReadableStream {
   return new ReadableStream({
@@ -21,6 +26,7 @@ describe("app page response helpers", () => {
     expect(
       resolveAppPageRscResponsePolicy({
         dynamicUsedDuringBuild: false,
+        isDraftMode: false,
         isDynamicError: false,
         isForceDynamic: false,
         isForceStatic: true,
@@ -36,6 +42,7 @@ describe("app page response helpers", () => {
       resolveAppPageRscResponsePolicy({
         dynamicUsedDuringBuild: false,
         expireSeconds: 300,
+        isDraftMode: false,
         isDynamicError: false,
         isForceDynamic: false,
         isForceStatic: false,
@@ -52,6 +59,7 @@ describe("app page response helpers", () => {
     expect(
       resolveAppPageRscResponsePolicy({
         dynamicUsedDuringBuild: false,
+        isDraftMode: false,
         isDynamicError: false,
         isForceDynamic: true,
         isForceStatic: false,
@@ -65,6 +73,7 @@ describe("app page response helpers", () => {
     expect(
       resolveAppPageRscResponsePolicy({
         dynamicUsedDuringBuild: false,
+        isDraftMode: false,
         isDynamicError: false,
         isForceDynamic: false,
         isForceStatic: false,
@@ -79,6 +88,7 @@ describe("app page response helpers", () => {
     expect(
       resolveAppPageRscResponsePolicy({
         dynamicUsedDuringBuild: false,
+        isDraftMode: false,
         isDynamicError: false,
         isForceDynamic: false,
         isForceStatic: false,
@@ -92,6 +102,7 @@ describe("app page response helpers", () => {
     expect(
       resolveAppPageRscResponsePolicy({
         dynamicUsedDuringBuild: true,
+        isDraftMode: false,
         isDynamicError: false,
         isForceDynamic: false,
         isForceStatic: false,
@@ -103,11 +114,44 @@ describe("app page response helpers", () => {
     });
   });
 
+  it("resolves draft mode response policies as uncacheable", () => {
+    expect(
+      resolveAppPageRscResponsePolicy({
+        dynamicUsedDuringBuild: false,
+        isDraftMode: true,
+        isDynamicError: false,
+        isForceDynamic: false,
+        isForceStatic: false,
+        isProduction: true,
+        revalidateSeconds: 60,
+      }),
+    ).toEqual({
+      cacheControl: "no-store, must-revalidate",
+    });
+
+    expect(
+      resolveAppPageHtmlResponsePolicy({
+        dynamicUsedDuringRender: false,
+        hasScriptNonce: false,
+        isDraftMode: true,
+        isDynamicError: false,
+        isForceDynamic: false,
+        isForceStatic: false,
+        isProduction: true,
+        revalidateSeconds: 60,
+      }),
+    ).toEqual({
+      cacheControl: "no-store, must-revalidate",
+      shouldWriteToCache: false,
+    });
+  });
+
   it("resolves HTML response policy precedence", () => {
     expect(
       resolveAppPageHtmlResponsePolicy({
         dynamicUsedDuringRender: true,
         hasScriptNonce: false,
+        isDraftMode: false,
         isDynamicError: false,
         isForceDynamic: false,
         isForceStatic: false,
@@ -123,6 +167,7 @@ describe("app page response helpers", () => {
       resolveAppPageHtmlResponsePolicy({
         dynamicUsedDuringRender: false,
         hasScriptNonce: false,
+        isDraftMode: false,
         isDynamicError: false,
         isForceDynamic: false,
         isForceStatic: false,
@@ -139,6 +184,7 @@ describe("app page response helpers", () => {
       resolveAppPageHtmlResponsePolicy({
         dynamicUsedDuringRender: false,
         hasScriptNonce: false,
+        isDraftMode: false,
         isDynamicError: false,
         isForceDynamic: false,
         isForceStatic: false,
@@ -157,6 +203,7 @@ describe("app page response helpers", () => {
       resolveAppPageHtmlResponsePolicy({
         dynamicUsedDuringRender: false,
         hasScriptNonce: false,
+        isDraftMode: false,
         isDynamicError: false,
         isForceDynamic: false,
         isForceStatic: false,
@@ -170,10 +217,30 @@ describe("app page response helpers", () => {
     });
   });
 
+  it("treats progressive action HTML responses as no-store", () => {
+    expect(
+      resolveAppPageHtmlResponsePolicy({
+        dynamicUsedDuringRender: false,
+        isProgressiveActionRender: true,
+        hasScriptNonce: false,
+        isDraftMode: false,
+        isDynamicError: false,
+        isForceDynamic: false,
+        isForceStatic: false,
+        isProduction: true,
+        revalidateSeconds: 60,
+      }),
+    ).toEqual({
+      cacheControl: "no-store, must-revalidate",
+      shouldWriteToCache: false,
+    });
+  });
+
   it("treats revalidate = 0 as no-store in RSC response policy", () => {
     expect(
       resolveAppPageRscResponsePolicy({
         dynamicUsedDuringBuild: false,
+        isDraftMode: false,
         isDynamicError: false,
         isForceDynamic: false,
         isForceStatic: false,
@@ -188,6 +255,7 @@ describe("app page response helpers", () => {
     expect(
       resolveAppPageRscResponsePolicy({
         dynamicUsedDuringBuild: false,
+        isDraftMode: false,
         isDynamicError: false,
         isForceDynamic: false,
         isForceStatic: true,
@@ -204,6 +272,7 @@ describe("app page response helpers", () => {
       resolveAppPageHtmlResponsePolicy({
         dynamicUsedDuringRender: false,
         hasScriptNonce: false,
+        isDraftMode: false,
         isDynamicError: false,
         isForceDynamic: false,
         isForceStatic: false,
@@ -220,6 +289,7 @@ describe("app page response helpers", () => {
       resolveAppPageHtmlResponsePolicy({
         dynamicUsedDuringRender: false,
         hasScriptNonce: false,
+        isDraftMode: false,
         isDynamicError: false,
         isForceDynamic: false,
         isForceStatic: true,
@@ -236,6 +306,7 @@ describe("app page response helpers", () => {
     expect(
       resolveAppPageRscResponsePolicy({
         dynamicUsedDuringBuild: false,
+        isDraftMode: false,
         isDynamicError: false,
         isForceDynamic: false,
         isForceStatic: true,
@@ -251,6 +322,7 @@ describe("app page response helpers", () => {
       resolveAppPageHtmlResponsePolicy({
         dynamicUsedDuringRender: false,
         hasScriptNonce: false,
+        isDraftMode: false,
         isDynamicError: false,
         isForceDynamic: false,
         isForceStatic: true,
@@ -269,6 +341,7 @@ describe("app page response helpers", () => {
       resolveAppPageHtmlResponsePolicy({
         dynamicUsedDuringRender: false,
         hasScriptNonce: true,
+        isDraftMode: false,
         isDynamicError: false,
         isForceDynamic: false,
         isForceStatic: false,
@@ -305,13 +378,39 @@ describe("app page response helpers", () => {
     });
 
     expect(response.status).toBe(202);
-    expect(response.headers.get("content-type")).toBe("text/x-component; charset=utf-8");
+    expect(response.headers.get("content-type")).toBe("text/x-component");
     expect(response.headers.get("x-vinext-params")).toBe(encodeURIComponent('{"slug":"test"}'));
     expect(response.headers.get("cache-control")).toBe("private, max-age=5");
     expect(response.headers.get("x-vinext-cache")).toBe("MISS");
-    expect(response.headers.get("vary")).toBe("RSC, Accept, Next-Router-State-Tree");
+    expect(response.headers.get("vary")).toBe(VINEXT_RSC_VARY_HEADER);
     expect(response.headers.get("x-vinext-timing")).toBe("10,5,-1");
     await expect(response.text()).resolves.toBe("flight");
+  });
+
+  it("builds RSC responses with the current compatibility ID header", () => {
+    const response = withEnvVar("__VINEXT_RSC_COMPATIBILITY_ID", "compat-a", () =>
+      buildAppPageRscResponse(createBody("flight"), {
+        middlewareContext: { headers: null, status: null },
+        policy: {},
+      }),
+    );
+
+    expect(response.headers.get(VINEXT_RSC_COMPATIBILITY_ID_HEADER)).toBe("compat-a");
+  });
+
+  it("keeps the framework compatibility ID when middleware sets the internal header", () => {
+    const middlewareHeaders = new Headers({
+      [VINEXT_RSC_COMPATIBILITY_ID_HEADER]: "middleware-compat",
+    });
+
+    const response = withEnvVar("__VINEXT_RSC_COMPATIBILITY_ID", "framework-compat", () =>
+      buildAppPageRscResponse(createBody("flight"), {
+        middlewareContext: { headers: middlewareHeaders, status: null },
+        policy: {},
+      }),
+    );
+
+    expect(response.headers.get(VINEXT_RSC_COMPATIBILITY_ID_HEADER)).toBe("framework-compat");
   });
 
   it("percent-encodes X-Vinext-Params so non-ASCII characters survive the ByteString header constraint (issue #676)", () => {
@@ -365,7 +464,7 @@ describe("app page response helpers", () => {
     expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
     expect(response.headers.get("cache-control")).toBe("private, max-age=5");
     expect(response.headers.get("x-vinext-cache")).toBe("STATIC");
-    expect(response.headers.get("vary")).toBe("RSC, Accept, Next-Router-State-Tree");
+    expect(response.headers.get("vary")).toBe(VINEXT_RSC_VARY_HEADER);
     expect(response.headers.get("link")).toBe(
       "</font.woff2>; rel=preload; as=font; type=font/woff2; crossorigin",
     );
@@ -420,5 +519,45 @@ describe("mergeMiddlewareResponseHeaders", () => {
     mergeMiddlewareResponseHeaders(target, mwHeaders);
 
     expect(target.get("Vary")).toBe("RSC, Accept, Next-Router-State-Tree");
+  });
+
+  it("deduplicates Vary values when appending middleware headers", () => {
+    const target = new Headers({ Vary: VINEXT_RSC_VARY_HEADER });
+    const mwHeaders = new Headers();
+    mwHeaders.set("Vary", "next-router-state-tree, X-Auth-State");
+
+    mergeMiddlewareResponseHeaders(target, mwHeaders);
+
+    expect(target.get("Vary")).toBe(`${VINEXT_RSC_VARY_HEADER}, X-Auth-State`);
+  });
+
+  it("preserves wildcard Vary semantics when appending middleware headers", () => {
+    const target = new Headers({ Vary: "RSC, Accept" });
+    const mwHeaders = new Headers();
+    mwHeaders.set("Vary", "*, X-Auth-State");
+
+    mergeMiddlewareResponseHeaders(target, mwHeaders);
+
+    expect(target.get("Vary")).toBe("*");
+  });
+
+  it("preserves wildcard Vary semantics when target already has Vary wildcard", () => {
+    const target = new Headers({ Vary: "*" });
+    const mwHeaders = new Headers();
+    mwHeaders.set("Vary", "X-Auth-State");
+
+    mergeMiddlewareResponseHeaders(target, mwHeaders);
+
+    expect(target.get("Vary")).toBe("*");
+  });
+
+  it("preserves wildcard Vary semantics when middleware is the first Vary source", () => {
+    const target = new Headers();
+    const mwHeaders = new Headers();
+    mwHeaders.set("Vary", "*, X-Auth-State");
+
+    mergeMiddlewareResponseHeaders(target, mwHeaders);
+
+    expect(target.get("Vary")).toBe("*");
   });
 });

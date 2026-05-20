@@ -97,6 +97,15 @@ export async function middleware(request: NextRequest, event: NextFetchEvent) {
     });
   }
 
+  // Action forward loop test: rewrite POSTs from /nextjs-compat/action-forward-loop
+  // to /nextjs-compat/action-forward-loop-rewrite so the receiving page does not
+  // bundle the action. Without the x-action-forwarded guard, a multi-worker
+  // deployment would loop indefinitely. In vinext's single-worker model, the
+  // guard still fires defensively when the header is injected.
+  if (pathname === "/nextjs-compat/action-forward-loop" && request.method === "POST") {
+    return NextResponse.rewrite(new URL("/nextjs-compat/action-forward-loop-rewrite", request.url));
+  }
+
   // Block /middleware-blocked with custom response
   if (pathname === "/middleware-blocked") {
     return new Response("Blocked by middleware", { status: 403 });
@@ -114,6 +123,19 @@ export async function middleware(request: NextRequest, event: NextFetchEvent) {
     }
     event.waitUntil(Promise.resolve());
     return new Response("Event OK", { status: 200 });
+  }
+
+  if (pathname === "/middleware-fetch-dedupe") {
+    const target = process.env.TEST_FETCH_DEDUPE_TARGET;
+    if (!target) {
+      return Response.json({ error: "missing TEST_FETCH_DEDUPE_TARGET" }, { status: 500 });
+    }
+
+    const first = await fetch(target, { cache: "no-store" });
+    const second = await fetch(target, { cache: "no-store" });
+    const firstBody = (await first.json()) as { count: number };
+    const secondBody = (await second.json()) as { count: number };
+    return Response.json({ counts: [firstBody.count, secondBody.count] });
   }
 
   // Inject mw-before-user=1 cookie for beforeFiles rewrite gating test.
@@ -274,6 +296,7 @@ export const config = {
     "/middleware-blocked",
     "/middleware-throw",
     "/middleware-event",
+    "/middleware-fetch-dedupe",
     "/search-query",
     "/headers/override-from-middleware",
     "/header-override-delete",
@@ -285,6 +308,7 @@ export const config = {
     "/script-manual-nonce",
     "/pages-script-manual-nonce",
     "/nextjs-compat/dynamic/:path*",
+    "/nextjs-compat/action-forward-loop",
     "/use-client-page-pathname/:path*",
     "/rsc-fetch-redirect-src",
     "/rsc-fetch-error-target",

@@ -23,71 +23,62 @@ import { describe, it, expect } from "vite-plus/test";
 
 const BLOCK_MESSAGE = "Next.js has blocked a javascript: URL as a security precaution.";
 
-describe("App Router useRouter() blocks dangerous URI schemes", () => {
+describe("App Router appRouterInstance blocks dangerous URI schemes", () => {
   it("router.push throws on javascript: URL", async () => {
-    const { useRouter } = await import("../packages/vinext/src/shims/navigation.js");
-    const router = useRouter();
-    expect(() => router.push("javascript:alert(1)")).toThrow(BLOCK_MESSAGE);
+    const { appRouterInstance } = await import("../packages/vinext/src/shims/navigation.js");
+    expect(() => appRouterInstance.push("javascript:alert(1)")).toThrow(BLOCK_MESSAGE);
   });
 
   it("router.replace throws on javascript: URL", async () => {
-    const { useRouter } = await import("../packages/vinext/src/shims/navigation.js");
-    const router = useRouter();
-    expect(() => router.replace("javascript:alert(1)")).toThrow(BLOCK_MESSAGE);
+    const { appRouterInstance } = await import("../packages/vinext/src/shims/navigation.js");
+    expect(() => appRouterInstance.replace("javascript:alert(1)")).toThrow(BLOCK_MESSAGE);
   });
 
   it("router.prefetch throws on javascript: URL", async () => {
-    const { useRouter } = await import("../packages/vinext/src/shims/navigation.js");
-    const router = useRouter();
-    expect(() => router.prefetch("javascript:alert(1)")).toThrow(BLOCK_MESSAGE);
+    const { appRouterInstance } = await import("../packages/vinext/src/shims/navigation.js");
+    expect(() => appRouterInstance.prefetch("javascript:alert(1)")).toThrow(BLOCK_MESSAGE);
   });
 
   it("router.push throws on data: URL", async () => {
-    const { useRouter } = await import("../packages/vinext/src/shims/navigation.js");
-    const router = useRouter();
-    expect(() => router.push("data:text/html,<script>alert(1)</script>")).toThrow(BLOCK_MESSAGE);
+    const { appRouterInstance } = await import("../packages/vinext/src/shims/navigation.js");
+    expect(() => appRouterInstance.push("data:text/html,<script>alert(1)</script>")).toThrow(
+      BLOCK_MESSAGE,
+    );
   });
 
   it("router.push throws on vbscript: URL", async () => {
-    const { useRouter } = await import("../packages/vinext/src/shims/navigation.js");
-    const router = useRouter();
-    expect(() => router.push("vbscript:MsgBox(1)")).toThrow(BLOCK_MESSAGE);
+    const { appRouterInstance } = await import("../packages/vinext/src/shims/navigation.js");
+    expect(() => appRouterInstance.push("vbscript:MsgBox(1)")).toThrow(BLOCK_MESSAGE);
   });
 
   it("router.push throws on obfuscated javascript: URL with embedded tabs", async () => {
-    const { useRouter } = await import("../packages/vinext/src/shims/navigation.js");
-    const router = useRouter();
-    expect(() => router.push("java\tscript:alert(1)")).toThrow(BLOCK_MESSAGE);
+    const { appRouterInstance } = await import("../packages/vinext/src/shims/navigation.js");
+    expect(() => appRouterInstance.push("java\tscript:alert(1)")).toThrow(BLOCK_MESSAGE);
   });
 
   it("router.push throws on uppercase JAVASCRIPT: URL", async () => {
-    const { useRouter } = await import("../packages/vinext/src/shims/navigation.js");
-    const router = useRouter();
-    expect(() => router.push("JAVASCRIPT:alert(1)")).toThrow(BLOCK_MESSAGE);
+    const { appRouterInstance } = await import("../packages/vinext/src/shims/navigation.js");
+    expect(() => appRouterInstance.push("JAVASCRIPT:alert(1)")).toThrow(BLOCK_MESSAGE);
   });
 
   it("router.push throws on leading-whitespace javascript: URL", async () => {
-    const { useRouter } = await import("../packages/vinext/src/shims/navigation.js");
-    const router = useRouter();
-    expect(() => router.push("   javascript:alert(1)")).toThrow(BLOCK_MESSAGE);
+    const { appRouterInstance } = await import("../packages/vinext/src/shims/navigation.js");
+    expect(() => appRouterInstance.push("   javascript:alert(1)")).toThrow(BLOCK_MESSAGE);
   });
 
   // Safe URLs must not throw — guard must not over-block.
   it("router.push does not throw on a normal pathname", async () => {
-    const { useRouter } = await import("../packages/vinext/src/shims/navigation.js");
-    const router = useRouter();
-    expect(() => router.push("/safe")).not.toThrow();
+    const { appRouterInstance } = await import("../packages/vinext/src/shims/navigation.js");
+    expect(() => appRouterInstance.push("/safe")).not.toThrow();
   });
 
   it("router.replace does not throw on absolute https URL", async () => {
-    const { useRouter } = await import("../packages/vinext/src/shims/navigation.js");
-    const router = useRouter();
-    expect(() => router.replace("https://example.com/path")).not.toThrow();
+    const { appRouterInstance } = await import("../packages/vinext/src/shims/navigation.js");
+    expect(() => appRouterInstance.replace("https://example.com/path")).not.toThrow();
   });
 
   it("router.prefetch does not throw on a normal pathname", async () => {
-    const { useRouter } = await import("../packages/vinext/src/shims/navigation.js");
-    const router = useRouter();
-    expect(() => router.prefetch("/safe")).not.toThrow();
+    const { appRouterInstance } = await import("../packages/vinext/src/shims/navigation.js");
+    expect(() => appRouterInstance.prefetch("/safe")).not.toThrow();
   });
 });

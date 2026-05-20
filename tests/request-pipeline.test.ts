@@ -2,8 +2,11 @@ import { describe, it, expect } from "vite-plus/test";
 import {
   applyConfigHeadersToHeaderRecord,
   applyConfigHeadersToResponse,
+  cloneRequestWithHeaders,
   createStaticFileSignal,
+  filterInternalHeaders,
   guardProtocolRelativeUrl,
+  INTERNAL_HEADERS,
   isOpenRedirectShaped,
   hasBasePath,
   stripBasePath,
@@ -14,6 +17,7 @@ import {
   validateImageUrl,
   processMiddlewareHeaders,
 } from "../packages/vinext/src/server/request-pipeline.js";
+import { buildRequestHeadersFromMiddlewareResponse } from "../packages/vinext/src/server/middleware-request-headers.js";
 
 // ── guardProtocolRelativeUrl ────────────────────────────────────────────
 
@@ -334,6 +338,28 @@ describe("normalizeTrailingSlash", () => {
     expect(res!.headers.get("Location")).toBe("/about/?foo=1");
   });
 
+  it("strips the trailing slash from file-looking paths when trailingSlash is true", () => {
+    const res = normalizeTrailingSlash("/catch-all/hello.world/", "", true, "");
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(308);
+    expect(res!.headers.get("Location")).toBe("/catch-all/hello.world");
+  });
+
+  it("preserves query string when stripping file-looking paths with trailingSlash true", () => {
+    const res = normalizeTrailingSlash("/catch-all/hello.world/", "", true, "?hello=world");
+    expect(res).not.toBeNull();
+    expect(res!.headers.get("Location")).toBe("/catch-all/hello.world?hello=world");
+  });
+
+  it("does not add a slash to already-canonical file-looking paths with trailingSlash true", () => {
+    expect(normalizeTrailingSlash("/catch-all/hello.world", "", true, "")).toBeNull();
+  });
+
+  it("does not redirect .well-known paths when trailingSlash is true", () => {
+    expect(normalizeTrailingSlash("/.well-known/acme-challenge", "", true, "")).toBeNull();
+    expect(normalizeTrailingSlash("/.well-known/acme-challenge/", "", true, "")).toBeNull();
+  });
+
   it("prepends basePath to redirect Location", () => {
     const res = normalizeTrailingSlash("/about", "/docs", true, "");
     expect(res!.headers.get("Location")).toBe("/docs/about/");
@@ -636,5 +662,253 @@ describe("processMiddlewareHeaders", () => {
     processMiddlewareHeaders(headers);
     expect(headers.get("content-type")).toBe("text/html");
     expect(headers.get("x-custom")).toBe("keep");
+  });
+});
+
+// ── INTERNAL_HEADERS / filterInternalHeaders ─────────────────────────────
+//
+// Ported from Next.js INTERNAL_HEADERS:
+// https://github.com/vercel/next.js/blob/canary/packages/next/src/server/lib/server-ipc/utils.ts
+//
+// Next.js strips these via filterInternalHeaders() at the router-server
+// entry point before any handler sees the request:
+// https://github.com/vercel/next.js/blob/canary/packages/next/src/server/lib/router-server.ts
+
+describe("INTERNAL_HEADERS", () => {
+  it("matches Next.js's exact header list", () => {
+    // Keep in sync with Next.js:
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/lib/server-ipc/utils.ts
+    const expected = [
+      "x-middleware-rewrite",
+      "x-middleware-redirect",
+      "x-middleware-set-cookie",
+      "x-middleware-skip",
+      "x-middleware-override-headers",
+      "x-middleware-next",
+      "x-now-route-matches",
+      "x-matched-path",
+      "x-nextjs-data",
+      "x-next-resume-state-length",
+      "x-action-forwarded",
+    ];
+    expect(INTERNAL_HEADERS).toEqual(expected);
+  });
+});
+
+describe("filterInternalHeaders", () => {
+  it("strips all INTERNAL_HEADERS from the Headers object", () => {
+    const headers = new Headers();
+    for (const name of INTERNAL_HEADERS) {
+      headers.set(name, "forged");
+    }
+    headers.set("user-agent", "test");
+    headers.set("cookie", "session=abc");
+
+    const result = filterInternalHeaders(headers);
+
+    // Original is unchanged (function returns a new copy, never mutates)
+    for (const name of INTERNAL_HEADERS) {
+      expect(headers.has(name)).toBe(true);
+    }
+    // Result has internal headers stripped
+    for (const name of INTERNAL_HEADERS) {
+      expect(result.has(name)).toBe(false);
+    }
+    expect(result.get("user-agent")).toBe("test");
+    expect(result.get("cookie")).toBe("session=abc");
+  });
+
+  it("strips headers case-insensitively", () => {
+    const headers = new Headers();
+    headers.set("X-Nextjs-Data", "1");
+    headers.set("X-Matched-Path", "/admin");
+    const result = filterInternalHeaders(headers);
+    expect(result.has("X-Nextjs-Data")).toBe(false);
+    expect(result.has("x-nextjs-data")).toBe(false);
+    expect(result.has("X-Matched-Path")).toBe(false);
+    expect(result.has("x-matched-path")).toBe(false);
+  });
+
+  it("is a no-op when no internal headers are present", () => {
+    const headers = new Headers();
+    headers.set("user-agent", "test");
+    headers.set("accept", "text/html");
+    const result = filterInternalHeaders(headers);
+    expect(result.get("user-agent")).toBe("test");
+    expect(result.get("accept")).toBe("text/html");
+    expect(result.has("x-nextjs-data")).toBe(false);
+    expect(result.has("x-matched-path")).toBe(false);
+    // Original headers are preserved
+    expect(headers.get("user-agent")).toBe("test");
+    expect(headers.get("accept")).toBe("text/html");
+  });
+
+  it("strips a subset of internal headers while preserving others", () => {
+    const headers = new Headers({
+      "x-nextjs-data": "1",
+      "x-matched-path": "/admin",
+      "x-custom": "keep-me",
+      "x-forwarded-for": "10.0.0.1",
+    });
+    const result = filterInternalHeaders(headers);
+    expect(result.has("x-nextjs-data")).toBe(false);
+    expect(result.has("x-matched-path")).toBe(false);
+    expect(result.get("x-custom")).toBe("keep-me");
+    expect(result.get("x-forwarded-for")).toBe("10.0.0.1");
+  });
+
+  it("strips x-middleware-rewrite forged as a request header", () => {
+    const headers = new Headers({
+      "x-middleware-rewrite": "/evil/admin",
+      "x-middleware-next": "1",
+      cookie: "auth=valid",
+    });
+    const result = filterInternalHeaders(headers);
+    expect(result.has("x-middleware-rewrite")).toBe(false);
+    expect(result.has("x-middleware-next")).toBe(false);
+    expect(result.get("cookie")).toBe("auth=valid");
+  });
+
+  it("works on an empty Headers object", () => {
+    const headers = new Headers();
+    const result = filterInternalHeaders(headers);
+    expect([...result.keys()]).toEqual([]);
+  });
+});
+
+describe("buildRequestHeadersFromMiddlewareResponse", () => {
+  it("preserves credential headers when applying partial middleware override headers", () => {
+    const baseHeaders = new Headers({
+      authorization: "Bearer token",
+      cookie: "session=abc",
+      "x-keep": "original",
+    });
+    const middlewareHeaders = new Headers({
+      "x-middleware-override-headers": "x-added",
+      "x-middleware-request-x-added": "1",
+    });
+
+    const result = buildRequestHeadersFromMiddlewareResponse(baseHeaders, middlewareHeaders, {
+      preserveCredentialHeaders: true,
+    });
+
+    expect(result).not.toBeNull();
+    expect(result!.get("authorization")).toBe("Bearer token");
+    expect(result!.get("cookie")).toBe("session=abc");
+    expect(result!.get("x-added")).toBe("1");
+    expect(result!.get("x-keep")).toBeNull();
+  });
+
+  it("deletes credential headers when middleware explicitly omits their forwarded values", () => {
+    const baseHeaders = new Headers({
+      authorization: "Bearer token",
+      cookie: "session=abc",
+      "x-keep": "original",
+    });
+    const middlewareHeaders = new Headers({
+      "x-middleware-override-headers": "authorization,cookie,x-keep",
+      "x-middleware-request-x-keep": "updated",
+    });
+
+    const result = buildRequestHeadersFromMiddlewareResponse(baseHeaders, middlewareHeaders);
+
+    expect(result).not.toBeNull();
+    expect(result!.get("authorization")).toBeNull();
+    expect(result!.get("cookie")).toBeNull();
+    expect(result!.get("x-keep")).toBe("updated");
+  });
+});
+
+// ── cloneRequestWithHeaders ──────────────────────────────────────────────
+//
+// The Request-constructor pattern `new Request(request, { headers })` preserves
+// metadata in Workers (redirect, signal, cf) but can throw in Node/undici when
+// the input is a foreign Request instance (cross-realm or subclass). The helper
+// falls back to a manual RequestInit that copies every known metadata field.
+//
+// These tests lock down the helper so it can't be "simplified" back into the
+// broken URL-constructor pattern that drops body/redirect/signal semantics.
+
+describe("cloneRequestWithHeaders", () => {
+  it("preserves method", () => {
+    const original = new Request("http://localhost/test", { method: "POST" });
+    const cloned = cloneRequestWithHeaders(original, new Headers({ "x-foo": "bar" }));
+    expect(cloned.method).toBe("POST");
+  });
+
+  it("preserves URL", () => {
+    const original = new Request("http://localhost/some/path?q=1");
+    const cloned = cloneRequestWithHeaders(original, new Headers());
+    expect(cloned.url).toBe("http://localhost/some/path?q=1");
+  });
+
+  it("preserves redirect mode", () => {
+    const original = new Request("http://localhost", { redirect: "manual" });
+    const cloned = cloneRequestWithHeaders(original, new Headers());
+    expect(cloned.redirect).toBe("manual");
+  });
+
+  it("preserves signal", () => {
+    const controller = new AbortController();
+    const original = new Request("http://localhost", { signal: controller.signal });
+    const cloned = cloneRequestWithHeaders(original, new Headers());
+    // Signal identity is not guaranteed (new Request may create a following signal).
+    // But both signals share the same aborted state at construction time.
+    expect(cloned.signal.aborted).toBe(false);
+    controller.abort();
+    expect(cloned.signal.aborted).toBe(true);
+  });
+
+  it("preserves body readability for streaming requests", async () => {
+    const bodyText = "hello world";
+    const original = new Request("http://localhost", {
+      method: "POST",
+      body: bodyText,
+    });
+    const cloned = cloneRequestWithHeaders(original, new Headers());
+    expect(cloned.method).toBe("POST");
+    const text = await cloned.text();
+    expect(text).toBe(bodyText);
+  });
+
+  it("preserves cf property when defined via Object.defineProperty", () => {
+    const original = new Request("http://localhost");
+    Object.defineProperty(original, "cf", {
+      value: { country: "US" },
+      enumerable: true,
+      configurable: true,
+    });
+    const cloned = cloneRequestWithHeaders(original, new Headers());
+    expect(Reflect.get(cloned, "cf")).toEqual({ country: "US" });
+  });
+
+  it("replaces headers while preserving all other metadata", () => {
+    const controller = new AbortController();
+    const original = new Request("http://localhost/path?x=1", {
+      method: "PUT",
+      headers: new Headers({ "x-old": "remove-me", "keep-me": "val" }),
+      redirect: "error",
+      signal: controller.signal,
+    });
+    const newHeaders = new Headers({ "x-new": "added", "keep-me": "still-here" });
+    const cloned = cloneRequestWithHeaders(original, newHeaders);
+
+    // Headers replaced
+    expect(cloned.headers.get("x-old")).toBeNull();
+    expect(cloned.headers.get("keep-me")).toBe("still-here");
+    expect(cloned.headers.get("x-new")).toBe("added");
+    // Metadata preserved
+    expect(cloned.method).toBe("PUT");
+    expect(cloned.url).toBe("http://localhost/path?x=1");
+    expect(cloned.redirect).toBe("error");
+    expect(cloned.signal.aborted).toBe(false);
+  });
+
+  it("handles GET request (no body) correctly", () => {
+    const original = new Request("http://localhost", { method: "GET" });
+    const cloned = cloneRequestWithHeaders(original, new Headers({ accept: "text/html" }));
+    expect(cloned.method).toBe("GET");
+    expect(cloned.body).toBeNull();
+    expect(cloned.headers.get("accept")).toBe("text/html");
   });
 });

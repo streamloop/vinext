@@ -1,5 +1,7 @@
 import type { AppPageSpecialError } from "./app-page-execution.js";
+import { runWithFetchDedupe } from "vinext/shims/fetch-cache";
 import { getAppPageSegmentParamName } from "./app-page-params.js";
+import { notFoundResponse } from "./http-error-responses.js";
 
 type AppPageParams = Record<string, string | string[]>;
 type GenerateStaticParams = (args: { params: AppPageParams }) => unknown;
@@ -22,7 +24,6 @@ export type ValidateAppPageDynamicParamsOptions = {
     | readonly (GenerateStaticParams | GenerateStaticParamsSource | null | undefined)[]
     | null;
   isDynamicRoute: boolean;
-  logGenerateStaticParamsError?: (error: unknown) => void;
   params: AppPageParams;
 };
 
@@ -48,6 +49,7 @@ type BuildAppPageElementResult<TElement> = {
 type AppPageInterceptMatch<TPage = unknown> = {
   matchedParams: AppPageParams;
   page: TPage;
+  slotId?: string | null;
   slotKey: string;
   sourceRouteIndex: number;
 };
@@ -254,21 +256,19 @@ export async function validateAppPageDynamicParams(
   const generateStaticParamsSources = normalizeGenerateStaticParams(options.generateStaticParams);
   if (generateStaticParamsSources.length === 0) {
     options.clearRequestContext();
-    return new Response("Not Found", { status: 404 });
+    return notFoundResponse();
   }
 
-  try {
-    for (const source of generateStaticParamsSources) {
-      const staticParams = await source.generateStaticParams({
+  for (const source of generateStaticParamsSources) {
+    const staticParams = await runWithFetchDedupe(() =>
+      source.generateStaticParams({
         params: pickRouteParams(options.params, source.parentParamNames),
-      });
-      if (Array.isArray(staticParams) && !areStaticParamsAllowed(options.params, staticParams)) {
-        options.clearRequestContext();
-        return new Response("Not Found", { status: 404 });
-      }
+      }),
+    );
+    if (Array.isArray(staticParams) && !areStaticParamsAllowed(options.params, staticParams)) {
+      options.clearRequestContext();
+      return notFoundResponse();
     }
-  } catch (error) {
-    options.logGenerateStaticParamsError?.(error);
   }
 
   return null;

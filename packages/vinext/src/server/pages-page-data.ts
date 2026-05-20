@@ -1,7 +1,9 @@
 import type { ReactNode } from "react";
 import type { Route } from "../routing/pages-router.js";
+import { normalizeStaticPathname } from "../routing/route-pattern.js";
 import type { CachedPagesValue, CacheControlMetadata } from "vinext/shims/cache";
 import { buildCachedRevalidateCacheControl } from "./cache-control.js";
+import { VINEXT_CACHE_HEADER } from "./headers.js";
 import { buildPagesCacheValue, type ISRCacheEntry } from "./isr-cache.js";
 import {
   buildPagesNextDataScript,
@@ -15,9 +17,14 @@ type PagesRedirectResult = {
   statusCode?: number;
 };
 
-type PagesStaticPathsEntry = {
-  params: Record<string, unknown>;
-};
+// Next.js allows `paths` entries to be either an object with a `params` key
+// or a raw string path. We keep a local variant of `StaticPathsEntry` here
+// because at request time we compare against the actual request `params`
+// (whose value type is `unknown` from the route matcher) rather than the
+// `string | string[]` shape used at build time. The shared
+// `normalizeStaticPathname` helper from `../routing/route-pattern.js` is used
+// to canonicalize the string-entry comparison.
+type PagesStaticPathsEntry = string | { params?: Record<string, unknown>; locale?: string };
 
 type PagesStaticPathsResult = {
   fallback?: boolean | "blocking";
@@ -143,11 +150,34 @@ function resolvePagesRedirectStatus(redirect: PagesRedirectResult): number {
   return redirect.statusCode != null ? redirect.statusCode : redirect.permanent ? 308 : 307;
 }
 
+/**
+ * Compare a `getStaticPaths` entry against the actual request params.
+ *
+ * Handles both shapes Next.js allows:
+ *   - { params: { ... } }
+ *   - "string-path"
+ *
+ * For a string entry, compare the entry against the current request URL using
+ * the shared `normalizeStaticPathname` helper from
+ * `../routing/route-pattern.ts` (which mirrors the Next.js
+ * `removeTrailingSlash` behaviour in
+ * `.nextjs-ref/packages/next/src/build/static-paths/pages.ts`). For an object
+ * entry with a missing `params` key, return false rather than throwing — the
+ * caller will respond with a 404 just like Next.js does for unlisted paths.
+ */
 function matchesPagesStaticPath(
   pathEntry: PagesStaticPathsEntry,
   params: Record<string, unknown>,
+  routeUrl: string,
 ): boolean {
-  return Object.entries(pathEntry.params).every(([key, value]) => {
+  if (typeof pathEntry === "string") {
+    return normalizeStaticPathname(pathEntry) === normalizeStaticPathname(routeUrl);
+  }
+  const entryParams = pathEntry.params;
+  if (entryParams === undefined || entryParams === null) {
+    return false;
+  }
+  return Object.entries(entryParams).every(([key, value]) => {
     const actual = params[key];
     if (Array.isArray(value)) {
       return Array.isArray(actual) && value.join("/") === actual.join("/");
@@ -172,7 +202,7 @@ function buildPagesCacheResponse(
     cacheControl === undefined ? undefined : (cacheControl.expire ?? expireSeconds);
   const headers: Record<string, string> = {
     "Content-Type": "text/html",
-    "X-Vinext-Cache": cacheState,
+    [VINEXT_CACHE_HEADER]: cacheState,
     "Cache-Control": buildCachedRevalidateCacheControl(
       cacheState,
       effectiveRevalidateSeconds,
@@ -252,7 +282,7 @@ export async function resolvePagesPageData(
     if (fallback === false) {
       const paths = pathsResult?.paths ?? [];
       const isValidPath = paths.some((pathEntry) =>
-        matchesPagesStaticPath(pathEntry, options.params),
+        matchesPagesStaticPath(pathEntry, options.params, options.routeUrl),
       );
 
       if (!isValidPath) {

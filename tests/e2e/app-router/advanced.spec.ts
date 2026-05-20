@@ -1,12 +1,7 @@
 import { test, expect } from "@playwright/test";
+import { waitForAppRouterHydration } from "../helpers";
 
 const BASE = "http://localhost:4174";
-
-async function waitForAppRouterHydration(page: import("@playwright/test").Page) {
-  await page.waitForFunction(() => typeof window.__VINEXT_RSC_NAVIGATE__ === "function", null, {
-    timeout: 10_000,
-  });
-}
 
 test.describe("Parallel Routes", () => {
   test("dashboard renders all parallel slot content", async ({ page }) => {
@@ -40,6 +35,31 @@ test.describe("Parallel Routes", () => {
     await expect(page.locator('[data-testid="analytics-default"]')).toBeVisible();
 
     // Should NOT contain the slot page.tsx content
+    await expect(page.locator('[data-testid="team-slot"]')).not.toBeVisible();
+    await expect(page.locator('[data-testid="analytics-slot"]')).not.toBeVisible();
+  });
+
+  test("soft navigation preserves active parallel slot content over target defaults", async ({
+    page,
+  }) => {
+    await page.goto(`${BASE}/dashboard`);
+    await waitForAppRouterHydration(page);
+
+    await expect(page.locator('[data-testid="team-slot"]')).toBeVisible();
+    await expect(page.locator('[data-testid="analytics-slot"]')).toBeVisible();
+
+    await page.click('[data-testid="dash-settings-link"]');
+    await expect(page).toHaveURL(`${BASE}/dashboard/settings`);
+    await expect(page.locator("h1")).toHaveText("Settings");
+    await expect(page.locator('[data-testid="team-slot"]')).toBeVisible();
+    await expect(page.locator('[data-testid="analytics-slot"]')).toBeVisible();
+    await expect(page.locator('[data-testid="team-default"]')).not.toBeVisible();
+    await expect(page.locator('[data-testid="analytics-default"]')).not.toBeVisible();
+
+    await page.reload();
+    await waitForAppRouterHydration(page);
+    await expect(page.locator('[data-testid="team-default"]')).toBeVisible();
+    await expect(page.locator('[data-testid="analytics-default"]')).toBeVisible();
     await expect(page.locator('[data-testid="team-slot"]')).not.toBeVisible();
     await expect(page.locator('[data-testid="analytics-slot"]')).not.toBeVisible();
   });
@@ -109,6 +129,31 @@ test.describe("Intercepting Routes", () => {
     await expect(page.locator('[data-testid="photo-page"]')).not.toBeVisible();
   });
 
+  test("refresh after chained intercepted navigation keeps the proven source context", async ({
+    page,
+  }) => {
+    // Same user-visible contract as Next.js intercepted refresh coverage:
+    // test/e2e/app-dir/parallel-routes-revalidation/parallel-routes-revalidation.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/parallel-routes-revalidation/parallel-routes-revalidation.test.ts
+    await page.goto(`${BASE}/feed`);
+    await waitForAppRouterHydration(page);
+
+    await page.click("#feed-photo-42-link");
+    await expect(page.locator('[data-testid="photo-modal"]')).toContainText("Viewing photo 42");
+
+    await page.click("#modal-photo-43-link");
+    await expect(page.locator('[data-testid="photo-modal"]')).toContainText("Viewing photo 43");
+    await expect(page.locator('[data-testid="feed-page"]')).toBeVisible();
+    await expect(page.locator('[data-testid="photo-page"]')).not.toBeVisible();
+
+    await page.click('[data-testid="photo-modal-refresh"]');
+
+    await expect(page.locator('[data-testid="photo-modal"]')).toContainText("Viewing photo 43");
+    await expect(page.locator('[data-testid="feed-page"]')).toBeVisible();
+    await expect(page.locator('[data-testid="photo-page"]')).not.toBeVisible();
+    expect(new URL(page.url()).pathname).toBe("/photos/43");
+  });
+
   test("refresh on direct photo load preserves the full-page render", async ({ page }) => {
     await page.goto(`${BASE}/photos/42`);
     await expect(page.locator('[data-testid="photo-page"]')).toBeVisible();
@@ -118,6 +163,71 @@ test.describe("Intercepting Routes", () => {
 
     await expect(page.locator('[data-testid="photo-page"]')).toBeVisible();
     await expect(page.locator('[data-testid="photo-modal"]')).not.toBeVisible();
+  });
+
+  test("refresh on direct target clears stale intercepted history context", async ({ page }) => {
+    const refreshInterceptionHeaders: Array<string | null> = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (url.pathname === "/photos/42.rsc") {
+        refreshInterceptionHeaders.push(request.headers()["x-vinext-interception-context"] ?? null);
+      }
+    });
+
+    await page.goto(`${BASE}/photos/42`);
+    await waitForAppRouterHydration(page);
+    await expect(page.locator('[data-testid="photo-page"]')).toBeVisible();
+
+    await page.evaluate(() => {
+      const currentState = window.history.state;
+      const nextState =
+        currentState && typeof currentState === "object" ? Object.assign({}, currentState) : {};
+      Reflect.set(nextState, "__vinext_previousNextUrl", "/feed");
+      window.history.replaceState(nextState, "", window.location.href);
+    });
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const currentState = window.history.state;
+          if (!currentState || typeof currentState !== "object") return null;
+          const value = Reflect.get(currentState, "__vinext_previousNextUrl");
+          return typeof value === "string" ? value : null;
+        }),
+      )
+      .toBe("/feed");
+
+    await page.evaluate(async () => {
+      const runtime = Reflect.get(window, Symbol.for("vinext.navigationRuntime"));
+      const navigate =
+        typeof runtime === "object" &&
+        runtime !== null &&
+        "functions" in runtime &&
+        typeof runtime.functions === "object" &&
+        runtime.functions !== null &&
+        "navigate" in runtime.functions &&
+        typeof runtime.functions.navigate === "function"
+          ? runtime.functions.navigate
+          : null;
+      if (typeof navigate !== "function") {
+        throw new Error("Expected Vinext RSC navigation executor to be installed");
+      }
+      await navigate(window.location.href, 0, "refresh", undefined, undefined, true);
+    });
+
+    await expect.poll(() => refreshInterceptionHeaders.length).toBeGreaterThan(0);
+    expect(refreshInterceptionHeaders.at(-1)).toBeNull();
+    await expect(page.locator('[data-testid="photo-page"]')).toBeVisible();
+    await expect(page.locator('[data-testid="photo-modal"]')).not.toBeVisible();
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const currentState = window.history.state;
+          if (!currentState || typeof currentState !== "object") return null;
+          const value = Reflect.get(currentState, "__vinext_previousNextUrl");
+          return typeof value === "string" ? value : null;
+        }),
+      )
+      .toBeNull();
   });
 
   test("hard reload after intercepted navigation renders the full page", async ({ page }) => {
@@ -269,35 +379,6 @@ test.describe("Intercepting Routes", () => {
     await expect(page.locator('[data-testid="photo-modal"]')).toBeVisible();
     await expect(page.locator('[data-testid="feed-page"]')).toBeVisible();
     await expect(page.locator('[data-testid="photo-page"]')).not.toBeVisible();
-  });
-
-  test("prefetches keep separate cache entries for feed and gallery interception contexts", async ({
-    page,
-  }) => {
-    await page.goto(`${BASE}/feed`);
-    await waitForAppRouterHydration(page);
-    await expect
-      .poll(async () =>
-        page.evaluate(() =>
-          Array.from(window.__VINEXT_RSC_PREFETCH_CACHE__?.keys() ?? []).filter((key) =>
-            key.includes("/photos/42.rsc"),
-          ),
-        ),
-      )
-      .toEqual(["/photos/42.rsc\u0000/feed"]);
-
-    await page.click("#gallery-link");
-    await page.waitForURL(`${BASE}/gallery`);
-    await waitForAppRouterHydration(page);
-    await expect
-      .poll(async () =>
-        page.evaluate(() =>
-          Array.from(window.__VINEXT_RSC_PREFETCH_CACHE__?.keys() ?? [])
-            .filter((key) => key.includes("/photos/42.rsc"))
-            .sort(),
-        ),
-      )
-      .toEqual(["/photos/42.rsc\u0000/feed", "/photos/42.rsc\u0000/gallery"]);
   });
 });
 

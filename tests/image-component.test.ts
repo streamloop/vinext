@@ -8,7 +8,7 @@
  * Tests SSR output, srcSet generation, getImageProps(), fill mode,
  * priority, custom loader, and static image data handling.
  */
-import { describe, it, expect } from "vite-plus/test";
+import { describe, it, expect, vi, afterEach } from "vite-plus/test";
 import React from "react";
 import ReactDOMServer from "react-dom/server";
 import Image, { getImageProps, type StaticImageData } from "../packages/vinext/src/shims/image.js";
@@ -44,7 +44,7 @@ describe("Image SSR rendering", () => {
     expect(html).toContain('data-nimg="1"');
   });
 
-  it("renders with priority (eager loading + fetchpriority)", () => {
+  it("renders with priority (preload + eager loading + fetchpriority)", () => {
     const html = ReactDOMServer.renderToString(
       React.createElement(Image, {
         alt: "priority image",
@@ -54,9 +54,34 @@ describe("Image SSR rendering", () => {
         priority: true,
       }),
     );
+    // Ported from Next.js:
+    // .nextjs-ref/test/e2e/next-image-new/app-dir/app-dir-static.test.ts
+    // .nextjs-ref/packages/next/src/client/image-component.tsx
+    expect(html).toContain('<link rel="preload"');
+    expect(html).toContain('as="image"');
+    expect(html).toContain('fetchPriority="high"');
+    expect(html).toContain(`imageSrcSet="${optUrlHtml("/hero.png", 640)} 640w`);
+    expect(html).not.toContain(`href="${optUrlHtml("/hero.png", 800)}"`);
     expect(html).toContain('loading="eager"');
     expect(html).toContain('fetchPriority="high"');
     expect(html).not.toContain('loading="lazy"');
+  });
+
+  it("renders an image preload for the modern preload prop", () => {
+    const html = ReactDOMServer.renderToString(
+      React.createElement(Image, {
+        alt: "preloaded image",
+        src: "/hero-preload.png",
+        width: 800,
+        height: 600,
+        preload: true,
+      }),
+    );
+    expect(html).toContain('<link rel="preload"');
+    expect(html).toContain('as="image"');
+    expect(html).toContain(`imageSrcSet="${optUrlHtml("/hero-preload.png", 640)} 640w`);
+    expect(html).not.toContain('loading="lazy"');
+    expect(html).not.toContain('fetchPriority="high"');
   });
 
   it("renders fill mode with absolute positioning", () => {
@@ -76,6 +101,27 @@ describe("Image SSR rendering", () => {
     expect(html).toContain("height:100%");
     expect(html).toContain('data-nimg="fill"');
     // Fill defaults sizes to 100vw
+    expect(html).toContain('sizes="100vw"');
+  });
+
+  it("renders remote fill mode with absolute positioning", () => {
+    // Ported from Next.js: test/unit/next-image-get-img-props.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/unit/next-image-get-img-props.test.ts
+    const html = ReactDOMServer.renderToString(
+      React.createElement(Image, {
+        alt: "remote fill image",
+        src: "https://images.unsplash.com/photo-fill",
+        fill: true,
+      }),
+    );
+    // Remote fill must preserve the same layout contract as local fill:
+    // the DOM img is absolutely positioned and marked as data-nimg="fill".
+    expect(html).not.toMatch(/width="\d+"/);
+    expect(html).not.toMatch(/height="\d+"/);
+    expect(html).toContain("position:absolute");
+    expect(html).toContain("width:100%");
+    expect(html).toContain("height:100%");
+    expect(html).toContain('data-nimg="fill"');
     expect(html).toContain('sizes="100vw"');
   });
 
@@ -158,6 +204,30 @@ describe("Image SSR rendering", () => {
     );
     expect(html).toContain('class="hero-img"');
     expect(html).toContain("border-radius:8px");
+  });
+
+  it("preserves custom style for remote images with width and height", () => {
+    // Next.js computes a single imgAttributes.style object in getImgProps and
+    // passes it through to the rendered <img>.
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/shared/lib/get-img-props.ts
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/client/image-component.tsx
+    const html = ReactDOMServer.renderToString(
+      React.createElement(Image, {
+        alt: "remote styled",
+        src: "https://images.unsplash.com/photo-style",
+        width: 400,
+        height: 300,
+        style: {
+          borderRadius: "12px",
+          objectPosition: "left center",
+          transform: "scale(0.9)",
+        },
+      }),
+    );
+
+    expect(html).toContain("border-radius:12px");
+    expect(html).toContain("object-position:left center");
+    expect(html).toContain("transform:scale(0.9)");
   });
 });
 
@@ -776,5 +846,129 @@ describe("onLoad / onError handler attachment (SSR)", () => {
     );
     expect(html).toContain("<img");
     expect(html).toContain('alt="remote events"');
+  });
+});
+
+// ─── dangerouslyAllowLocalIP / private-IP guard ─────────────────────────
+// Ported from Next.js: test/unit/image-optimizer/fetch-external-image.test.ts
+// https://github.com/vercel/next.js/blob/canary/test/unit/image-optimizer/fetch-external-image.test.ts
+
+describe("dangerouslyAllowLocalIP private-IP guard", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    delete process.env.__VINEXT_IMAGE_REMOTE_PATTERNS;
+    delete process.env.__VINEXT_IMAGE_DOMAINS;
+    delete process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_LOCAL_IP;
+  });
+
+  it("blocks private-IP remote URLs in production (Image returns null)", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    process.env.__VINEXT_IMAGE_REMOTE_PATTERNS = JSON.stringify([{ hostname: "**" }]);
+    process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_LOCAL_IP = "false";
+
+    // Module-level constants in image.tsx are evaluated at import time from
+    // process.env, so we must re-evaluate the module after changing env.
+    vi.resetModules();
+    const { default: PrivateIpImage } = await import("../packages/vinext/src/shims/image.js");
+
+    const html = ReactDOMServer.renderToString(
+      React.createElement(PrivateIpImage, {
+        alt: "private ip",
+        src: "http://127.0.0.1/photo.jpg",
+        width: 400,
+        height: 300,
+      }),
+    );
+    // Production: blocked → no img tag rendered
+    expect(html).not.toContain("<img");
+  });
+
+  it("blocks private-IP remote URLs in production (getImageProps returns empty src)", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    process.env.__VINEXT_IMAGE_REMOTE_PATTERNS = JSON.stringify([{ hostname: "**" }]);
+    process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_LOCAL_IP = "false";
+
+    vi.resetModules();
+    const { getImageProps: privateIpGetImageProps } =
+      await import("../packages/vinext/src/shims/image.js");
+
+    const { props } = privateIpGetImageProps({
+      alt: "private ip",
+      src: "http://192.168.1.1/photo.jpg",
+      width: 400,
+      height: 300,
+    });
+    expect(props.src).toBe("");
+  });
+
+  it("allows private-IP remote URLs when dangerouslyAllowLocalIP = true", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    process.env.__VINEXT_IMAGE_REMOTE_PATTERNS = JSON.stringify([{ hostname: "**" }]);
+    process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_LOCAL_IP = "true";
+
+    // Module-level constants in image.tsx are evaluated at import time from
+    // process.env, so we must re-evaluate the module after changing env.
+    vi.resetModules();
+    const { default: PrivateIpImage } = await import("../packages/vinext/src/shims/image.js");
+
+    const html = ReactDOMServer.renderToString(
+      React.createElement(PrivateIpImage, {
+        alt: "private ip allowed",
+        src: "http://10.0.0.1/photo.jpg",
+        width: 400,
+        height: 300,
+      }),
+    );
+    expect(html).toContain("<img");
+    expect(html).toContain('alt="private ip allowed"');
+  });
+
+  it("allows public-IP remote URLs regardless of dangerouslyAllowLocalIP", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    process.env.__VINEXT_IMAGE_REMOTE_PATTERNS = JSON.stringify([{ hostname: "**" }]);
+    process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_LOCAL_IP = "false";
+
+    // Module-level constants in image.tsx are evaluated at import time from
+    // process.env, so we must re-evaluate the module after changing env.
+    vi.resetModules();
+    const { default: PrivateIpImage } = await import("../packages/vinext/src/shims/image.js");
+
+    const html = ReactDOMServer.renderToString(
+      React.createElement(PrivateIpImage, {
+        alt: "public ip",
+        src: "http://8.8.8.8/photo.jpg",
+        width: 400,
+        height: 300,
+      }),
+    );
+    expect(html).toContain("<img");
+    expect(html).toContain('alt="public ip"');
+  });
+
+  it("warns but does not block private-IP remote URLs in development", async () => {
+    vi.stubEnv("NODE_ENV", "development");
+    process.env.__VINEXT_IMAGE_REMOTE_PATTERNS = JSON.stringify([{ hostname: "**" }]);
+    process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_LOCAL_IP = "false";
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // Module-level constants in image.tsx are evaluated at import time from
+    // process.env, so we must re-evaluate the module after changing env.
+    vi.resetModules();
+    const { default: PrivateIpImage } = await import("../packages/vinext/src/shims/image.js");
+
+    const html = ReactDOMServer.renderToString(
+      React.createElement(PrivateIpImage, {
+        alt: "private ip dev",
+        src: "http://172.16.0.1/photo.jpg",
+        width: 400,
+        height: 300,
+      }),
+    );
+    // Dev: warn but still render
+    expect(html).toContain("<img");
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("resolved to private IP"));
+
+    warnSpy.mockRestore();
   });
 });

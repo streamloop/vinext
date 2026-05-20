@@ -45,6 +45,10 @@ export function buildCachedRevalidateCacheControl(
   revalidateSeconds: number,
   expireSeconds?: number,
 ): string {
+  if (revalidateSeconds === Infinity) {
+    return STATIC_CACHE_CONTROL;
+  }
+
   // When expire is known, match Next.js and emit the route policy even for
   // vinext-served STALE entries. The hard-expire gate has already decided the
   // stale payload is still usable, and downstream caches should see the same

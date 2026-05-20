@@ -17,7 +17,7 @@ export default async function FeedPage() {
           <Link href="/photos/3">Photo 3</Link>
         </li>
         <li>
-          <Link href="/photos/42" id="feed-photo-42-link">
+          <Link href="/photos/42" id="feed-photo-42-link" prefetch={true}>
             Photo 42
           </Link>
         </li>

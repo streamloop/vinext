@@ -1,32 +1,41 @@
 import type { ReactNode } from "react";
+import type { ReactFormState } from "react-dom/client";
 import type { ClassificationReason } from "../build/layout-classification-types.js";
 import {
   _consumeRequestScopedCacheLife,
   _peekRequestScopedCacheLife,
   type CachedAppPageValue,
 } from "vinext/shims/cache";
+import type { RootParams } from "vinext/shims/root-params";
 import {
   consumeDynamicUsage,
   consumeInvalidDynamicUsageError,
+  consumeRenderRequestApiUsage,
+  getAndClearPendingCookies,
   getDraftModeCookieHeader,
+  isDraftModeRequest,
   markDynamicUsage,
+  peekRenderRequestApiUsage,
   setHeadersContext,
 } from "vinext/shims/headers";
 import { getRequestExecutionContext } from "vinext/shims/request-context";
 import { createRequestContext, runWithRequestContext } from "vinext/shims/unified-request-context";
 import {
   ensureFetchPatch,
+  consumeDynamicFetchObservations,
   type FetchCacheMode,
   getCollectedFetchTags,
+  peekDynamicFetchObservations,
+  runWithFetchDedupe,
   setCurrentFetchCacheMode,
   setCurrentFetchSoftTags,
 } from "vinext/shims/fetch-cache";
-import type { AppOutgoingElements } from "./app-elements.js";
+import { AppElementsWire, type AppOutgoingElements } from "./app-elements.js";
 import { readAppPageCacheResponse } from "./app-page-cache.js";
 import { resolveAppPageParentHttpAccessBoundaryModule } from "./app-page-boundary.js";
+import { readStreamAsText } from "../utils/text-stream.js";
 import {
   buildAppPageSpecialErrorResponse,
-  readAppPageTextStream,
   resolveAppPageSpecialError,
   teeAppPageRscStreamForCapture,
   type AppPageFontPreload,
@@ -42,9 +51,24 @@ import {
 } from "./app-page-request.js";
 import { renderAppPageLifecycle } from "./app-page-render.js";
 import {
+  createAppPageHtmlOutputScope,
+  createAppPageRenderObservation,
+  createAppPageRscOutputScope,
+} from "./app-page-render-observation.js";
+import {
   mergeMiddlewareResponseHeaders,
   type AppPageMiddlewareContext,
 } from "./app-page-response.js";
+import {
+  VINEXT_RSC_CONTENT_TYPE,
+  VINEXT_RSC_VARY_HEADER,
+  applyRscCompatibilityIdHeader,
+} from "./app-rsc-cache-busting.js";
+import {
+  APP_RSC_RENDER_MODE_NAVIGATION,
+  shouldSuppressLoadingBoundaries,
+  type AppRscRenderMode,
+} from "./app-rsc-render-mode.js";
 import { createAppPageTreePath } from "./app-page-route-wiring.js";
 import type { AppPageSsrHandler } from "./app-page-stream.js";
 import { createStaticGenerationHeadersContext } from "./app-static-generation.js";
@@ -83,6 +107,7 @@ type AppPageDispatchIntercept<TPage = unknown> = {
   interceptLayouts?: readonly AppPageModule[] | null;
   matchedParams: AppPageParams;
   page: TPage;
+  slotId?: string | null;
   slotKey: string;
   sourceRouteIndex: number;
 };
@@ -92,7 +117,9 @@ type AppPageDispatchInterceptOptions<TPage = unknown> = {
   interceptLayouts?: readonly AppPageModule[] | null;
   interceptPage: TPage;
   interceptParams: AppPageParams;
+  interceptSlotId?: string | null;
   interceptSlotKey: string;
+  interceptSourceMatchedUrl?: string | null;
 };
 
 type AppPageModule = {
@@ -117,6 +144,8 @@ type AppPageDispatchRoute = {
 };
 
 type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
+  /** Configured basePath (e.g. "/blog"). Used to prefix redirect Locations. */
+  basePath?: string;
   buildPageElement: (
     route: TRoute,
     params: AppPageParams,
@@ -131,6 +160,9 @@ type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
   dynamicParamsConfig?: boolean;
   fetchCache?: FetchCacheMode | null;
   findIntercept: (pathname: string) => AppPageDispatchIntercept | null;
+  formState?: ReactFormState | null;
+  actionError?: unknown;
+  actionFailed?: boolean;
   generateStaticParams?: ValidateAppPageDynamicParamsOptions["generateStaticParams"];
   getFontLinks: () => string[];
   getFontPreloads: () => AppPageFontPreload[];
@@ -142,17 +174,23 @@ type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
   hasPageModule: boolean;
   handlerStart: number;
   interceptionContext: string | null;
+  isProgressiveActionRender?: boolean;
   isProduction: boolean;
   isRscRequest: boolean;
   isrDebug?: AppPageDebugLogger;
   isrGet: AppPageCacheGetter;
   isrHtmlKey: (pathname: string) => string;
-  isrRscKey: (pathname: string, mountedSlotsHeader?: string | null) => string;
+  isrRscKey: (
+    pathname: string,
+    mountedSlotsHeader?: string | null,
+    renderMode?: AppRscRenderMode,
+  ) => string;
   isrSet: AppPageCacheSetter;
   loadSsrHandler: () => Promise<AppPageSsrHandler>;
   middlewareContext: AppPageMiddlewareContext;
   mountedSlotsHeader?: string | null;
   params: AppPageParams;
+  rootParams?: RootParams;
   probeLayoutAt: (layoutIndex: number) => unknown;
   probePage: () => unknown;
   expireSeconds?: number;
@@ -186,9 +224,12 @@ type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
     pathname: string;
     searchParams: URLSearchParams;
   }) => void;
+  renderMode?: AppRscRenderMode;
 };
 
 function shouldReadAppPageCache(options: {
+  isProgressiveActionRender: boolean;
+  isDraftMode: boolean;
   isForceDynamic: boolean;
   isProduction: boolean;
   isRscRequest: boolean;
@@ -197,10 +238,11 @@ function shouldReadAppPageCache(options: {
 }): boolean {
   return (
     options.isProduction &&
+    !options.isProgressiveActionRender &&
+    !options.isDraftMode &&
     !options.isForceDynamic &&
     (options.isRscRequest || !options.scriptNonce) &&
-    (options.revalidateSeconds === null ||
-      (options.revalidateSeconds > 0 && options.revalidateSeconds !== Infinity))
+    (options.revalidateSeconds === null || options.revalidateSeconds > 0)
   );
 }
 
@@ -212,7 +254,13 @@ function buildAppPageTags(
   return buildPageCacheTags(cleanPathname, extraTags, [...routeSegments], "page");
 }
 
-async function runAppPageRevalidationContext(
+async function runAppPageRevalidationContext<
+  TResult extends {
+    html: string;
+    rscData: ArrayBuffer;
+    tags: string[];
+  },
+>(
   options: {
     cleanPathname: string;
     currentFetchCacheMode?: FetchCacheMode | null;
@@ -222,16 +270,8 @@ async function runAppPageRevalidationContext(
     routeSegments: readonly string[];
     setNavigationContext: DispatchAppPageOptions<AppPageDispatchRoute>["setNavigationContext"];
   },
-  renderFn: () => Promise<{
-    html: string;
-    rscData: ArrayBuffer;
-    tags: string[];
-  }>,
-): Promise<{
-  html: string;
-  rscData: ArrayBuffer;
-  tags: string[];
-}> {
+  renderFn: () => Promise<TResult>,
+): Promise<TResult> {
   const headersContext = createStaticGenerationHeadersContext({
     dynamicConfig: options.dynamicConfig,
     routeKind: "page",
@@ -252,7 +292,7 @@ async function runAppPageRevalidationContext(
       searchParams: new URLSearchParams(),
       params: options.params,
     });
-    return renderFn();
+    return await runWithFetchDedupe(renderFn);
   });
 }
 
@@ -277,11 +317,19 @@ function toInterceptOptions(
     interceptLayouts: intercept.interceptLayouts,
     interceptPage: intercept.page,
     interceptParams: intercept.matchedParams,
+    interceptSlotId: intercept.slotId ?? null,
     interceptSlotKey: intercept.slotKey,
+    interceptSourceMatchedUrl: interceptionContext,
   };
 }
 
 export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
+  options: DispatchAppPageOptions<TRoute>,
+): Promise<Response> {
+  return await runWithFetchDedupe(() => dispatchAppPageInner(options));
+}
+
+async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   options: DispatchAppPageOptions<TRoute>,
 ): Promise<Response> {
   const route = options.route;
@@ -290,6 +338,7 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
   const isForceStatic = dynamicConfig === "force-static";
   const isDynamicError = dynamicConfig === "error";
   const isForceDynamic = dynamicConfig === "force-dynamic";
+  const isDraftMode = isDraftModeRequest(options.request);
 
   setCurrentFetchSoftTags(buildAppPageTags(options.cleanPathname, [], route.routeSegments));
   setCurrentFetchCacheMode(options.fetchCache ?? null);
@@ -312,7 +361,7 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
     return methodResponse;
   }
 
-  if (isForceStatic || isDynamicError) {
+  if ((isForceStatic || isDynamicError) && !isDraftMode) {
     setHeadersContext(
       createStaticGenerationHeadersContext({
         dynamicConfig,
@@ -329,7 +378,9 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
 
   if (
     shouldReadAppPageCache({
+      isDraftMode,
       isForceDynamic,
+      isProgressiveActionRender: options.isProgressiveActionRender === true,
       isProduction: options.isProduction,
       isRscRequest: options.isRscRequest,
       revalidateSeconds: currentRevalidateSeconds,
@@ -345,7 +396,10 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
       isrHtmlKey: options.isrHtmlKey,
       isrRscKey: options.isrRscKey,
       isrSet: options.isrSet,
+      middlewareHeaders: options.middlewareContext.headers,
+      middlewareStatus: options.middlewareContext.status,
       mountedSlotsHeader: options.mountedSlotsHeader,
+      renderMode: options.renderMode,
       expireSeconds: options.expireSeconds,
       // cacheLife-only routes discover their actual revalidate during the
       // fresh render; this seed only gets them into the cache read path.
@@ -372,6 +426,8 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
               options.cleanPathname,
               route.pattern,
             );
+            // No inner runWithFetchDedupe here: this renderFn is already
+            // wrapped in runWithFetchDedupe by runAppPageRevalidationContext.
             const revalidatedRscStream = options.renderToReadableStream(revalidatedElement, {
               onError: revalidatedOnError,
             });
@@ -388,14 +444,18 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
                 styles: options.getFontStyles(),
                 preloads: options.getFontPreloads(),
               },
-              revalidatedRscCapture.sideStream
-                ? {
-                    sideStream: revalidatedRscCapture.sideStream,
-                    capturedRscDataRef: revalidatedCapturedRscRef,
-                  }
-                : undefined,
+              {
+                basePath: options.basePath,
+                rootParams: options.rootParams,
+                ...(revalidatedRscCapture.sideStream
+                  ? {
+                      sideStream: revalidatedRscCapture.sideStream,
+                      capturedRscDataRef: revalidatedCapturedRscRef,
+                    }
+                  : {}),
+              },
             );
-            const html = await readAppPageTextStream(revalidatedHtmlStream);
+            const html = await readStreamAsText(revalidatedHtmlStream);
             const rscData = await getCapturedRscDataPromise(revalidatedCapturedRscRef.value);
             const cacheLife = _consumeRequestScopedCacheLife();
             options.clearRequestContext();
@@ -404,9 +464,46 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
               getCollectedFetchTags(),
               route.routeSegments,
             );
+            // Consume once: HTML and RSC artifacts are produced by the same
+            // regeneration render and should carry the same observation set.
+            const observationState = {
+              dynamicFetches: consumeDynamicFetchObservations(),
+              requestApis: consumeRenderRequestApiUsage(),
+            };
             return {
               html,
+              htmlRenderObservation: createAppPageRenderObservation({
+                boundaryOutcome: { kind: "success" },
+                cacheability: "public",
+                cacheTags: tags,
+                cleanPathname: options.cleanPathname,
+                completeness: "complete",
+                output: createAppPageHtmlOutputScope({
+                  element: revalidatedElement,
+                  renderEpoch: null,
+                  rootBoundaryId: null,
+                  routePattern: route.pattern,
+                }),
+                params: options.params,
+                state: observationState,
+              }),
               rscData,
+              rscRenderObservation: createAppPageRenderObservation({
+                boundaryOutcome: { kind: "success" },
+                cacheability: "public",
+                cacheTags: tags,
+                cleanPathname: options.cleanPathname,
+                completeness: "complete",
+                output: createAppPageRscOutputScope({
+                  element: revalidatedElement,
+                  mountedSlotsHeader: options.mountedSlotsHeader,
+                  renderEpoch: null,
+                  rootBoundaryId: null,
+                  routePattern: route.pattern,
+                }),
+                params: options.params,
+                state: observationState,
+              }),
               tags,
               cacheControl:
                 typeof cacheLife?.revalidate === "number"
@@ -433,9 +530,6 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
     enforceStaticParamsOnly: options.dynamicParamsConfig === false,
     generateStaticParams: options.generateStaticParams,
     isDynamicRoute: route.isDynamic,
-    logGenerateStaticParamsError(error) {
-      console.error("[vinext] generateStaticParams error:", error);
-    },
     params: options.params,
   });
   if (dynamicParamsResponse) {
@@ -474,14 +568,17 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
         options.cleanPathname,
         sourceRoute.pattern,
       );
+      // No inner runWithFetchDedupe here: dispatchAppPage already activated
+      // dedupe at line 294, and this callback runs inside dispatchAppPageInner.
       const interceptStream = options.renderToReadableStream(interceptElement, {
         onError: interceptOnError,
       });
       const interceptHeaders = new Headers({
-        "Content-Type": "text/x-component; charset=utf-8",
-        Vary: "RSC, Accept",
+        "Content-Type": VINEXT_RSC_CONTENT_TYPE,
+        Vary: VINEXT_RSC_VARY_HEADER,
       });
       mergeMiddlewareResponseHeaders(interceptHeaders, options.middlewareContext.headers);
+      applyRscCompatibilityIdHeader(interceptHeaders);
       return new Response(interceptStream, {
         status: options.middlewareContext.status ?? 200,
         headers: interceptHeaders,
@@ -499,6 +596,9 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
 
   const pageBuildResult = await buildAppPageElement({
     buildPageElement() {
+      if (options.actionFailed) {
+        throw options.actionError;
+      }
       return options.buildPageElement(
         route,
         options.params,
@@ -519,10 +619,17 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
   }
 
   return renderAppPageLifecycle({
+    basePath: options.basePath,
     cleanPathname: options.cleanPathname,
     clearRequestContext: options.clearRequestContext,
     consumeDynamicUsage,
     consumeInvalidDynamicUsageError,
+    consumeRenderObservationState() {
+      return {
+        dynamicFetches: consumeDynamicFetchObservations(),
+        requestApis: consumeRenderRequestApiUsage(),
+      };
+    },
     createRscOnErrorHandler(pathname, routePath) {
       return options.createRscOnErrorHandler(pathname, routePath);
     },
@@ -542,8 +649,15 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
       return _peekRequestScopedCacheLife();
     },
     handlerStart: options.handlerStart,
-    hasLoadingBoundary: Boolean(route.loading?.default),
+    hasLoadingBoundary: shouldSuppressLoadingBoundaries(
+      options.renderMode ?? APP_RSC_RENDER_MODE_NAVIGATION,
+    )
+      ? false
+      : Boolean(route.loading?.default),
+    formState: options.formState ?? null,
+    isProgressiveActionRender: options.isProgressiveActionRender === true,
     isDynamicError,
+    isDraftMode,
     isForceDynamic,
     isForceStatic,
     isPrerender: process.env.VINEXT_PRERENDER === "1",
@@ -558,6 +672,13 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
     loadSsrHandler: options.loadSsrHandler,
     middlewareContext: options.middlewareContext,
     params: options.params,
+    rootParams: options.rootParams,
+    peekRenderObservationState() {
+      return {
+        dynamicFetches: peekDynamicFetchObservations(),
+        requestApis: peekRenderRequestApiUsage(),
+      };
+    },
     probeLayoutAt(layoutIndex) {
       return options.probeLayoutAt(layoutIndex);
     },
@@ -567,7 +688,9 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
     classification: {
       getLayoutId(index) {
         const treePosition = route.layoutTreePositions?.[index] ?? 0;
-        return "layout:" + createAppPageTreePath([...route.routeSegments], treePosition);
+        return AppElementsWire.encodeLayoutId(
+          createAppPageTreePath([...route.routeSegments], treePosition),
+        );
       },
       buildTimeClassifications: route.__buildTimeClassifications,
       buildTimeReasons: route.__buildTimeReasons,
@@ -586,6 +709,7 @@ export async function dispatchAppPage<TRoute extends AppPageDispatchRoute>(
     },
     revalidateSeconds: currentRevalidateSeconds,
     mountedSlotsHeader: options.mountedSlotsHeader,
+    renderMode: options.renderMode ?? APP_RSC_RENDER_MODE_NAVIGATION,
     renderErrorBoundaryResponse(renderError) {
       return options.renderErrorBoundaryPage(renderError);
     },
@@ -616,7 +740,10 @@ async function renderLayoutSpecialError<TRoute extends AppPageDispatchRoute>(
   layoutIndex: number,
 ): Promise<Response> {
   return buildAppPageSpecialErrorResponse({
+    basePath: options.basePath,
     clearRequestContext: options.clearRequestContext,
+    getAndClearPendingCookies,
+    isRscRequest: options.isRscRequest,
     middlewareContext: options.middlewareContext,
     renderFallbackPage(statusCode) {
       const parentBoundary = resolveAppPageParentHttpAccessBoundaryModule({
@@ -639,7 +766,7 @@ async function renderLayoutSpecialError<TRoute extends AppPageDispatchRoute>(
         null,
       );
     },
-    requestUrl: options.request.url,
+    request: options.request,
     specialError,
   });
 }
@@ -649,7 +776,10 @@ async function renderPageSpecialError<TRoute extends AppPageDispatchRoute>(
   specialError: AppPageSpecialError,
 ): Promise<Response> {
   return buildAppPageSpecialErrorResponse({
+    basePath: options.basePath,
     clearRequestContext: options.clearRequestContext,
+    getAndClearPendingCookies,
+    isRscRequest: options.isRscRequest,
     middlewareContext: options.middlewareContext,
     renderFallbackPage(statusCode) {
       return options.renderHttpAccessFallbackPage(
@@ -658,7 +788,7 @@ async function renderPageSpecialError<TRoute extends AppPageDispatchRoute>(
         null,
       );
     },
-    requestUrl: options.request.url,
+    request: options.request,
     specialError,
   });
 }

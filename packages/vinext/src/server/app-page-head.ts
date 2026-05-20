@@ -1,12 +1,14 @@
 import {
   mergeMetadataEntries,
   mergeViewport,
+  postProcessMetadata,
   resolveModuleMetadata,
   resolveModuleViewport,
   type Metadata,
   type MetadataMergeEntry,
   type Viewport,
 } from "vinext/shims/metadata";
+import { runWithFetchDedupe } from "vinext/shims/fetch-cache";
 import { applyFileBasedMetadata } from "./file-based-metadata.js";
 import type { AppPageParams } from "./app-page-boundary.js";
 import { resolveAppPageSegmentParams } from "./app-page-params.js";
@@ -52,6 +54,13 @@ type ResolveActiveParallelRouteHeadInputsOptions<
 };
 
 type ResolveAppPageHeadOptions<TModule extends AppPageHeadModule = AppPageHeadModule> = {
+  /**
+   * Configured next.config `basePath`. Threaded into `applyFileBasedMetadata`
+   * so file-based metadata route URLs (icon, opengraph-image, manifest, ...)
+   * emitted in <head> are prefixed with the basePath. Empty string when no
+   * basePath is configured.
+   */
+  basePath?: string;
   fallbackOnFileMetadataError?: boolean;
   layoutModules: readonly (TModule | null | undefined)[];
   layoutTreePositions?: readonly number[] | null;
@@ -300,6 +309,12 @@ async function resolveParallelRouteHead<TModule extends AppPageHeadModule>(
 export async function resolveAppPageHead<TModule extends AppPageHeadModule>(
   options: ResolveAppPageHeadOptions<TModule>,
 ): Promise<ResolveAppPageHeadResult> {
+  return await runWithFetchDedupe(() => resolveAppPageHeadInner(options));
+}
+
+async function resolveAppPageHeadInner<TModule extends AppPageHeadModule>(
+  options: ResolveAppPageHeadOptions<TModule>,
+): Promise<ResolveAppPageHeadResult> {
   const routeSegments = options.routeSegments ?? [];
   const layoutTreePositions = options.layoutTreePositions ?? [];
   const layoutInputs = createLayoutInputs(options.layoutModules, layoutTreePositions);
@@ -387,6 +402,7 @@ export async function resolveAppPageHead<TModule extends AppPageHeadModule>(
       {
         routeSegments,
         metadataSources,
+        basePath: options.basePath ?? "",
       },
     );
   } catch (error) {
@@ -397,6 +413,10 @@ export async function resolveAppPageHead<TModule extends AppPageHeadModule>(
       `[vinext] File-based metadata resolution failed while rendering error boundary for ${options.routePath}:`,
       error,
     );
+  }
+
+  if (metadata) {
+    metadata = postProcessMetadata(metadata);
   }
 
   return {

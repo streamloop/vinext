@@ -10,7 +10,8 @@
  * vi.resetModules() + dynamic import().
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vite-plus/test";
-import { createAppPayloadCacheKey } from "../packages/vinext/src/server/app-elements.js";
+import { AppElementsWire } from "../packages/vinext/src/server/app-elements.js";
+import { VINEXT_RSC_COMPATIBILITY_ID_HEADER } from "../packages/vinext/src/server/app-rsc-cache-busting.js";
 
 type Navigation = typeof import("../packages/vinext/src/shims/navigation.js");
 let storePrefetchResponse: Navigation["storePrefetchResponse"];
@@ -22,13 +23,21 @@ let MAX_PREFETCH_CACHE_SIZE: Navigation["MAX_PREFETCH_CACHE_SIZE"];
 let PREFETCH_CACHE_TTL: Navigation["PREFETCH_CACHE_TTL"];
 let snapshotRscResponse: Navigation["snapshotRscResponse"];
 let restoreRscResponse: Navigation["restoreRscResponse"];
+let invalidatePrefetchCache: Navigation["invalidatePrefetchCache"];
+let appRouterInstance: Navigation["appRouterInstance"];
 
 beforeEach(async () => {
   // Set window BEFORE importing so isServer evaluates to false
   (globalThis as any).window = {
     __VINEXT_RSC_PREFETCH_CACHE__: new Map(),
     __VINEXT_RSC_PREFETCHED_URLS__: new Set(),
-    location: { pathname: "/", search: "", hash: "", href: "http://localhost/" },
+    location: {
+      origin: "http://localhost",
+      pathname: "/",
+      search: "",
+      hash: "",
+      href: "http://localhost/",
+    },
     addEventListener: () => {},
     history: { pushState: () => {}, replaceState: () => {}, state: null },
     dispatchEvent: () => {},
@@ -44,11 +53,14 @@ beforeEach(async () => {
   PREFETCH_CACHE_TTL = nav.PREFETCH_CACHE_TTL;
   snapshotRscResponse = nav.snapshotRscResponse;
   restoreRscResponse = nav.restoreRscResponse;
+  invalidatePrefetchCache = nav.invalidatePrefetchCache;
+  appRouterInstance = nav.appRouterInstance;
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
   delete (globalThis as any).window;
+  delete (globalThis as any).fetch;
 });
 
 /** Helper: fill cache with `count` entries at a given timestamp. */
@@ -66,13 +78,102 @@ function fillCache(count: number, timestamp: number, keyPrefix = "/page-"): void
         paramsHeader: null,
         url: key,
       },
+      outcome: "cache-seeded",
       timestamp,
     });
     prefetched.add(key);
   }
 }
 
+async function waitForPrefetchSetup(isReady: () => boolean = () => true): Promise<void> {
+  const deadline = Date.now() + 1_000;
+
+  do {
+    await Promise.resolve();
+    if (isReady()) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  } while (Date.now() < deadline);
+}
+
 describe("prefetch cache eviction", () => {
+  it("router.prefetch ignores external absolute URLs", async () => {
+    const fetch = vi.fn();
+    (globalThis as any).fetch = fetch;
+
+    appRouterInstance.prefetch("https://external.example/dashboard");
+    await waitForPrefetchSetup();
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(getPrefetchedUrls().size).toBe(0);
+  });
+
+  it("router.prefetch normalizes same-origin absolute URLs before caching", async () => {
+    let fetchedUrl: unknown;
+    const fetch = vi.fn(async (input: RequestInfo | URL) => {
+      fetchedUrl = input;
+      return new Response("flight", { headers: { "content-type": "text/x-component" } });
+    });
+    (globalThis as any).fetch = fetch;
+
+    appRouterInstance.prefetch("http://localhost/dashboard?tab=1");
+    await waitForPrefetchSetup(() => fetch.mock.calls.length > 0);
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetchedUrl).toMatch(/^\/dashboard\.rsc\?tab=1&_rsc(?:=.+)?$/);
+    expect(getPrefetchedUrls().has(AppElementsWire.encodeCacheKey(String(fetchedUrl), "/"))).toBe(
+      true,
+    );
+  });
+
+  it("router.prefetch calls onInvalidate once when the prefetched response is invalidated", async () => {
+    let fetchedUrl: unknown;
+    const fetch = vi.fn(async (input: RequestInfo | URL) => {
+      fetchedUrl = input;
+      return new Response("flight", { headers: { "content-type": "text/x-component" } });
+    });
+    const onInvalidate = vi.fn();
+    (globalThis as any).fetch = fetch;
+
+    appRouterInstance.prefetch("/dashboard", { onInvalidate });
+    await waitForPrefetchSetup(() => getPrefetchCache().size > 0);
+
+    const cacheKey = AppElementsWire.encodeCacheKey(String(fetchedUrl), "/");
+    expect(getPrefetchedUrls().has(cacheKey)).toBe(true);
+
+    invalidatePrefetchCache();
+
+    expect(onInvalidate).toHaveBeenCalledTimes(1);
+    expect(getPrefetchedUrls().has(cacheKey)).toBe(false);
+    expect(getPrefetchCache().has(cacheKey)).toBe(false);
+
+    invalidatePrefetchCache();
+    expect(onInvalidate).toHaveBeenCalledTimes(1);
+  });
+
+  it("router.prefetch preserves onInvalidate callbacks attached to an already-prefetched URL", async () => {
+    const fetch = vi.fn(
+      async () => new Response("flight", { headers: { "content-type": "text/x-component" } }),
+    );
+    const firstInvalidate = vi.fn();
+    const secondInvalidate = vi.fn();
+    (globalThis as any).fetch = fetch;
+
+    appRouterInstance.prefetch("/dashboard", { onInvalidate: firstInvalidate });
+    await waitForPrefetchSetup(() => getPrefetchCache().size > 0);
+    appRouterInstance.prefetch("/dashboard", { onInvalidate: secondInvalidate });
+    await waitForPrefetchSetup(() => {
+      const entry = getPrefetchCache().values().next().value;
+      return entry?.onInvalidateCallbacks?.size === 2;
+    });
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    invalidatePrefetchCache();
+
+    expect(firstInvalidate).toHaveBeenCalledTimes(1);
+    expect(secondInvalidate).toHaveBeenCalledTimes(1);
+  });
+
   it("reuses a prefetched response only when mounted-slot context matches", () => {
     const cache = getPrefetchCache();
     const prefetched = getPrefetchedUrls();
@@ -85,7 +186,7 @@ describe("prefetch cache eviction", () => {
       url: rscUrl,
     };
 
-    cache.set(rscUrl, { snapshot, timestamp: Date.now() });
+    cache.set(rscUrl, { outcome: "cache-seeded", snapshot, timestamp: Date.now() });
     prefetched.add(rscUrl);
 
     expect(consumePrefetchResponse(rscUrl, null, "slot:auth:/")).toEqual(snapshot);
@@ -99,6 +200,7 @@ describe("prefetch cache eviction", () => {
     const rscUrl = "/dashboard.rsc";
 
     cache.set(rscUrl, {
+      outcome: "cache-seeded",
       snapshot: {
         buffer: new TextEncoder().encode("flight").buffer,
         contentType: "text/x-component",
@@ -125,17 +227,18 @@ describe("prefetch cache eviction", () => {
     storePrefetchResponse("/photos/42.rsc", new Response("feed"), "/feed");
     storePrefetchResponse("/photos/42.rsc", new Response("gallery"), "/gallery");
 
-    const feedKey = createAppPayloadCacheKey("/photos/42.rsc", "/feed");
-    const galleryKey = createAppPayloadCacheKey("/photos/42.rsc", "/gallery");
+    const feedKey = AppElementsWire.encodeCacheKey("/photos/42.rsc", "/feed");
+    const galleryKey = AppElementsWire.encodeCacheKey("/photos/42.rsc", "/gallery");
     expect(feedKey).not.toBe(galleryKey);
     expect(getPrefetchCache().has(feedKey)).toBe(true);
     expect(getPrefetchCache().has(galleryKey)).toBe(true);
   });
 
-  it("preserves X-Vinext-Params when replaying cached RSC responses", async () => {
+  it("preserves RSC metadata when replaying cached responses", async () => {
     const response = new Response("flight", {
       headers: {
-        "content-type": "text/x-component; charset=utf-8",
+        "content-type": "text/x-component",
+        [VINEXT_RSC_COMPATIBILITY_ID_HEADER]: "compat-a",
         "x-vinext-params": encodeURIComponent('{"id":"2"}'),
       },
     });
@@ -143,9 +246,67 @@ describe("prefetch cache eviction", () => {
     const snapshot = await snapshotRscResponse(response);
     const restored = restoreRscResponse(snapshot);
 
-    expect(restored.headers.get("content-type")).toBe("text/x-component; charset=utf-8");
+    expect(restored.headers.get("content-type")).toBe("text/x-component");
+    expect(restored.headers.get(VINEXT_RSC_COMPATIBILITY_ID_HEADER)).toBe("compat-a");
     expect(restored.headers.get("x-vinext-params")).toBe(encodeURIComponent('{"id":"2"}'));
     await expect(restored.text()).resolves.toBe("flight");
+  });
+
+  it("settles router.prefetch as a consumable cache-seeded response without visible navigation", async () => {
+    let resolveResponse!: (response: Response) => void;
+    const fetchPromise = new Promise<Response>((resolve) => {
+      resolveResponse = resolve;
+    });
+    let fetchedUrl: RequestInfo | URL | undefined;
+    const fetch = vi.fn((input: RequestInfo | URL) => {
+      fetchedUrl = input;
+      return fetchPromise;
+    });
+    const navigate = vi.fn();
+    (globalThis as any).fetch = fetch;
+    (globalThis as any).window[Symbol.for("vinext.navigationRuntime")] = {
+      bootstrap: {
+        routeManifest: null,
+        rsc: undefined,
+      },
+      functions: {
+        navigate,
+      },
+    };
+
+    appRouterInstance.prefetch("/dashboard");
+    await waitForPrefetchSetup(() => fetch.mock.calls.length > 0);
+
+    if (fetchedUrl === undefined) {
+      throw new Error("Expected router.prefetch to fetch an RSC URL");
+    }
+
+    const rscUrl =
+      typeof fetchedUrl === "string"
+        ? fetchedUrl
+        : fetchedUrl instanceof URL
+          ? fetchedUrl.href
+          : fetchedUrl.url;
+    const cacheKey = AppElementsWire.encodeCacheKey(rscUrl, "/");
+
+    expect(getPrefetchCache().get(cacheKey)?.outcome).toBe("pending");
+
+    resolveResponse(new Response("flight", { headers: { "content-type": "text/x-component" } }));
+    await waitForPrefetchSetup(
+      () =>
+        getPrefetchCache().get(cacheKey)?.outcome === "cache-seeded" &&
+        getPrefetchCache().get(cacheKey)?.pending === undefined,
+    );
+
+    const entry = getPrefetchCache().get(cacheKey);
+    expect(entry?.outcome).toBe("cache-seeded");
+    expect(entry?.pending).toBeUndefined();
+
+    const consumed = consumePrefetchResponse(rscUrl, "/", null);
+    expect(consumed?.mountedSlotsHeader).toBeNull();
+    expect(getPrefetchCache().has(cacheKey)).toBe(false);
+    expect(getPrefetchedUrls().has(cacheKey)).toBe(false);
+    expect(navigate).not.toHaveBeenCalled();
   });
 
   it("sweeps all expired entries before FIFO", () => {

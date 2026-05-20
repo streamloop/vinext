@@ -15,7 +15,12 @@ import ReactDOMServer from "react-dom/server";
 
 // We test the Link component and its internal helpers.
 // Link is a "use client" component but renderToString still works for SSR output.
-import Link, { useLinkStatus } from "../packages/vinext/src/shims/link.js";
+import Link, {
+  canAutoPrefetchFullAppRoute,
+  resolveLinkPrefetchMode,
+  useLinkStatus,
+} from "../packages/vinext/src/shims/link.js";
+import { navigatePagesRouterLink } from "../packages/vinext/src/client/pages-router-link-navigation.js";
 
 // Internal helpers re-exported or accessible via the router shim
 import { isExternalUrl, isHashOnlyChange } from "../packages/vinext/src/shims/router.js";
@@ -26,6 +31,9 @@ import { runWithI18nState } from "../packages/vinext/src/shims/i18n-state.js";
 import { setI18nContext } from "../packages/vinext/src/shims/i18n-context.js";
 
 import {
+  isAbsoluteOrProtocolRelativeUrl,
+  isAbsoluteUrl,
+  normalizePathTrailingSlash,
   resolveRelativeHref,
   toBrowserNavigationHref,
   toSameOriginAppPath,
@@ -130,6 +138,45 @@ describe("useLinkStatus", () => {
     }
     ReactDOMServer.renderToString(React.createElement(TestComponent));
     expect(status).toEqual({ pending: false });
+  });
+});
+
+describe("Link App Router prefetch mode", () => {
+  it("distinguishes automatic prefetch from explicit full prefetch", () => {
+    expect(resolveLinkPrefetchMode(undefined, false)).toBe("auto");
+    expect(resolveLinkPrefetchMode(null, false)).toBe("auto");
+    expect(resolveLinkPrefetchMode("auto", false)).toBe("auto");
+    expect(resolveLinkPrefetchMode(true, false)).toBe("full");
+    expect(resolveLinkPrefetchMode(false, false)).toBe("disabled");
+    expect(resolveLinkPrefetchMode(true, true)).toBe("disabled");
+  });
+
+  it("allows automatic full RSC prefetch only for known static App Router routes", () => {
+    const originalWindow = globalThis.window;
+    (globalThis as any).window = {
+      location: {
+        href: "http://localhost/blog",
+        origin: "http://localhost",
+      },
+      __VINEXT_LINK_PREFETCH_ROUTES__: [
+        { patternParts: ["about"], isDynamic: false },
+        { patternParts: ["blog", ":slug"], isDynamic: true },
+        { patternParts: ["docs", ":slug+"], isDynamic: true },
+      ],
+    };
+
+    try {
+      expect(canAutoPrefetchFullAppRoute("/about")).toBe(true);
+      expect(canAutoPrefetchFullAppRoute("/blog/hello-world")).toBe(false);
+      expect(canAutoPrefetchFullAppRoute("/docs/a/b")).toBe(false);
+      expect(canAutoPrefetchFullAppRoute("/missing")).toBe(false);
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = originalWindow;
+      }
+    }
   });
 });
 
@@ -295,6 +342,21 @@ describe("Link locale handling", () => {
     expect(html).toContain('href="/about"');
   });
 
+  it("locale=undefined uses the current non-default locale", async () => {
+    delete (globalThis as any).window;
+
+    const html = await runWithI18nState(async () => {
+      setI18nContext({
+        locale: "id",
+        locales: ["en", "id"],
+        defaultLocale: "en",
+      });
+      return ReactDOMServer.renderToString(React.createElement(Link, { href: "/" }, "x"));
+    });
+
+    expect(html).toContain('href="/id"');
+  });
+
   it("locale string prepends locale prefix", () => {
     // When locale is a non-default locale string, it prepends /{locale}
     // Note: default locale check uses __VINEXT_DEFAULT_LOCALE__ which is undefined in tests
@@ -334,6 +396,17 @@ describe("Link locale handling", () => {
       React.createElement(Link, { href: "http://example.com/path", locale: "de" } as any, "x"),
     );
     expect(html).toContain('href="http://example.com/path"');
+  });
+
+  it("locale does not mangle native URI schemes", () => {
+    const cases = ["mailto:hello@example.com", "tel:+123456789", "sms:+123456789"];
+
+    for (const href of cases) {
+      const html = ReactDOMServer.renderToString(
+        React.createElement(Link, { href, locale: "fr" } as any, "x"),
+      );
+      expect(html).toContain(`href="${href}"`);
+    }
   });
 
   it("locale string uses configured locale domains for cross-domain links", () => {
@@ -416,6 +489,32 @@ describe("Link locale handling", () => {
       }
       vi.resetModules();
     }
+  });
+
+  it("passes locale=false through the Pages Router Link handoff", async () => {
+    const push = vi.fn(async () => true);
+    const replace = vi.fn(async () => true);
+
+    await navigatePagesRouterLink(
+      { push, replace },
+      { href: "/", replace: false, scroll: true, locale: false },
+    );
+
+    expect(push).toHaveBeenCalledWith("/", undefined, { scroll: true, locale: false });
+    expect(replace).not.toHaveBeenCalled();
+  });
+
+  it("passes explicit locale through the Pages Router Link handoff", async () => {
+    const push = vi.fn(async () => true);
+    const replace = vi.fn(async () => true);
+
+    await navigatePagesRouterLink(
+      { push, replace },
+      { href: "/fr/about", replace: false, scroll: true, locale: "fr" },
+    );
+
+    expect(push).toHaveBeenCalledWith("/fr/about", undefined, { scroll: true, locale: "fr" });
+    expect(replace).not.toHaveBeenCalled();
   });
 });
 
@@ -580,6 +679,25 @@ describe("toSameOriginPath", () => {
   });
 });
 
+describe("absolute URL classification", () => {
+  it("matches Next.js scheme classification for native URI schemes", () => {
+    expect(isAbsoluteUrl("mailto:hello@example.com")).toBe(true);
+    expect(isAbsoluteUrl("tel:+123456789")).toBe(true);
+    expect(isAbsoluteUrl("sms:+123456789")).toBe(true);
+    expect(isAbsoluteUrl("ftp://example.com/file")).toBe(true);
+    expect(isAbsoluteUrl("/local")).toBe(false);
+    expect(isAbsoluteUrl("?page=2")).toBe(false);
+    expect(isAbsoluteUrl("#section")).toBe(false);
+    expect(isAbsoluteUrl("//example.com/path")).toBe(false);
+  });
+
+  it("treats protocol-relative URLs as browser-owned absolute-like hrefs", () => {
+    expect(isAbsoluteOrProtocolRelativeUrl("//example.com/path")).toBe(true);
+    expect(isAbsoluteOrProtocolRelativeUrl("mailto:hello@example.com")).toBe(true);
+    expect(isAbsoluteOrProtocolRelativeUrl("/local")).toBe(false);
+  });
+});
+
 describe("resolveRelativeHref", () => {
   it("resolves relative search params against the current page", () => {
     expect(resolveRelativeHref("?page=2", "http://localhost:3000/posts/1")).toBe("/posts/1?page=2");
@@ -599,6 +717,12 @@ describe("resolveRelativeHref", () => {
 
   it("leaves absolute paths unchanged", () => {
     expect(resolveRelativeHref("/about", "http://localhost:3000/posts/1")).toBe("/about");
+  });
+
+  it("leaves native URI schemes unchanged", () => {
+    expect(resolveRelativeHref("mailto:hello@example.com", "http://localhost:3000/posts/1")).toBe(
+      "mailto:hello@example.com",
+    );
   });
 
   it("strips the current basePath before returning the app-relative href", () => {
@@ -747,5 +871,141 @@ describe("toSameOriginAppPath", () => {
         (globalThis as any).window = originalWindow;
       }
     }
+  });
+});
+
+// ─── normalizePathTrailingSlash ─────────────────────────────────────────
+//
+// Ports the behaviour of Next.js's client `normalizePathTrailingSlash`:
+//   packages/next/src/client/normalize-trailing-slash.ts
+// Validates Link `href` rewriting expectations from upstream e2e:
+//   test/e2e/trailing-slashes/with-trailing-slash.test.ts
+//   test/e2e/trailing-slashes/without-trailing-slash.test.ts
+
+describe("normalizePathTrailingSlash", () => {
+  describe("trailingSlash: true", () => {
+    it("adds a trailing slash to a path without one", () => {
+      expect(normalizePathTrailingSlash("/about", true)).toBe("/about/");
+    });
+
+    it("is idempotent for already-canonical paths", () => {
+      expect(normalizePathTrailingSlash("/about/", true)).toBe("/about/");
+    });
+
+    it("leaves the bare root unchanged", () => {
+      expect(normalizePathTrailingSlash("/", true)).toBe("/");
+    });
+
+    it("preserves query strings", () => {
+      expect(normalizePathTrailingSlash("/about?hello=world", true)).toBe("/about/?hello=world");
+      expect(normalizePathTrailingSlash("/about/?hello=world", true)).toBe("/about/?hello=world");
+    });
+
+    it("preserves hash fragments", () => {
+      expect(normalizePathTrailingSlash("/about#section", true)).toBe("/about/#section");
+      expect(normalizePathTrailingSlash("/about/#section", true)).toBe("/about/#section");
+    });
+
+    it("preserves query + hash", () => {
+      expect(normalizePathTrailingSlash("/about?x=1#y", true)).toBe("/about/?x=1#y");
+    });
+
+    it("strips trailing slash from filename-looking paths", () => {
+      // Matches Next.js's routes-manifest rule: paths ending in `.ext` are
+      // treated as files and keep the no-trailing-slash form.
+      expect(normalizePathTrailingSlash("/catch-all/hello.world/", true)).toBe(
+        "/catch-all/hello.world",
+      );
+      expect(normalizePathTrailingSlash("/catch-all/hello.world", true)).toBe(
+        "/catch-all/hello.world",
+      );
+    });
+
+    it("returns absolute URLs unchanged", () => {
+      // Only paths that start with `/` are touched; absolute URLs with a
+      // scheme are skipped entirely (matches Next.js behaviour).
+      expect(normalizePathTrailingSlash("https://nextjs.org", true)).toBe("https://nextjs.org");
+      expect(normalizePathTrailingSlash("https://nextjs.org/", true)).toBe("https://nextjs.org/");
+    });
+  });
+
+  describe("trailingSlash: false", () => {
+    it("strips a trailing slash from a non-root path", () => {
+      expect(normalizePathTrailingSlash("/about/", false)).toBe("/about");
+    });
+
+    it("is idempotent for already-canonical paths", () => {
+      expect(normalizePathTrailingSlash("/about", false)).toBe("/about");
+    });
+
+    it("leaves the bare root unchanged", () => {
+      expect(normalizePathTrailingSlash("/", false)).toBe("/");
+    });
+
+    it("preserves query strings", () => {
+      expect(normalizePathTrailingSlash("/about/?hello=world", false)).toBe("/about?hello=world");
+      expect(normalizePathTrailingSlash("/about?hello=world", false)).toBe("/about?hello=world");
+    });
+
+    it("preserves hash fragments", () => {
+      expect(normalizePathTrailingSlash("/about/#section", false)).toBe("/about#section");
+      expect(normalizePathTrailingSlash("/about#section", false)).toBe("/about#section");
+    });
+
+    it("returns absolute URLs unchanged", () => {
+      expect(normalizePathTrailingSlash("https://nextjs.org/", false)).toBe("https://nextjs.org/");
+      expect(normalizePathTrailingSlash("https://nextjs.org", false)).toBe("https://nextjs.org");
+    });
+  });
+});
+
+// ─── Link href trailing-slash rendering ─────────────────────────────────
+//
+// Ports cases from upstream `testLinkShouldRewriteTo` in:
+//   test/e2e/trailing-slashes/with-trailing-slash.test.ts
+//   test/e2e/trailing-slashes/without-trailing-slash.test.ts
+//
+// Note: the build-time define `process.env.__VINEXT_TRAILING_SLASH` is what
+// drives this in real builds. Tests run with the unbuilt source and therefore
+// observe the `trailingSlash: false` default (env var is unset). That is the
+// inverse half of the upstream matrix — the `with-trailing-slash` direction
+// is covered by `normalizePathTrailingSlash` above and exercised end-to-end
+// in CI.
+
+describe("Link href trailing-slash (trailingSlash: false default)", () => {
+  it("strips a trailing slash from the rendered href", () => {
+    const html = ReactDOMServer.renderToString(React.createElement(Link, { href: "/about/" }, "x"));
+    expect(html).toContain('href="/about"');
+  });
+
+  it("preserves query when stripping the trailing slash", () => {
+    const html = ReactDOMServer.renderToString(
+      React.createElement(Link, { href: "/about/?hello=world" }, "x"),
+    );
+    expect(html).toContain('href="/about?hello=world"');
+  });
+
+  it("preserves the bare root", () => {
+    const html = ReactDOMServer.renderToString(React.createElement(Link, { href: "/" }, "x"));
+    expect(html).toContain('href="/"');
+  });
+
+  it("leaves filename-looking paths untouched", () => {
+    const html = ReactDOMServer.renderToString(
+      React.createElement(Link, { href: "/catch-all/hello.world" }, "x"),
+    );
+    expect(html).toContain('href="/catch-all/hello.world"');
+  });
+
+  it("leaves absolute URLs unchanged", () => {
+    const html = ReactDOMServer.renderToString(
+      React.createElement(Link, { href: "https://nextjs.org" }, "x"),
+    );
+    expect(html).toContain('href="https://nextjs.org"');
+
+    const trailing = ReactDOMServer.renderToString(
+      React.createElement(Link, { href: "https://nextjs.org/" }, "x"),
+    );
+    expect(trailing).toContain('href="https://nextjs.org/"');
   });
 });

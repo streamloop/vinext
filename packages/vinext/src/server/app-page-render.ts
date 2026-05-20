@@ -1,6 +1,10 @@
 import type { ReactNode } from "react";
+import type { ReactFormState } from "react-dom/client";
 import type { CachedAppPageValue } from "vinext/shims/cache";
-import { buildOutgoingAppPayload, type AppOutgoingElements } from "./app-elements.js";
+import type { RootParams } from "vinext/shims/root-params";
+import { runWithFetchDedupe } from "vinext/shims/fetch-cache";
+import { AppElementsWire, isAppElementsRecord, type AppOutgoingElements } from "./app-elements.js";
+import { hasDigest } from "./app-rsc-errors.js";
 import {
   finalizeAppPageHtmlCacheResponse,
   finalizeAppPageRscCacheResponse,
@@ -32,6 +36,19 @@ import {
   shouldRerenderAppPageWithGlobalError,
   type AppPageSsrHandler,
 } from "./app-page-stream.js";
+import type { AppRscRenderMode } from "./app-rsc-render-mode.js";
+import {
+  createArtifactCompatibilityEnvelope,
+  createArtifactCompatibilityGraphVersion,
+  type ArtifactCompatibilityEnvelope,
+} from "./artifact-compatibility.js";
+import {
+  createAppPageHtmlOutputScope,
+  createAppPageRenderObservation,
+  createAppPageRscOutputScope,
+  createEmptyAppPageRenderObservationState,
+  type AppPageRenderObservationState,
+} from "./app-page-render-observation.js";
 
 type AppPageBoundaryOnError = (
   error: unknown,
@@ -53,9 +70,11 @@ type AppPageRequestCacheLife = {
 };
 
 type RenderAppPageLifecycleOptions = {
+  basePath?: string;
   cleanPathname: string;
   clearRequestContext: () => void;
   consumeDynamicUsage: () => boolean;
+  consumeRenderObservationState?: () => AppPageRenderObservationState;
   /** Read and clear any invalid dynamic usage error recorded during render (dev-only). */
   consumeInvalidDynamicUsageError?: () => unknown;
   createRscOnErrorHandler: (pathname: string, routePath: string) => AppPageBoundaryOnError;
@@ -70,22 +89,31 @@ type RenderAppPageLifecycleOptions = {
   handlerStart: number;
   hasLoadingBoundary: boolean;
   isDynamicError: boolean;
+  isDraftMode: boolean;
   isForceDynamic: boolean;
   isForceStatic: boolean;
+  isProgressiveActionRender?: boolean;
   isPrerender?: boolean;
   isProduction: boolean;
   isRscRequest: boolean;
   isrDebug?: AppPageDebugLogger;
   isrHtmlKey: (pathname: string) => string;
-  isrRscKey: (pathname: string, mountedSlotsHeader?: string | null) => string;
+  isrRscKey: (
+    pathname: string,
+    mountedSlotsHeader?: string | null,
+    renderMode?: AppRscRenderMode,
+  ) => string;
   isrSet: AppPageCacheSetter;
   layoutCount: number;
   loadSsrHandler: () => Promise<AppPageSsrHandler>;
   middlewareContext: AppPageMiddlewareContext;
   params: Record<string, unknown>;
+  rootParams?: RootParams;
+  peekRenderObservationState?: () => AppPageRenderObservationState;
   probeLayoutAt: (layoutIndex: number) => unknown;
   probePage: () => unknown;
   expireSeconds?: number;
+  formState?: ReactFormState | null;
   revalidateSeconds: number | null;
   renderErrorBoundaryResponse: (error: unknown) => Promise<Response | null>;
   renderLayoutSpecialError: (
@@ -102,6 +130,7 @@ type RenderAppPageLifecycleOptions = {
   runWithSuppressedHookWarning<T>(probe: () => Promise<T>): Promise<T>;
   scriptNonce?: string;
   mountedSlotsHeader?: string | null;
+  renderMode?: AppRscRenderMode;
   waitUntil?: (promise: Promise<void>) => void;
   element: ReactNode | Readonly<Record<string, ReactNode>>;
   classification?: LayoutClassificationOptions | null;
@@ -159,13 +188,45 @@ function applyRequestCacheLife(options: {
   return { expireSeconds, revalidateSeconds };
 }
 
+function readRootBoundaryId(element: Readonly<Record<string, unknown>>): string | null {
+  const rootLayoutTreePath = element[AppElementsWire.keys.rootLayout];
+  return typeof rootLayoutTreePath === "string" ? rootLayoutTreePath : null;
+}
+
+function createAppPageArtifactCompatibility(
+  element: ReactNode | Readonly<Record<string, ReactNode>>,
+  routePattern: string,
+): ArtifactCompatibilityEnvelope | undefined {
+  if (!isAppElementsRecord(element)) {
+    return undefined;
+  }
+
+  const rootBoundaryId = readRootBoundaryId(element);
+  return createArtifactCompatibilityEnvelope({
+    graphVersion: createArtifactCompatibilityGraphVersion({
+      routePattern,
+      rootBoundaryId,
+    }),
+    deploymentVersion: process.env.__VINEXT_BUILD_ID ?? null,
+    rootBoundaryId,
+  });
+}
+
 /**
  * Wraps an RSC response body to report invalid dynamic usage errors after the
  * stream is fully consumed. In dev mode, errors from cookies()/headers() inside
  * "use cache" may be caught by user try/catch and silently swallowed — this
  * wrapper waits for the stream to drain and surfaces any recorded error to the
  * terminal (and, via HMR, the browser dev overlay).
- * Ported from Next.js: https://github.com/vercel/next.js/commit/f5e54c06726b571a042fce67417e40a29f6b8689
+ *
+ * Dedups against React's Flight error chunk: if the recorded error already
+ * carries a `digest`, React's serverComponentsErrorHandler has already stamped
+ * it and emitted it into the RSC stream. Skipping `console.error` prevents
+ * double-logging. Caught cases (no digest) still surface here.
+ *
+ * Ported from Next.js:
+ *   https://github.com/vercel/next.js/commit/f5e54c06726b571a042fce67417e40a29f6b8689
+ *   https://github.com/vercel/next.js/pull/93706
  */
 function wrapRscResponseForDevErrorReporting(
   response: Response,
@@ -179,7 +240,9 @@ function wrapRscResponseForDevErrorReporting(
     if (consumed) return;
     consumed = true;
     const error = consumeInvalidDynamicUsageError();
-    if (error) {
+    if (!error) return;
+    // Dedup: React already emitted this error as a Flight error chunk.
+    if (!hasDigest(error)) {
       console.error("[vinext] Invalid dynamic usage:", error);
     }
   };
@@ -254,23 +317,68 @@ export async function renderAppPageLifecycle(
   // Render the CANONICAL element. The outgoing payload carries per-layout
   // static/dynamic flags under `__layoutFlags` so the client can later tell
   // which layouts are safe to skip on subsequent navigations.
-  const outgoingElement = buildOutgoingAppPayload({
+  const artifactCompatibility = createAppPageArtifactCompatibility(
+    options.element,
+    options.routePattern,
+  );
+  const rootBoundaryId = artifactCompatibility?.rootBoundaryId ?? null;
+  const renderEpoch = artifactCompatibility?.renderEpoch ?? null;
+  const rscOutputScope = createAppPageRscOutputScope({
+    element: options.element,
+    mountedSlotsHeader: options.mountedSlotsHeader,
+    renderEpoch,
+    rootBoundaryId,
+    routePattern: options.routePattern,
+  });
+  const htmlOutputScope = createAppPageHtmlOutputScope({
+    element: options.element,
+    renderEpoch,
+    rootBoundaryId,
+    routePattern: options.routePattern,
+  });
+  // Partial payload metadata is a pre-stream snapshot. Fetch tags may still
+  // accumulate while the RSC/HTML streams are consumed; complete cache artifact
+  // observations below rebuild this field after the stream drains.
+  const payloadRenderObservation = createAppPageRenderObservation({
+    boundaryOutcome: { kind: "unknown" },
+    cacheability: "unknown",
+    cacheTags: options.getPageTags(),
+    cleanPathname: options.cleanPathname,
+    completeness: "partial",
+    output: rscOutputScope,
+    params: options.params,
+    state: options.peekRenderObservationState?.() ?? createEmptyAppPageRenderObservationState(),
+  });
+  const outgoingElement = AppElementsWire.encodeOutgoingPayload({
     element: options.element,
     layoutFlags,
+    ...(artifactCompatibility ? { artifactCompatibility } : {}),
+    renderObservation: payloadRenderObservation,
   });
 
   const compileEnd = options.isProduction ? undefined : performance.now();
   const baseOnError = options.createRscOnErrorHandler(options.cleanPathname, options.routePattern);
   const rscErrorTracker = createAppPageRscErrorTracker(baseOnError);
-  const rscStream = options.renderToReadableStream(outgoingElement, {
-    onError: rscErrorTracker.onRenderError,
-  });
+  // Defensive wrap for standalone callers. In the normal dispatch path this is
+  // a no-op since dispatchAppPage already activated dedupe. Note that
+  // renderToReadableStream returns synchronously — the actual fetch calls
+  // happen later during async stream consumption — so the dedupe map a
+  // standalone call would establish here is only effective if the caller has
+  // an outer runWithRequestContext / runWithFetchDedupe scope keeping the ALS
+  // store alive across that consumption.
+  const rscStream = runWithFetchDedupe(() =>
+    options.renderToReadableStream(outgoingElement, {
+      onError: rscErrorTracker.onRenderError,
+    }),
+  );
 
   let revalidateSeconds = options.revalidateSeconds;
   let expireSeconds = options.expireSeconds;
   const shouldCaptureRscForCacheMetadata =
+    options.isProgressiveActionRender !== true &&
     (options.isProduction || options.isPrerender === true) &&
     (revalidateSeconds === null || (revalidateSeconds > 0 && revalidateSeconds !== Infinity)) &&
+    !options.isDraftMode &&
     !options.isForceDynamic;
   const rscCapture = teeAppPageRscStreamForCapture(rscStream, shouldCaptureRscForCacheMetadata);
   const rscForResponse = rscCapture.ssrStream;
@@ -298,6 +406,7 @@ export async function renderAppPageLifecycle(
     const dynamicUsedDuringBuild = options.consumeDynamicUsage();
     const rscResponsePolicy = resolveAppPageRscResponsePolicy({
       dynamicUsedDuringBuild,
+      isDraftMode: options.isDraftMode,
       isDynamicError: options.isDynamicError,
       isForceDynamic: options.isForceDynamic,
       isForceStatic: options.isForceStatic,
@@ -340,6 +449,19 @@ export async function renderAppPageLifecycle(
         options.isProduction && shouldCaptureRscForCacheMetadata ? capturedRscDataRef.value : null,
       cleanPathname: options.cleanPathname,
       consumeDynamicUsage: options.consumeDynamicUsage,
+      consumeRenderObservationState: options.consumeRenderObservationState,
+      createRscRenderObservation(input) {
+        return createAppPageRenderObservation({
+          boundaryOutcome: { kind: "success" },
+          cacheability: "public",
+          cacheTags: input.cacheTags,
+          cleanPathname: options.cleanPathname,
+          completeness: "complete",
+          output: rscOutputScope,
+          params: options.params,
+          state: input.state,
+        });
+      },
       dynamicUsedDuringBuild,
       getPageTags() {
         return options.getPageTags();
@@ -351,6 +473,7 @@ export async function renderAppPageLifecycle(
       isrRscKey: options.isrRscKey,
       isrSet: options.isrSet,
       mountedSlotsHeader: options.mountedSlotsHeader,
+      renderMode: options.renderMode,
       preserveClientResponseHeaders: rscResponsePolicy.cacheState !== "MISS",
       expireSeconds,
       revalidateSeconds,
@@ -383,10 +506,14 @@ export async function renderAppPageLifecycle(
         capturedRscDataRef,
         fontData,
         navigationContext: options.getNavigationContext(),
+        basePath: options.basePath,
+        rootParams: options.rootParams,
+        formState: options.formState ?? null,
         rscStream: rscForResponse,
         scriptNonce: options.scriptNonce,
         sideStream: rscCapture.sideStream,
         ssrHandler,
+        waitForAllReady: options.isPrerender,
       });
     },
     renderSpecialErrorResponse(specialError) {
@@ -400,6 +527,29 @@ export async function renderAppPageLifecycle(
   const htmlStream = htmlRender.htmlStream;
   if (!htmlStream) {
     throw new Error("[vinext] Expected an HTML stream when no fallback response was returned");
+  }
+
+  // Routes with a route-level Suspense boundary (loading.tsx) skip the page
+  // probe — the page render happens once, inside the RSC stream. Mirror
+  // Next.js's `app-render.tsx:4293` catch shape: by the time the SSR shell
+  // promise has resolved, any redirect()/notFound() throw whose async work
+  // settles in microtasks during shell rendering has already fired through
+  // React's onError and been captured by the tracker. Convert that to a
+  // 307/404 before any bytes are flushed.
+  //
+  // Late rejections — ones that settle after macrotask boundaries (real
+  // I/O, setTimeout, etc.) — fall through to the streamed body, exactly
+  // as Next.js does. The digest survives in the Flight payload for the
+  // client router to consume.
+  if (options.hasLoadingBoundary) {
+    const captured = rscErrorTracker.getCapturedSpecialError();
+    if (captured) {
+      const specialError = resolveAppPageSpecialError(captured);
+      if (specialError) {
+        void htmlStream.cancel().catch(() => {});
+        return options.renderPageSpecialError(specialError);
+      }
+    }
   }
 
   if (
@@ -427,6 +577,7 @@ export async function renderAppPageLifecycle(
   }
   const draftCookie = options.getDraftModeCookieHeader();
   const dynamicUsedDuringRender = options.consumeDynamicUsage();
+  let dynamicUsedBeforeContextCleanup = dynamicUsedDuringRender;
 
   // Defer clearRequestContext() until the HTML stream is fully consumed by the
   // HTTP layer. The RSC/SSR pipeline is lazy — Server Components execute while
@@ -435,12 +586,16 @@ export async function renderAppPageLifecycle(
   // headers()/cookies() to see a null context on warm (module-cached) requests.
   // See: https://github.com/cloudflare/vinext/issues/660
   const safeHtmlStream = deferUntilStreamConsumed(htmlStream, () => {
+    dynamicUsedBeforeContextCleanup =
+      dynamicUsedBeforeContextCleanup || options.consumeDynamicUsage();
     options.clearRequestContext();
   });
 
   const htmlResponsePolicy = resolveAppPageHtmlResponsePolicy({
     dynamicUsedDuringRender,
+    isProgressiveActionRender: options.isProgressiveActionRender === true,
     hasScriptNonce: Boolean(options.scriptNonce),
+    isDraftMode: options.isDraftMode,
     isDynamicError: options.isDynamicError,
     isForceDynamic: options.isForceDynamic,
     isForceStatic: options.isForceStatic,
@@ -463,6 +618,7 @@ export async function renderAppPageLifecycle(
     !options.isDynamicError &&
     !options.isForceStatic &&
     !options.scriptNonce &&
+    options.isProgressiveActionRender !== true &&
     !dynamicUsedDuringRender;
 
   if (htmlResponsePolicy.shouldWriteToCache || shouldSpeculativelyWriteCache) {
@@ -479,9 +635,37 @@ export async function renderAppPageLifecycle(
     }
 
     return finalizeAppPageHtmlCacheResponse(isrResponse, {
+      capturedDynamicUsageBeforeContextCleanup() {
+        return dynamicUsedBeforeContextCleanup;
+      },
       capturedRscDataPromise: capturedRscDataRef.value,
       cleanPathname: options.cleanPathname,
       consumeDynamicUsage: options.consumeDynamicUsage,
+      consumeRenderObservationState: options.consumeRenderObservationState,
+      createHtmlRenderObservation(input) {
+        return createAppPageRenderObservation({
+          boundaryOutcome: { kind: "success" },
+          cacheability: "public",
+          cacheTags: input.cacheTags,
+          cleanPathname: options.cleanPathname,
+          completeness: "complete",
+          output: htmlOutputScope,
+          params: options.params,
+          state: input.state,
+        });
+      },
+      createRscRenderObservation(input) {
+        return createAppPageRenderObservation({
+          boundaryOutcome: { kind: "success" },
+          cacheability: "public",
+          cacheTags: input.cacheTags,
+          cleanPathname: options.cleanPathname,
+          completeness: "complete",
+          output: rscOutputScope,
+          params: options.params,
+          state: input.state,
+        });
+      },
       getPageTags() {
         return options.getPageTags();
       },

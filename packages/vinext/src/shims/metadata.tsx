@@ -6,6 +6,7 @@
  */
 import React from "react";
 import { makeThenableParams } from "./thenable-params.js";
+import { isAbsoluteOrProtocolRelativeUrl } from "./url-utils.js";
 
 // ---------------------------------------------------------------------------
 // Viewport types and resolution
@@ -139,15 +140,7 @@ export type Metadata = {
     description?: string;
     url?: string | URL;
     siteName?: string;
-    images?:
-      | string
-      | URL
-      | { url: string | URL; width?: number; height?: number; alt?: string; type?: string }
-      | Array<
-          | string
-          | URL
-          | { url: string | URL; width?: number; height?: number; alt?: string; type?: string }
-        >;
+    images?: string | URL | SocialImageDescriptor | Array<string | URL | SocialImageDescriptor>;
     videos?: Array<{ url: string | URL; width?: number; height?: number }>;
     audio?: Array<{ url: string | URL }>;
     locale?: string;
@@ -162,15 +155,7 @@ export type Metadata = {
     siteId?: string;
     title?: string;
     description?: string;
-    images?:
-      | string
-      | URL
-      | { url: string | URL; alt?: string; width?: number; height?: number; type?: string }
-      | Array<
-          | string
-          | URL
-          | { url: string | URL; alt?: string; width?: number; height?: number; type?: string }
-        >;
+    images?: string | URL | SocialImageDescriptor | Array<string | URL | SocialImageDescriptor>;
     creator?: string;
     creatorId?: string;
     players?: TwitterPlayerDescriptor | TwitterPlayerDescriptor[];
@@ -266,6 +251,14 @@ type TwitterAppDescriptor = {
   name?: string;
 };
 
+type SocialImageDescriptor = {
+  url: string | URL;
+  alt?: string;
+  width?: number;
+  height?: number;
+  type?: string;
+};
+
 type IconDescriptor = {
   url: string | URL;
   sizes?: string;
@@ -309,20 +302,177 @@ export type MetadataMergeEntry = {
  * Shallow merge: later entries override earlier ones (per Next.js docs).
  */
 export function mergeMetadata(metadataList: Metadata[]): Metadata {
-  return mergeMetadataEntries(
+  const merged = mergeMetadataEntries(
     metadataList.map((metadata, index) => ({
       isPage: index === metadataList.length - 1,
       metadata,
     })),
   );
+  return postProcessMetadata(merged);
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" && value !== null && !Array.isArray(value) && !(value instanceof URL)
+  );
+}
+
+function isOtherMetadata(value: unknown): value is NonNullable<Metadata["other"]> {
+  if (!isPlainObject(value)) return false;
+  return Object.values(value).every((item) => {
+    if (typeof item === "string") return true;
+    return Array.isArray(item) && item.every((nestedItem) => typeof nestedItem === "string");
+  });
+}
+
+/**
+ * Extract a plain string title from a metadata title value.
+ */
+function resolveStringTitle(title: Metadata["title"]): string | undefined {
+  if (typeof title === "string") return title;
+  if (title && typeof title === "object") {
+    return title.absolute ?? title.default ?? undefined;
+  }
+  return undefined;
+}
+
+function applyTitleTemplate(template: string | undefined, title: string): string {
+  return template ? template.replace(/%s/g, title) : title;
+}
+
+function resolveTitle(title: Metadata["title"], stashedTemplate: string | undefined) {
+  if (typeof title === "string") {
+    return applyTitleTemplate(stashedTemplate, title);
+  }
+
+  if (title && typeof title === "object") {
+    let resolved =
+      title.default === undefined ? undefined : applyTitleTemplate(stashedTemplate, title.default);
+
+    if (title.absolute) {
+      resolved = title.absolute;
+    }
+
+    return resolved;
+  }
+
+  return undefined;
+}
+
+/**
+ * Post-process merged metadata to cross-fill openGraph and Twitter fields.
+ *
+ * Next.js runs this once after all layouts/pages and file-based metadata
+ * have been resolved. When openGraph exists, it auto-fills missing
+ * twitter:title/description/images from openGraph (falling back to root
+ * metadata title/description). Existing openGraph/twitter objects also inherit
+ * missing title/description from root metadata.
+ *
+ * Ported from Next.js:
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/lib/metadata/resolve-metadata.ts
+ */
+export function postProcessMetadata(merged: Metadata): Metadata {
+  // Shallow-clone to avoid mutating the caller's object.
+  // Both current call sites (mergeMetadata, resolveAppPageHead) pass
+  // freshly-constructed objects, but this guards against future misuse.
+  const result = { ...merged };
+
+  const resolvedTitle = resolveStringTitle(result.title);
+
+  // openGraph inherits title/description from root metadata when absent
+  if (result.openGraph) {
+    const og = { ...result.openGraph };
+    if (!og.title && resolvedTitle) {
+      og.title = resolvedTitle;
+    }
+    if (!og.description && result.description) {
+      og.description = result.description;
+    }
+    result.openGraph = og;
+  }
+
+  if (result.openGraph) {
+    const autoFill: {
+      title?: string;
+      description?: string;
+      images?: NonNullable<Metadata["twitter"]>["images"];
+    } = {};
+
+    const existingTwitter = result.twitter;
+    const hasTwTitle = existingTwitter ? Boolean(existingTwitter.title) : false;
+    const hasTwDescription = existingTwitter ? Boolean(existingTwitter.description) : false;
+    const hasTwImages = existingTwitter
+      ? Object.prototype.hasOwnProperty.call(existingTwitter, "images") &&
+        Boolean(existingTwitter.images)
+      : false;
+
+    if (!hasTwTitle) {
+      if (result.openGraph.title) {
+        autoFill.title = result.openGraph.title;
+      } else if (resolvedTitle) {
+        autoFill.title = resolvedTitle;
+      }
+    }
+    if (!hasTwDescription) {
+      autoFill.description = result.openGraph.description || result.description || undefined;
+    }
+    if (!hasTwImages && result.openGraph.images !== undefined) {
+      autoFill.images = result.openGraph.images;
+    }
+
+    if (Object.keys(autoFill).length > 0) {
+      if (existingTwitter) {
+        result.twitter = { ...existingTwitter, ...autoFill };
+      } else {
+        result.twitter = autoFill;
+      }
+    }
+  }
+
+  if (result.twitter) {
+    const tw = { ...result.twitter };
+    if (!tw.title && resolvedTitle) {
+      tw.title = resolvedTitle;
+    }
+    if (!tw.description && result.description) {
+      tw.description = result.description;
+    }
+    result.twitter = tw;
+  }
+
+  // If twitter exists (either originally or via auto-fill), ensure card type is set.
+  // Next.js resolveTwitter defaults: summary_large_image when images present, else summary.
+  if (result.twitter) {
+    const tw = { ...result.twitter };
+    if (!tw.card) {
+      const images = tw.images;
+      const hasImages = Array.isArray(images) ? images.length > 0 : Boolean(images);
+      tw.card = hasImages ? "summary_large_image" : "summary";
+    }
+    result.twitter = tw;
+  }
+
+  return result;
+}
+
+/**
+ * Merge metadata from multiple sources (layouts + page).
+ *
+ * The list is ordered [rootLayout, nestedLayout, ..., page].
+ * Title template from layouts applies to the page title but NOT to
+ * the segment that defines the template itself. `title.absolute`
+ * skips all templates. `title.default` is the fallback when no
+ * child provides a title.
+ *
+ * For top-level keys, later entries override earlier ones. `other` custom meta
+ * tags are the exception: Next.js merges those across segments.
+ */
 export function mergeMetadataEntries(entries: readonly MetadataMergeEntry[]): Metadata {
   if (entries.length === 0) return {};
 
   const merged: Metadata = {};
 
-  // Track the most recent title template from LAYOUTS (not from page).
+  // Track the most recent ancestor title template from layouts (not from page).
   let parentTemplate: string | undefined;
 
   for (const entry of entries) {
@@ -330,7 +480,28 @@ export function mergeMetadataEntries(entries: readonly MetadataMergeEntry[]): Me
     const isPage = Boolean(entry.isPage);
     const contributesTitle = entry.contributesTitle !== false;
 
-    // Collect template from layouts only (page templates are ignored per Next.js spec)
+    // Merge non-title keys
+    for (const key of Object.keys(meta)) {
+      if (key === "title") continue; // Handle title separately below
+
+      const incoming = meta[key];
+      const existing = merged[key];
+
+      if (key === "other" && isOtherMetadata(existing) && isOtherMetadata(incoming)) {
+        merged.other = { ...existing, ...incoming };
+      } else {
+        // Plain replacement for everything else
+        merged[key] = incoming;
+      }
+    }
+
+    // Title resolution
+    if (contributesTitle && meta.title !== undefined) {
+      merged.title = resolveTitle(meta.title, parentTemplate);
+    }
+
+    // Collect the current layout template after resolving its own title so
+    // title.default is wrapped by the ancestor template, not by its own template.
     if (
       contributesTitle &&
       !isPage &&
@@ -339,40 +510,6 @@ export function mergeMetadataEntries(entries: readonly MetadataMergeEntry[]): Me
       meta.title.template
     ) {
       parentTemplate = meta.title.template;
-    }
-
-    // Shallow merge — later entries override earlier for top-level keys
-    for (const key of Object.keys(meta)) {
-      if (key === "title") continue; // Handle title separately below
-      (merged as Record<string, unknown>)[key] = (meta as Record<string, unknown>)[key];
-    }
-
-    // Title resolution
-    if (contributesTitle && meta.title !== undefined) {
-      merged.title = meta.title;
-    }
-  }
-
-  // Now resolve the final title, applying the parent template if applicable
-  const finalTitle = merged.title;
-  if (finalTitle) {
-    if (typeof finalTitle === "string") {
-      // Simple string title — apply parent template
-      if (parentTemplate) {
-        merged.title = parentTemplate.replace("%s", finalTitle);
-      }
-    } else if (typeof finalTitle === "object") {
-      if (finalTitle.absolute) {
-        // Absolute title — skip all templates
-        merged.title = finalTitle.absolute;
-      } else if (finalTitle.default) {
-        // Title object with default — this is used when the segment IS the
-        // defining layout (its own default doesn't get template-wrapped)
-        merged.title = finalTitle.default;
-      } else if (finalTitle.template && !finalTitle.default && !finalTitle.absolute) {
-        // Template only with no default — no title to render
-        merged.title = undefined;
-      }
     }
   }
 
@@ -457,7 +594,136 @@ function normalizeUrlDescriptorEntries<T extends { url: string | URL }>(
   return [normalizeUrlDescriptor(value, createDescriptor)];
 }
 
-export function MetadataHead({ metadata }: { metadata: Metadata }) {
+function stringifyUrl(url: string | URL): string {
+  return typeof url === "string" ? url : url.toString();
+}
+
+function createLocalMetadataBase(): URL {
+  const protocol = process.env.__NEXT_EXPERIMENTAL_HTTPS ? "https" : "http";
+  return new URL(`${protocol}://localhost:${process.env.PORT || 3000}`);
+}
+
+function getPreviewDeploymentUrl(): URL | null {
+  const origin = process.env.VERCEL_BRANCH_URL || process.env.VERCEL_URL;
+  return origin ? new URL(`https://${origin}`) : null;
+}
+
+function getProductionDeploymentUrl(): URL | null {
+  const origin = process.env.VERCEL_PROJECT_PRODUCTION_URL;
+  return origin ? new URL(`https://${origin}`) : null;
+}
+
+function getSocialImageMetadataBaseFallback(metadataBase: URL | null | undefined): URL {
+  const defaultMetadataBase = createLocalMetadataBase();
+  const previewDeploymentUrl = getPreviewDeploymentUrl();
+  const productionDeploymentUrl = getProductionDeploymentUrl();
+
+  if (process.env.NODE_ENV === "development") {
+    return defaultMetadataBase;
+  }
+
+  if (
+    process.env.NODE_ENV === "production" &&
+    process.env.VERCEL_ENV === "preview" &&
+    previewDeploymentUrl
+  ) {
+    return previewDeploymentUrl;
+  }
+
+  return metadataBase || productionDeploymentUrl || defaultMetadataBase;
+}
+
+function trimSlashes(value: string): string {
+  return value.replace(/^\/+|\/+$/g, "");
+}
+
+function joinMetadataPath(basePathname: string, pathname: string): string {
+  if (!basePathname || basePathname === "/") {
+    return pathname;
+  }
+
+  const base = trimSlashes(basePathname);
+  const path = trimSlashes(pathname);
+  return path ? `/${base}/${path}` : `/${base}`;
+}
+
+function resolveRelativeMetadataUrl(url: string, pathname: string): string {
+  if (url === "." || url === "./") {
+    return pathname || "/";
+  }
+  if (!url.startsWith("./")) {
+    return url;
+  }
+
+  const base = pathname === "/" ? "" : pathname.replace(/\/+$/g, "");
+  return `${base}/${url.slice(2)}`;
+}
+
+function formatResolvedMetadataUrl(url: URL): string {
+  if (url.pathname === "/" && url.search === "" && url.hash === "") {
+    return url.origin;
+  }
+  return url.href;
+}
+
+function resolveMetadataUrl(url: string | URL, metadataBase: URL | null | undefined): string {
+  const value = stringifyUrl(url);
+  if (isAbsoluteOrProtocolRelativeUrl(value) || !metadataBase) {
+    return value;
+  }
+
+  try {
+    return formatResolvedMetadataUrl(
+      new URL(joinMetadataPath(metadataBase.pathname, value), metadataBase),
+    );
+  } catch {
+    return value;
+  }
+}
+
+function resolveCanonicalUrl(
+  url: string | URL,
+  metadataBase: URL | null | undefined,
+  pathname: string,
+): string {
+  if (url instanceof URL) {
+    return resolveMetadataUrl(url, metadataBase);
+  }
+  return resolveMetadataUrl(resolveRelativeMetadataUrl(url, pathname), metadataBase);
+}
+
+function isSocialImageDescriptor(
+  value: string | URL | SocialImageDescriptor,
+): value is SocialImageDescriptor {
+  return typeof value === "object" && !(value instanceof URL);
+}
+
+function isMetadataRouteSocialImage(value: SocialImageDescriptor): boolean {
+  return Reflect.get(value, "metadataRoute") === true;
+}
+
+function resolveSocialImageUrl(
+  image: string | URL | SocialImageDescriptor,
+  metadataBase: URL | null | undefined,
+): string {
+  const imageUrl = isSocialImageDescriptor(image) ? image.url : image;
+  const metadataRoute = isSocialImageDescriptor(image) && isMetadataRouteSocialImage(image);
+  if (
+    typeof imageUrl === "string" &&
+    !isAbsoluteOrProtocolRelativeUrl(imageUrl) &&
+    (!metadataBase || metadataRoute)
+  ) {
+    return resolveMetadataUrl(imageUrl, getSocialImageMetadataBaseFallback(metadataBase));
+  }
+  return resolveMetadataUrl(imageUrl, metadataBase);
+}
+
+type MetadataHeadProps = {
+  metadata: Metadata;
+  pathname?: string;
+};
+
+export function MetadataHead({ metadata, pathname = "/" }: MetadataHeadProps) {
   const elements: React.ReactElement[] = [];
   let key = 0;
 
@@ -467,15 +733,7 @@ export function MetadataHead({ metadata }: { metadata: Metadata }) {
   function resolveUrl(url: string | URL | undefined): string | undefined;
   function resolveUrl(url: string | URL | undefined): string | undefined {
     if (!url) return undefined;
-    // Coerce URL objects to strings (Next.js metadata allows string | URL)
-    const s = typeof url === "string" ? url : url instanceof URL ? url.toString() : String(url);
-    if (!base) return s;
-    if (s.startsWith("http://") || s.startsWith("https://") || s.startsWith("//")) return s;
-    try {
-      return new URL(s, base).toString();
-    } catch {
-      return s;
-    }
+    return resolveMetadataUrl(url, base);
   }
 
   // Title
@@ -620,8 +878,9 @@ export function MetadataHead({ metadata }: { metadata: Metadata }) {
             ? og.images
             : [og.images];
       for (const img of imgList) {
-        const imgUrl = typeof img === "string" || img instanceof URL ? img : img.url;
-        elements.push(<meta key={key++} property="og:image" content={resolveUrl(imgUrl)} />);
+        elements.push(
+          <meta key={key++} property="og:image" content={resolveSocialImageUrl(img, base)} />,
+        );
         if (typeof img !== "string" && !(img instanceof URL)) {
           if (img.width)
             elements.push(
@@ -678,8 +937,9 @@ export function MetadataHead({ metadata }: { metadata: Metadata }) {
             ? tw.images
             : [tw.images];
       for (const img of imgList) {
-        const imgUrl = typeof img === "string" || img instanceof URL ? img : img.url;
-        elements.push(<meta key={key++} name="twitter:image" content={resolveUrl(imgUrl)} />);
+        elements.push(
+          <meta key={key++} name="twitter:image" content={resolveSocialImageUrl(img, base)} />,
+        );
         if (typeof img !== "string" && !(img instanceof URL)) {
           if (img.type) {
             elements.push(<meta key={key++} name="twitter:image:type" content={img.type} />);
@@ -810,14 +1070,20 @@ export function MetadataHead({ metadata }: { metadata: Metadata }) {
 
   // Manifest
   if (metadata.manifest) {
-    elements.push(<link key={key++} rel="manifest" href={resolveUrl(metadata.manifest)} />);
+    elements.push(<link key={key++} rel="manifest" href={stringifyUrl(metadata.manifest)} />);
   }
 
   // Alternates
   if (metadata.alternates) {
     const alt = metadata.alternates;
     if (alt.canonical) {
-      elements.push(<link key={key++} rel="canonical" href={resolveUrl(alt.canonical)} />);
+      elements.push(
+        <link
+          key={key++}
+          rel="canonical"
+          href={resolveCanonicalUrl(alt.canonical, base, pathname)}
+        />,
+      );
     }
     if (alt.languages) {
       for (const [lang, href] of Object.entries(alt.languages)) {

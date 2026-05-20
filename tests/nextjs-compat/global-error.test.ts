@@ -65,6 +65,16 @@ describe("Next.js compat: global-error", () => {
     expect(html).not.toContain("outer-error-boundary");
   });
 
+  it("route group error.tsx without sibling layout catches descendant server errors", async () => {
+    // Next.js loader trees attach error conventions to the segment even when
+    // that segment has no layout:
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/build/webpack/loaders/next-app-loader/index.ts
+    const { res, html } = await fetchHtml(baseUrl, "/nextjs-compat/route-group-error/child");
+    expect(res.status).toBe(200);
+    expect(html).toContain("Route group error boundary");
+    expect(html).not.toContain("global-error");
+  });
+
   // ── Server component error (RSC throw -> global-error) ─────
   // Next.js: it('should render global error for error in server components', ...)
   // Source: https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/global-error/basic/index.test.ts#L29-L49

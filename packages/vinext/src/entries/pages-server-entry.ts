@@ -7,7 +7,7 @@
  *
  * Extracted from index.ts.
  */
-import { resolveEntryPath } from "./runtime-entry-module.js";
+import { resolveEntryPath, normalizePathSeparators } from "./runtime-entry-module.js";
 import { pagesRouter, apiRouter, type Route } from "../routing/pages-router.js";
 import { createValidFileMatcher } from "../routing/file-matcher.js";
 import { type ResolvedNextConfig } from "../config/next-config.js";
@@ -27,6 +27,7 @@ const _pagesNodeCompatPath = resolveEntryPath("../server/pages-node-compat.js", 
 const _pagesApiRoutePath = resolveEntryPath("../server/pages-api-route.js", import.meta.url);
 const _isrCachePath = resolveEntryPath("../server/isr-cache.js", import.meta.url);
 const _cspPath = resolveEntryPath("../server/csp.js", import.meta.url);
+const _serverGlobalsPath = resolveEntryPath("../server/server-globals.js", import.meta.url);
 
 /**
  * Generate the virtual SSR server entry module.
@@ -45,18 +46,18 @@ export async function generateServerEntry(
   // Generate import statements using absolute paths since virtual
   // modules don't have a real file location for relative resolution.
   const pageImports = pageRoutes.map((r: Route, i: number) => {
-    const absPath = r.filePath.replace(/\\/g, "/");
+    const absPath = normalizePathSeparators(r.filePath);
     return `import * as page_${i} from ${JSON.stringify(absPath)};`;
   });
 
   const apiImports = apiRoutes.map((r: Route, i: number) => {
-    const absPath = r.filePath.replace(/\\/g, "/");
+    const absPath = normalizePathSeparators(r.filePath);
     return `import * as api_${i} from ${JSON.stringify(absPath)};`;
   });
 
   // Build the route table — include filePath for SSR manifest lookup
   const pageRouteEntries = pageRoutes.map((r: Route, i: number) => {
-    const absPath = r.filePath.replace(/\\/g, "/");
+    const absPath = normalizePathSeparators(r.filePath);
     return `  { pattern: ${JSON.stringify(r.pattern)}, patternParts: ${JSON.stringify(r.patternParts)}, isDynamic: ${r.isDynamic}, params: ${JSON.stringify(r.params)}, module: page_${i}, filePath: ${JSON.stringify(absPath)} }`;
   });
 
@@ -68,14 +69,21 @@ export async function generateServerEntry(
   // Check for _app and _document
   const appFilePath = findFileWithExts(pagesDir, "_app", fileMatcher);
   const docFilePath = findFileWithExts(pagesDir, "_document", fileMatcher);
+  // Embed the resolved _app path (or null) so the runtime can look it up
+  // in the SSR manifest and include any CSS/JS chunks `_app` brings in
+  // (e.g. global stylesheets imported by `_app.tsx`) alongside the page's
+  // own assets. Without this, `_app`-imported CSS is emitted by Vite but
+  // never `<link>`ed from the rendered HTML — see LHF-5 cluster.
+  const appAssetPathJson =
+    appFilePath !== null ? JSON.stringify(normalizePathSeparators(appFilePath)) : "null";
   const appImportCode =
     appFilePath !== null
-      ? `import { default as AppComponent } from ${JSON.stringify(appFilePath.replace(/\\/g, "/"))};`
+      ? `import { default as AppComponent } from ${JSON.stringify(normalizePathSeparators(appFilePath))};`
       : `const AppComponent = null;`;
 
   const docImportCode =
     docFilePath !== null
-      ? `import { default as DocumentComponent } from ${JSON.stringify(docFilePath.replace(/\\/g, "/"))};`
+      ? `import { default as DocumentComponent } from ${JSON.stringify(normalizePathSeparators(docFilePath))};`
       : `const DocumentComponent = null;`;
 
   // Serialize i18n config for embedding in the server entry
@@ -96,6 +104,7 @@ export async function generateServerEntry(
   // so prod-server.ts can apply them without loading next.config.js at runtime.
   const vinextConfigJson = JSON.stringify({
     basePath: nextConfig?.basePath ?? "",
+    assetPrefix: nextConfig?.assetPrefix ?? "",
     trailingSlash: nextConfig?.trailingSlash ?? false,
     redirects: nextConfig?.redirects ?? [],
     rewrites: nextConfig?.rewrites ?? { beforeFiles: [], afterFiles: [], fallback: [] },
@@ -106,6 +115,7 @@ export async function generateServerEntry(
       deviceSizes: nextConfig?.images?.deviceSizes,
       imageSizes: nextConfig?.images?.imageSizes,
       dangerouslyAllowSVG: nextConfig?.images?.dangerouslyAllowSVG,
+      dangerouslyAllowLocalIP: nextConfig?.images?.dangerouslyAllowLocalIP,
       contentDispositionType: nextConfig?.images?.contentDispositionType,
       contentSecurityPolicy: nextConfig?.images?.contentSecurityPolicy,
     },
@@ -121,7 +131,7 @@ export async function generateServerEntry(
   // The onRequestError handler is stored on globalThis so it is visible across
   // all code within the Worker (same global scope).
   const instrumentationImportCode = instrumentationPath
-    ? `import * as _instrumentation from ${JSON.stringify(instrumentationPath.replace(/\\/g, "/"))};`
+    ? `import * as _instrumentation from ${JSON.stringify(normalizePathSeparators(instrumentationPath))};`
     : "";
 
   const instrumentationInitCode = instrumentationPath
@@ -140,7 +150,7 @@ if (typeof _instrumentation.onRequestError === "function") {
 
   // Generate middleware code if middleware.ts exists
   const middlewareImportCode = middlewarePath
-    ? `import * as middlewareModule from ${JSON.stringify(middlewarePath.replace(/\\/g, "/"))};`
+    ? `import * as middlewareModule from ${JSON.stringify(normalizePathSeparators(middlewarePath))};`
     : "";
 
   // The matcher config is read from the middleware module at request time.
@@ -167,6 +177,7 @@ export async function runMiddleware() { return { continue: true }; }
   // The server entry is a self-contained module that uses Web-standard APIs
   // (Request/Response, renderToReadableStream) so it runs on Cloudflare Workers.
   return `
+import ${JSON.stringify(_serverGlobalsPath)};
 import React from "react";
 import { renderToReadableStream } from "react-dom/server.edge";
 import { resetSSRHead, getSSRHeadHTML } from "next/head";
@@ -214,6 +225,11 @@ const buildId = ${buildIdJson};
 
 // Full resolved config for production server (embedded at build time)
 export const vinextConfig = ${vinextConfigJson};
+
+// Path to the user's pages/_app file (or null). Used to look up the
+// _app's CSS/JS chunks in the SSR manifest so any global styles imported
+// by _app are included in every page's <link rel="stylesheet"> set.
+const _appAssetPath = ${appAssetPathJson};
 
 function isrGet(key) {
   return __sharedIsrGet(key);
@@ -275,6 +291,20 @@ function matchRoute(url, routes) {
   return _trieMatch(trie, urlParts);
 }
 
+export function matchPageRoute(url, request) {
+  const routeUrl = i18nConfig && request
+    ? resolvePagesI18nRequest(
+        url,
+        i18nConfig,
+        request.headers,
+        new URL(request.url).hostname,
+        vinextConfig.basePath,
+        vinextConfig.trailingSlash,
+      ).url
+    : url;
+  return matchRoute(routeUrl, pageRoutes);
+}
+
 function parseQuery(url) {
   const qs = url.split("?")[1];
   if (!qs) return {};
@@ -290,11 +320,18 @@ function parseQuery(url) {
   return q;
 }
 
+function mergeRouteParamsIntoQuery(query, params) {
+  return Object.assign(query, params);
+}
+
 function patternToNextFormat(pattern) {
+  // Match any non-/ param name. Non-greedy with lookahead prevents
+  // the +/* suffix being consumed into the param name when the name
+  // itself contains + or * internally (e.g. :c++lang → [c++lang]).
   return pattern
-    .replace(/:([\\w]+)\\*/g, "[[...$1]]")
-    .replace(/:([\\w]+)\\+/g, "[...$1]")
-    .replace(/:([\\w]+)/g, "[$1]");
+    .replace(/:([^\\/]+?)\\+(?=\\/|$)/g, "[...$1]")
+    .replace(/:([^\\/]+?)\\*(?=\\/|$)/g, "[[...$1]]")
+    .replace(/:([^\\/]+?)(?=\\/|$)/g, "[$1]");
 }
 
 function collectAssetTags(manifest, moduleIds, scriptNonce) {
@@ -406,53 +443,6 @@ function collectAssetTags(manifest, moduleIds, scriptNonce) {
   return tags.join("\\n  ");
 }
 
-// i18n helpers
-function extractLocale(url) {
-  if (!i18nConfig) return { locale: undefined, url, hadPrefix: false };
-  const pathname = url.split("?")[0];
-  const parts = pathname.split("/").filter(Boolean);
-  const query = url.includes("?") ? url.slice(url.indexOf("?")) : "";
-  if (parts.length > 0 && i18nConfig.locales.includes(parts[0])) {
-    const locale = parts[0];
-    const rest = "/" + parts.slice(1).join("/");
-    return { locale, url: (rest || "/") + query, hadPrefix: true };
-  }
-  return { locale: i18nConfig.defaultLocale, url, hadPrefix: false };
-}
-
-function detectLocaleFromHeaders(headers) {
-  if (!i18nConfig) return null;
-  const acceptLang = headers.get("accept-language");
-  if (!acceptLang) return null;
-  const langs = acceptLang.split(",").map(function(part) {
-    const pieces = part.trim().split(";");
-    const q = pieces[1] ? parseFloat(pieces[1].replace("q=", "")) : 1;
-    return { lang: pieces[0].trim().toLowerCase(), q: q };
-  }).sort(function(a, b) { return b.q - a.q; });
-  for (let k = 0; k < langs.length; k++) {
-    const lang = langs[k].lang;
-    for (let j = 0; j < i18nConfig.locales.length; j++) {
-      if (i18nConfig.locales[j].toLowerCase() === lang) return i18nConfig.locales[j];
-    }
-    const prefix = lang.split("-")[0];
-    for (let j = 0; j < i18nConfig.locales.length; j++) {
-      const loc = i18nConfig.locales[j].toLowerCase();
-      if (loc === prefix || loc.startsWith(prefix + "-")) return i18nConfig.locales[j];
-    }
-  }
-  return null;
-}
-
-function parseCookieLocaleFromHeader(cookieHeader) {
-  if (!i18nConfig || !cookieHeader) return null;
-  const match = cookieHeader.match(/(?:^|;\\s*)NEXT_LOCALE=([^;]*)/);
-  if (!match) return null;
-  var value;
-  try { value = decodeURIComponent(match[1].trim()); } catch (e) { return null; }
-  if (i18nConfig.locales.indexOf(value) !== -1) return value;
-  return null;
-}
-
 export async function renderPage(request, url, manifest, ctx, middlewareHeaders) {
   if (ctx) return _runWithExecutionContext(ctx, () => _renderPage(request, url, manifest, middlewareHeaders));
   return _renderPage(request, url, manifest, middlewareHeaders);
@@ -494,10 +484,11 @@ async function _renderPage(request, url, manifest, middlewareHeaders) {
     ensureFetchPatch();
     try {
       const routePattern = patternToNextFormat(route.pattern);
+      const query = mergeRouteParamsIntoQuery(parseQuery(routeUrl), params);
       if (typeof setSSRContext === "function") {
         setSSRContext({
           pathname: routePattern,
-          query: { ...params, ...parseQuery(routeUrl) },
+          query,
           asPath: routeUrl,
           locale: locale,
           locales: i18nConfig ? i18nConfig.locales : undefined,
@@ -534,13 +525,12 @@ async function _renderPage(request, url, manifest, middlewareHeaders) {
           _fontLinkHeader = _allFp.map(function(p) { return "<" + p.href + ">; rel=preload; as=font; type=" + p.type + "; crossorigin"; }).join(", ");
         }
       } catch (e) { /* font preloads not available */ }
-      const query = parseQuery(routeUrl);
       const pageDataResult = await __resolvePagesPageData({
         applyRequestContexts() {
           if (typeof setSSRContext === "function") {
             setSSRContext({
               pathname: routePattern,
-              query: { ...params, ...query },
+              query,
               asPath: routeUrl,
               locale: locale,
               locales: i18nConfig ? i18nConfig.locales : undefined,
@@ -609,7 +599,16 @@ async function _renderPage(request, url, manifest, middlewareHeaders) {
       var gsspRes = pageDataResult.gsspRes;
       let isrRevalidateSeconds = pageDataResult.isrRevalidateSeconds;
 
-      const pageModuleIds = route.filePath ? [route.filePath] : [];
+      // Include both the matched page module and the global _app module
+      // (if present). _app is wrapped around every page in Pages Router,
+      // and any CSS/JS it imports must be linked from the rendered HTML
+      // so the browser actually loads it. Without _app in this list, a
+      // global stylesheet imported via import "./globals.scss" in
+      // _app.tsx never reaches the page, producing the LHF-5 symptom
+      // where styled elements render with the browser default colour.
+      const pageModuleIds = [];
+      if (route.filePath) pageModuleIds.push(route.filePath);
+      if (_appAssetPath) pageModuleIds.push(_appAssetPath);
       const assetTags = collectAssetTags(manifest, pageModuleIds, scriptNonce);
 
       return __renderPagesPageResponse({
@@ -665,7 +664,6 @@ async function _renderPage(request, url, manifest, middlewareHeaders) {
         renderDocumentToString(element) {
           return renderToStringAsync(element);
         },
-        renderIsrPassToStringAsync,
         renderToReadableStream(element) {
           return renderToReadableStream(element);
         },

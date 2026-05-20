@@ -1,9 +1,15 @@
-const MIDDLEWARE_REQUEST_HEADER_PREFIX = "x-middleware-request-";
-const MIDDLEWARE_OVERRIDE_HEADERS = "x-middleware-override-headers";
-const MIDDLEWARE_SET_COOKIE_HEADER = "x-middleware-set-cookie";
+import {
+  MIDDLEWARE_OVERRIDE_HEADERS,
+  MIDDLEWARE_REQUEST_HEADER_PREFIX,
+  MIDDLEWARE_SET_COOKIE_HEADER,
+} from "./headers.js";
+const CREDENTIAL_REQUEST_HEADERS = ["authorization", "cookie"] as const;
 
 type MiddlewareHeaderValue = string | string[];
 type MiddlewareHeaderSource = Headers | Record<string, MiddlewareHeaderValue>;
+type BuildRequestHeadersOptions = {
+  preserveCredentialHeaders?: boolean;
+};
 
 function getMiddlewareHeaderValue(source: MiddlewareHeaderSource, key: string): string | null {
   if (source instanceof Headers) {
@@ -68,6 +74,7 @@ export function encodeMiddlewareRequestHeaders(
 export function buildRequestHeadersFromMiddlewareResponse(
   baseHeaders: Headers,
   middlewareHeaders: MiddlewareHeaderSource,
+  options: BuildRequestHeadersOptions = {},
 ): Headers | null {
   const overrideHeaderNames = getOverrideHeaderNames(middlewareHeaders);
   const forwardedHeaders = getForwardedRequestHeaders(middlewareHeaders);
@@ -83,6 +90,18 @@ export function buildRequestHeadersFromMiddlewareResponse(
       nextHeaders.set(key, value);
     }
     return nextHeaders;
+  }
+
+  if (options.preserveCredentialHeaders) {
+    const overrideHeaderNameSet = new Set(overrideHeaderNames);
+    for (const key of CREDENTIAL_REQUEST_HEADERS) {
+      if (overrideHeaderNameSet.has(key)) continue;
+
+      const value = baseHeaders.get(key);
+      if (value !== null) {
+        nextHeaders.set(key, value);
+      }
+    }
   }
 
   for (const key of overrideHeaderNames) {

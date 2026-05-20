@@ -19,13 +19,7 @@ import {
   renderAppPageHtmlResponse,
   type AppPageSsrHandler,
 } from "./app-page-stream.js";
-import {
-  APP_INTERCEPTION_CONTEXT_KEY,
-  APP_ROOT_LAYOUT_KEY,
-  APP_ROUTE_KEY,
-  createAppPayloadRouteId,
-  type AppElements,
-} from "./app-elements.js";
+import { AppElementsWire, type AppElements } from "./app-elements.js";
 import { createAppPageLayoutEntries } from "./app-page-route-wiring.js";
 
 // oxlint-disable-next-line @typescript-eslint/no-explicit-any
@@ -41,12 +35,19 @@ type AppPageBoundaryOnError = (
 
 type AppPageBoundaryRscPayloadOptions<TModule extends AppPageModule = AppPageModule> = {
   element: ReactNode;
+  layoutModules: readonly (TModule | null | undefined)[];
   pathname: string;
   route?: AppPageBoundaryRoute<TModule> | null;
 };
 
+type AppPageBoundaryLayoutEntry = {
+  id: string;
+  treePath: string;
+};
+
 export type AppPageBoundaryRoute<TModule extends AppPageModule = AppPageModule> = {
   error?: TModule | null;
+  errorPaths?: readonly TModule[] | null;
   errors?: readonly (TModule | null | undefined)[] | null;
   forbidden?: TModule | null;
   layoutTreePositions?: readonly number[] | null;
@@ -72,6 +73,8 @@ type AppPageBoundaryRenderCommonOptions<TModule extends AppPageModule = AppPageM
   makeThenableParams: (params: AppPageParams) => unknown;
   middlewareContext: AppPageMiddlewareContext;
   metadataRoutes: MetadataFileRoute[];
+  /** Configured next.config `basePath`, threaded into file-based metadata href emission. */
+  basePath?: string;
   renderToReadableStream: (
     element: ReactNode | AppElements,
     options: { onError: AppPageBoundaryOnError },
@@ -94,6 +97,14 @@ type RenderAppPageHttpAccessFallbackOptions<TModule extends AppPageModule = AppP
   rootNotFoundModule?: TModule | null;
   rootUnauthorizedModule?: TModule | null;
   route?: AppPageBoundaryRoute<TModule> | null;
+  /**
+   * When true, the resolved boundary is rendered without wrapping it in the
+   * route's layouts. Used by `global-not-found.tsx`, which provides its own
+   * `<html>`/`<body>` and intentionally replaces the root layout.
+   * Mirrors Next.js's `createNotFoundLoaderTree` behavior for `hasGlobalNotFound`.
+   * @see https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/app-render.tsx#L495-L520
+   */
+  skipLayoutWrapping?: boolean;
   statusCode: number;
 } & AppPageBoundaryRenderCommonOptions<TModule>;
 
@@ -162,26 +173,19 @@ function wrapRenderedBoundaryElement<TModule extends AppPageModule>(
   });
 }
 
-function resolveAppPageBoundaryRootLayoutTreePath<TModule extends AppPageModule>(
+function createAppPageBoundaryLayoutEntries<TModule extends AppPageModule>(
   route: AppPageBoundaryRoute<TModule> | null | undefined,
-): string | null {
-  if (route?.layouts) {
-    const rootLayoutEntry = createAppPageLayoutEntries({
-      errors: route.errors,
-      layoutTreePositions: route.layoutTreePositions,
-      layouts: route.layouts,
-      notFounds: null,
-      routeSegments: route.routeSegments,
-    })[0];
+  layoutModules: readonly (TModule | null | undefined)[],
+): readonly AppPageBoundaryLayoutEntry[] {
+  if (!route || layoutModules.length === 0) return [];
 
-    if (rootLayoutEntry) {
-      return rootLayoutEntry.treePath;
-    }
-  }
-
-  // Without route tree metadata we cannot derive a canonical root layout tree path.
-  // Returning null keeps boundary payloads soft-navigation compatible.
-  return null;
+  return createAppPageLayoutEntries({
+    errors: route.errors,
+    layoutTreePositions: route.layoutTreePositions,
+    layouts: layoutModules,
+    notFounds: null,
+    routeSegments: route.routeSegments,
+  });
 }
 
 function resolveHttpAccessFallbackHeadRouteSegments<TModule extends AppPageModule>(
@@ -219,12 +223,16 @@ function resolveHttpAccessFallbackHeadLayoutTreePositions<TModule extends AppPag
 function createAppPageBoundaryRscPayload<TModule extends AppPageModule>(
   options: AppPageBoundaryRscPayloadOptions<TModule>,
 ): AppElements {
-  const routeId = createAppPayloadRouteId(options.pathname, null);
+  const routeId = AppElementsWire.encodeRouteId(options.pathname, null);
+  const layoutEntries = createAppPageBoundaryLayoutEntries(options.route, options.layoutModules);
 
   return {
-    [APP_INTERCEPTION_CONTEXT_KEY]: null,
-    [APP_ROUTE_KEY]: routeId,
-    [APP_ROOT_LAYOUT_KEY]: resolveAppPageBoundaryRootLayoutTreePath(options.route),
+    ...AppElementsWire.createMetadataEntries({
+      interceptionContext: null,
+      layoutIds: layoutEntries.map((entry) => entry.id),
+      rootLayoutTreePath: layoutEntries[0]?.treePath ?? null,
+      routeId,
+    }),
     [routeId]: options.element,
   };
 }
@@ -241,6 +249,7 @@ async function renderAppPageBoundaryElementResponse<TModule extends AppPageModul
   const pathname = new URL(options.requestUrl).pathname;
   const payload = createAppPageBoundaryRscPayload({
     element: options.element,
+    layoutModules: options.layoutModules,
     pathname,
     route: options.route,
   });
@@ -296,8 +305,10 @@ export async function renderAppPageHttpAccessFallback<TModule extends AppPageMod
   }
 
   const layoutModules = options.layoutModules ?? options.route?.layouts ?? options.rootLayouts;
+  const pathname = new URL(options.requestUrl).pathname;
   const routeSegments = resolveHttpAccessFallbackHeadRouteSegments(options.route, layoutModules);
   const { metadata, viewport } = await resolveAppPageHead({
+    basePath: options.basePath ?? "",
     layoutModules,
     layoutTreePositions: resolveHttpAccessFallbackHeadLayoutTreePositions(
       options.route,
@@ -305,7 +316,7 @@ export async function renderAppPageHttpAccessFallback<TModule extends AppPageMod
     ),
     metadataRoutes: options.metadataRoutes,
     params: options.matchedParams,
-    routePath: options.route?.pattern ?? new URL(options.requestUrl).pathname,
+    routePath: options.route?.pattern ?? pathname,
     routeSegments,
   });
 
@@ -314,10 +325,11 @@ export async function renderAppPageHttpAccessFallback<TModule extends AppPageMod
     createElement("meta", { content: "noindex", key: "robots", name: "robots" }),
   ];
   if (metadata) {
-    headElements.push(createElement(MetadataHead, { key: "metadata", metadata }));
+    headElements.push(createElement(MetadataHead, { key: "metadata", metadata, pathname }));
   }
   headElements.push(createElement(ViewportHead, { key: "viewport", viewport }));
 
+  const skipLayoutWrapping = options.skipLayoutWrapping ?? false;
   const element = wrapRenderedBoundaryElement({
     element: createElement(Fragment, null, ...headElements, createElement(boundaryComponent)),
     globalErrorModule: options.globalErrorModule,
@@ -329,13 +341,17 @@ export async function renderAppPageHttpAccessFallback<TModule extends AppPageMod
     matchedParams: options.matchedParams,
     resolveChildSegments: options.resolveChildSegments,
     routeSegments: options.route?.routeSegments,
+    skipLayoutWrapping,
   });
 
   return renderAppPageBoundaryElementResponse({
     ...options,
+    // When global-not-found owns the document, no layouts should contribute to
+    // the RSC payload's layout entries either — otherwise the SSR pipeline
+    // would expect a root-layout tree path that doesn't exist in the markup.
     element,
-    layoutModules,
-    route: options.route,
+    layoutModules: skipLayoutWrapping ? [] : layoutModules,
+    route: skipLayoutWrapping ? null : options.route,
     routePattern: options.route?.pattern,
     status: options.statusCode,
   });
@@ -346,6 +362,7 @@ export async function renderAppPageErrorBoundary<TModule extends AppPageModule>(
 ): Promise<Response | null> {
   const errorBoundary = resolveAppPageErrorBoundary({
     getDefaultExport,
+    errorModules: options.route?.errorPaths,
     globalErrorModule: options.globalErrorModule,
     layoutErrorModules: options.route?.errors,
     pageErrorModule: options.route?.error,
@@ -366,6 +383,7 @@ export async function renderAppPageErrorBoundary<TModule extends AppPageModule>(
   if (!errorBoundary.isGlobalError) {
     try {
       const { metadata, viewport } = await resolveAppPageHead({
+        basePath: options.basePath ?? "",
         fallbackOnFileMetadataError: true,
         layoutModules,
         layoutTreePositions: options.route?.layoutTreePositions,
@@ -375,7 +393,7 @@ export async function renderAppPageErrorBoundary<TModule extends AppPageModule>(
         routeSegments: options.route?.routeSegments,
       });
       if (metadata) {
-        headElements.push(createElement(MetadataHead, { key: "metadata", metadata }));
+        headElements.push(createElement(MetadataHead, { key: "metadata", metadata, pathname }));
       }
       headElements.push(createElement(ViewportHead, { key: "viewport", viewport }));
     } catch (error) {

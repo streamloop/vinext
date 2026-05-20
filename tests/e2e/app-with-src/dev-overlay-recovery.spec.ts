@@ -14,9 +14,18 @@ test.describe("Dev recovery boundary (no global-error.tsx)", () => {
     await page.goto(`${BASE}/`);
     await expect(page.locator("#app-with-src-home")).toBeVisible();
     await page.waitForFunction(
-      () =>
-        typeof (window as unknown as { __VINEXT_RSC_NAVIGATE__?: unknown })
-          .__VINEXT_RSC_NAVIGATE__ === "function",
+      () => {
+        const runtime = Reflect.get(window, Symbol.for("vinext.navigationRuntime"));
+        return (
+          typeof runtime === "object" &&
+          runtime !== null &&
+          "functions" in runtime &&
+          typeof runtime.functions === "object" &&
+          runtime.functions !== null &&
+          "navigate" in runtime.functions &&
+          typeof runtime.functions.navigate === "function"
+        );
+      },
       undefined,
       { timeout: 10_000 },
     );

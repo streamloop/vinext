@@ -1,5 +1,5 @@
 import React from "react";
-import { describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { dispatchAppPage } from "../packages/vinext/src/server/app-page-dispatch.js";
 import type { AppPageMiddlewareContext } from "../packages/vinext/src/server/app-page-response.js";
 import type { ISRCacheEntry } from "../packages/vinext/src/server/isr-cache.js";
@@ -73,6 +73,10 @@ function createDispatchOptions(
     buildPageElement?: DispatchOptions["buildPageElement"];
     clearRequestContext?: DispatchOptions["clearRequestContext"];
     generateStaticParams?: DispatchOptions["generateStaticParams"];
+    formState?: DispatchOptions["formState"];
+    actionError?: DispatchOptions["actionError"];
+    actionFailed?: DispatchOptions["actionFailed"];
+    isProgressiveActionRender?: DispatchOptions["isProgressiveActionRender"];
     isProduction?: boolean;
     isRscRequest?: boolean;
     isrGet?: DispatchOptions["isrGet"];
@@ -123,7 +127,11 @@ function createDispatchOptions(
     hasPageDefaultExport: true,
     hasPageModule: true,
     handlerStart: 10,
+    formState: overrides.formState,
+    actionError: overrides.actionError,
+    actionFailed: overrides.actionFailed,
     interceptionContext: null,
+    isProgressiveActionRender: overrides.isProgressiveActionRender,
     isProduction: overrides.isProduction ?? false,
     isRscRequest: overrides.isRscRequest ?? false,
     isrGet,
@@ -177,6 +185,10 @@ function createDispatchOptions(
 }
 
 describe("app page dispatch", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("serves cached production HTML instead of revalidating params or rendering", async () => {
     const { options } = createDispatchOptions({
       async buildPageElement() {
@@ -196,6 +208,141 @@ describe("app page dispatch", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("x-vinext-cache")).toBe("HIT");
     await expect(response.text()).resolves.toBe("<html>cached</html>");
+  });
+
+  it("bypasses cached production HTML when draft mode is enabled", async () => {
+    vi.stubEnv("__VINEXT_DRAFT_SECRET", "draft-secret");
+    const isrGet = vi.fn(async () =>
+      buildISRCacheEntry(buildCachedAppPageValue("<html>stale</html>")),
+    );
+    const { options } = createDispatchOptions({
+      buildPageElement: vi.fn(async () => React.createElement("main", null, "draft page")),
+      isProduction: true,
+      isrGet,
+      request: new Request("https://example.test/posts/hello", {
+        headers: { Cookie: "__prerender_bypass=draft-secret" },
+      }),
+      revalidateSeconds: 60,
+      renderToReadableStream() {
+        return createStream(["flight"]);
+      },
+    });
+
+    const response = await dispatchAppPage(options);
+
+    expect(isrGet).not.toHaveBeenCalled();
+    expect(response.headers.get("x-vinext-cache")).toBeNull();
+    await expect(response.text()).resolves.toBe("<html>page</html>");
+  });
+
+  it("bypasses cached production HTML when rendering action form state", async () => {
+    const formState = ["action-result", "key-path", "reference-id", 1] as never;
+    const isrGet = vi.fn(async () =>
+      buildISRCacheEntry(buildCachedAppPageValue("<html>cached initial state</html>")),
+    );
+    const { options } = createDispatchOptions({
+      formState,
+      isProgressiveActionRender: true,
+      isProduction: true,
+      isrGet,
+      revalidateSeconds: 60,
+    });
+
+    const response = await dispatchAppPage(options);
+
+    expect(isrGet).not.toHaveBeenCalled();
+    expect(response.headers.get("x-vinext-cache")).toBeNull();
+    expect(response.headers.get("cache-control")).toBe("no-store, must-revalidate");
+    await expect(response.text()).resolves.toBe("<html>page</html>");
+  });
+
+  it("bypasses cached production HTML when a progressive action returns no form state", async () => {
+    const isrGet = vi.fn(async () =>
+      buildISRCacheEntry(buildCachedAppPageValue("<html>cached initial state</html>")),
+    );
+    const { options } = createDispatchOptions({
+      isProgressiveActionRender: true,
+      isProduction: true,
+      isrGet,
+      revalidateSeconds: 60,
+    });
+
+    const response = await dispatchAppPage(options);
+
+    expect(isrGet).not.toHaveBeenCalled();
+    expect(options.isrSet).not.toHaveBeenCalled();
+    expect(response.headers.get("x-vinext-cache")).toBeNull();
+    expect(response.headers.get("cache-control")).toBe("no-store, must-revalidate");
+    await expect(response.text()).resolves.toBe("<html>page</html>");
+  });
+
+  it("renders not-found HTML when a progressive action calls notFound()", async () => {
+    const buildPageElement = vi.fn(async () => React.createElement("main", null, "page"));
+    const renderHttpAccessFallbackPage = vi.fn(
+      async () => new Response("<html>not found</html>", { status: 404 }),
+    );
+    const { options } = createDispatchOptions({
+      actionError: { digest: "NEXT_HTTP_ERROR_FALLBACK;404" },
+      actionFailed: true,
+      buildPageElement,
+      isProgressiveActionRender: true,
+    });
+    options.renderHttpAccessFallbackPage = renderHttpAccessFallbackPage;
+
+    const response = await dispatchAppPage(options);
+
+    expect(response.status).toBe(404);
+    await expect(response.text()).resolves.toBe("<html>not found</html>");
+    expect(buildPageElement).not.toHaveBeenCalled();
+    expect(renderHttpAccessFallbackPage).toHaveBeenCalledWith(
+      404,
+      { matchedParams: { slug: "hello" } },
+      null,
+    );
+  });
+
+  it("does not bypass cached production HTML for arbitrary draft cookie values", async () => {
+    vi.stubEnv("__VINEXT_DRAFT_SECRET", "draft-secret");
+    const isrGet = vi.fn(async () =>
+      buildISRCacheEntry(buildCachedAppPageValue("<html>cached</html>")),
+    );
+    const { options } = createDispatchOptions({
+      async buildPageElement() {
+        throw new Error("invalid draft cookie should still use the page cache");
+      },
+      isProduction: true,
+      isrGet,
+      request: new Request("https://example.test/posts/hello", {
+        headers: { Cookie: "__prerender_bypass=wrong-secret" },
+      }),
+      revalidateSeconds: 60,
+    });
+
+    const response = await dispatchAppPage(options);
+
+    expect(isrGet).toHaveBeenCalledOnce();
+    expect(response.headers.get("x-vinext-cache")).toBe("HIT");
+    await expect(response.text()).resolves.toBe("<html>cached</html>");
+  });
+
+  it("serves cached production HTML for indefinite revalidate=false pages", async () => {
+    const { options } = createDispatchOptions({
+      async buildPageElement() {
+        throw new Error("revalidate=false cache hit should not render the page");
+      },
+      isProduction: true,
+      isrGet: vi.fn(async () =>
+        buildISRCacheEntry(buildCachedAppPageValue("<html>static cached</html>")),
+      ),
+      revalidateSeconds: Infinity,
+    });
+
+    const response = await dispatchAppPage(options);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("s-maxage=31536000, stale-while-revalidate");
+    expect(response.headers.get("x-vinext-cache")).toBe("HIT");
+    await expect(response.text()).resolves.toBe("<html>static cached</html>");
   });
 
   it("returns method policy responses instead of rendering unsupported methods", async () => {
@@ -229,7 +376,7 @@ describe("app page dispatch", () => {
     });
 
     expect(response.status).toBe(404);
-    await expect(response.text()).resolves.toBe("Not Found");
+    await expect(response.text()).resolves.toBe("This page could not be found");
   });
 
   it("serves intercepted RSC source-route payloads with middleware response state", async () => {
@@ -271,7 +418,7 @@ describe("app page dispatch", () => {
     });
 
     expect(response.status).toBe(202);
-    expect(response.headers.get("content-type")).toBe("text/x-component; charset=utf-8");
+    expect(response.headers.get("content-type")).toBe("text/x-component");
     expect(response.headers.get("x-from-middleware")).toBe("yes");
     await expect(response.text()).resolves.toBe("/feed:{}:modal@app/feed/@modal");
   });

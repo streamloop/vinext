@@ -7,6 +7,7 @@
  *   vinext build   Build for production
  *   vinext start   Start production server
  *   vinext deploy  Deploy to Cloudflare Workers
+ *   vinext typegen Generate App Router route helper types
  *   vinext lint    Run linter (delegates to eslint/oxlint)
  *
  * Automatically configures Vite with the vinext plugin — no vite.config.ts
@@ -14,7 +15,6 @@
  */
 
 import vinext from "./index.js";
-import { printBuildReport } from "./build/report.js";
 import { runPrerender } from "./build/run-prerender.js";
 import path from "node:path";
 import fs from "node:fs";
@@ -30,6 +30,12 @@ import { loadNextConfig, resolveNextConfig, PHASE_PRODUCTION_BUILD } from "./con
 import { emitStandaloneOutput } from "./build/standalone.js";
 import { resolveVinextPackageRoot } from "./utils/vinext-root.js";
 import { parseArgs } from "./cli-args.js";
+import {
+  type DevLockfile,
+  formatAlreadyRunningError,
+  tryAcquireLockfile,
+} from "./server/dev-lockfile.js";
+import { generateRouteTypes } from "./typegen.js";
 
 // ─── Resolve Vite from the project root ────────────────────────────────────────
 //
@@ -299,15 +305,106 @@ async function dev() {
   const port = parsed.port ?? 3000;
   const host = parsed.hostname ?? "localhost";
 
+  // Acquire the dev lock file. If another live `vinext dev` is running in this
+  // directory, print an actionable error (PID + URL) and exit. This is
+  // especially useful for AI coding agents, which frequently attempt to start
+  // a dev server without knowing one is already running.
+  //
+  // Disabled when VINEXT_NO_DEV_LOCK is set (escape hatch for unusual setups).
+  let lockfile: DevLockfile | undefined;
+  // Capture the acquisition timestamp so we can preserve it across the
+  // post-listen update(). `startedAt` is meant to reflect when this process
+  // started, not when the URL was resolved.
+  const startedAt = Date.now();
+  if (process.env.VINEXT_NO_DEV_LOCK !== "1") {
+    const root = process.cwd();
+    // Substitute "localhost" for wildcard binds so the URL is actually
+    // clickable when surfaced in the lock file before server.listen() has
+    // had a chance to resolve the real URL.
+    const initialDisplayHost = host === "0.0.0.0" ? "localhost" : host;
+    const acquired = tryAcquireLockfile({
+      root,
+      info: {
+        pid: process.pid,
+        port,
+        hostname: host,
+        appUrl: `http://${initialDisplayHost}:${port}`,
+        startedAt,
+        cwd: root,
+      },
+    });
+    if (!acquired.ok) {
+      console.error(
+        "\n  " +
+          formatAlreadyRunningError({
+            existing: acquired.existing,
+            cwd: root,
+            lockfilePath: acquired.lockfilePath,
+          }).replace(/\n/g, "\n  ") +
+          "\n",
+      );
+      process.exit(1);
+    }
+    lockfile = acquired.lockfile;
+  }
+
   console.log(`\n  vinext dev  (Vite ${getViteVersion()})\n`);
 
   const config = buildViteConfig({
     server: { port, host },
   });
 
-  const server = await vite.createServer(config);
-  await server.listen();
+  // If anything between here and the first successful listen() throws (e.g.
+  // strictPort and the port is taken), release the lock immediately so we
+  // don't leave a misleading "server running" entry behind in the brief
+  // window before the exit handler runs. The exit handler still serves as
+  // a safety net for unexpected exit paths.
+  let server;
+  try {
+    server = await vite.createServer(config);
+    await server.listen();
+  } catch (err) {
+    lockfile?.release();
+    throw err;
+  }
   server.printUrls();
+
+  // Once the server is actually listening, the port may have changed (e.g.
+  // Vite picked a free port if the requested one was in use). Update the
+  // lock file so other tools see the right port/URL.
+  //
+  // Prefer Vite's resolvedUrls.local[0] because it handles wildcard binds
+  // (e.g. host "0.0.0.0") by substituting "localhost" so the URL is
+  // actually clickable. Fall back to httpServer.address() if Vite didn't
+  // populate resolvedUrls for some reason.
+  if (lockfile) {
+    const resolved = server.resolvedUrls?.local[0];
+    let actualPort = port;
+    let appUrl: string;
+    if (resolved) {
+      appUrl = resolved.replace(/\/$/, "");
+      try {
+        const parsed = new URL(appUrl);
+        actualPort = parsed.port ? Number.parseInt(parsed.port, 10) : actualPort;
+      } catch {
+        // ignore — keep requested port
+      }
+    } else {
+      const address = server.httpServer?.address();
+      actualPort = typeof address === "object" && address ? address.port : port;
+      appUrl = `http://${host === "0.0.0.0" ? "localhost" : host}:${actualPort}`;
+    }
+    lockfile.update({
+      pid: process.pid,
+      port: actualPort,
+      hostname: host,
+      appUrl,
+      // Preserve the original acquire-time startedAt rather than resetting
+      // to "now". startedAt represents when the process started.
+      startedAt,
+      cwd: process.cwd(),
+    });
+  }
 }
 
 async function buildApp() {
@@ -363,7 +460,7 @@ async function buildApp() {
     : createBuildLogger(vite);
 
   // For App Router: upgrade React if needed for react-server-dom-webpack compatibility.
-  // Without this, builds with react<19.2.5 produce a Worker that crashes at
+  // Without this, builds with older React versions can produce a Worker that crashes at
   // runtime with "Cannot read properties of undefined (reading 'moduleMap')".
   if (isApp) {
     const reactUpgrade = getReactUpgradeDeps(process.cwd());
@@ -371,7 +468,11 @@ async function buildApp() {
       const installCmd = detectPackageManager(process.cwd()).replace(/ -D$/, "");
       const [pm, ...pmArgs] = installCmd.split(" ");
       console.log("  Upgrading React for RSC compatibility...");
-      execFileSync(pm, [...pmArgs, ...reactUpgrade], { cwd: process.cwd(), stdio: "inherit" });
+      execFileSync(pm, [...pmArgs, ...reactUpgrade], {
+        cwd: process.cwd(),
+        stdio: "inherit",
+        shell: process.platform === "win32",
+      });
     }
   }
 
@@ -481,13 +582,17 @@ async function buildApp() {
       : "Pre-rendering all routes (output: 'export')...";
     process.stdout.write("\x1b[0m");
     console.log(`  ${label}`);
-    prerenderResult = await runPrerender({ root: process.cwd() });
+    prerenderResult = await runPrerender({
+      root: process.cwd(),
+      concurrency: parsed.prerenderConcurrency,
+    });
   }
 
   // Precompression runs as a Vite plugin writeBundle hook (vinext:precompress).
   // Opt-in via --precompress CLI flag or `precompress: true` in plugin options.
 
   process.stdout.write("\x1b[0m");
+  const { printBuildReport } = await import("./build/report.js");
   await printBuildReport({
     root: process.cwd(),
     pageExtensions: resolvedNextConfig.pageExtensions,
@@ -545,13 +650,25 @@ async function lint() {
   try {
     if (hasEslint && hasNextLintConfig) {
       console.log("  Using eslint (with existing config)\n");
-      execFileSync("npx", ["eslint", "."], { cwd, stdio: "inherit" });
+      execFileSync("npx", ["eslint", "."], {
+        cwd,
+        stdio: "inherit",
+        shell: process.platform === "win32",
+      });
     } else if (hasOxlint) {
       console.log("  Using oxlint\n");
-      execFileSync("npx", ["oxlint", "."], { cwd, stdio: "inherit" });
+      execFileSync("npx", ["oxlint", "."], {
+        cwd,
+        stdio: "inherit",
+        shell: process.platform === "win32",
+      });
     } else if (hasEslint) {
       console.log("  Using eslint\n");
-      execFileSync("npx", ["eslint", "."], { cwd, stdio: "inherit" });
+      execFileSync("npx", ["eslint", "."], {
+        cwd,
+        stdio: "inherit",
+        shell: process.platform === "win32",
+      });
     } else {
       console.log(
         "  No linter found. Install eslint or oxlint:\n\n" +
@@ -586,6 +703,7 @@ async function deployCommand() {
     dryRun: parsed.dryRun,
     name: parsed.name,
     prerenderAll: parsed.prerenderAll,
+    prerenderConcurrency: parsed.prerenderConcurrency,
     experimentalTPR: parsed.experimentalTPR,
     tprCoverage: parsed.tprCoverage,
     tprLimit: parsed.tprLimit,
@@ -603,6 +721,26 @@ async function check() {
 
   const result = runCheck(root);
   console.log(formatReport(result));
+}
+
+async function typegen() {
+  const parsed = parseArgs(rawArgs);
+  if (parsed.help) return printHelp("typegen");
+
+  const root = path.resolve(parsed.positionals?.[0] ?? process.cwd());
+  loadDotenv({
+    root,
+    mode: "production",
+  });
+  const resolvedNextConfig = await resolveNextConfig(
+    await loadNextConfig(root, PHASE_PRODUCTION_BUILD),
+    root,
+  );
+  const outputPath = await generateRouteTypes({
+    root,
+    pageExtensions: resolvedNextConfig.pageExtensions,
+  });
+  console.log(`\n  Generated route types at ${path.relative(root, outputPath)}\n`);
 }
 
 async function initCommand() {
@@ -656,6 +794,8 @@ function printHelp(cmd?: string) {
     --verbose            Show full Vite/Rollup build output (suppressed by default)
     --prerender-all      Pre-render discovered routes after building (future releases
                          will serve these files in vinext start)
+    --prerender-concurrency <count>
+                         Maximum number of routes to pre-render in parallel
     --precompress        Precompress static assets at build time (.br, .gz, .zst)
     -h, --help           Show this help
 `);
@@ -701,6 +841,8 @@ function printHelp(cmd?: string) {
     --dry-run                Generate config files without building or deploying
     --prerender-all          Pre-render discovered routes after building (future
                              releases will auto-populate the remote cache)
+    --prerender-concurrency <count>
+                             Maximum number of routes to pre-render in parallel
     -h, --help               Show this help
 
   Experimental:
@@ -769,6 +911,22 @@ function printHelp(cmd?: string) {
     return;
   }
 
+  if (cmd === "typegen") {
+    console.log(`
+  vinext typegen - Generate App Router route helper types
+
+  Usage: vinext typegen [directory] [options]
+
+  Generates Next-compatible global route helpers for App Router projects:
+  PageProps, LayoutProps, and RouteContext. Output is written to
+  .next/types/routes.d.ts under the target directory.
+
+  Options:
+    -h, --help    Show this help
+`);
+    return;
+  }
+
   if (cmd === "lint") {
     console.log(`
   vinext lint - Run linter
@@ -794,6 +952,7 @@ function printHelp(cmd?: string) {
     build    Build for production
     start    Start production server
     deploy   Deploy to Cloudflare Workers
+    typegen  Generate App Router route helper types
     init     Migrate a Next.js project to vinext
     check    Scan Next.js app for compatibility
     lint     Run linter
@@ -806,6 +965,7 @@ function printHelp(cmd?: string) {
     vinext dev                  Start dev server on port 3000
     vinext dev -p 4000          Start dev server on port 4000
     vinext build                Build for production
+    vinext typegen              Generate route helper types
     vinext start                Start production server
     vinext deploy               Deploy to Cloudflare Workers
     vinext init                 Migrate a Next.js project
@@ -867,6 +1027,13 @@ switch (command) {
 
   case "check":
     check().catch((e) => {
+      console.error(e);
+      process.exit(1);
+    });
+    break;
+
+  case "typegen":
+    typegen().catch((e) => {
       console.error(e);
       process.exit(1);
     });

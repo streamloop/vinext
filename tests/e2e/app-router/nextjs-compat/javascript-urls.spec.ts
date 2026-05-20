@@ -95,4 +95,21 @@ test.describe("javascript-urls", () => {
     await page.locator('a[href="/nextjs-compat/javascript-urls/safe"]').click();
     await expect(page).toHaveURL(`${BASE}/nextjs-compat/javascript-urls/safe`);
   });
+
+  // Next.js keeps user-provided Link onClick handlers on anchors whose href is
+  // later blocked by React/Next.js javascript: URL protections.
+  // Reference implementation: https://github.com/vercel/next.js/blob/canary/packages/next/src/client/link.tsx
+  test("preserves custom Link onClick handlers when blocking unsafe hrefs", async ({ page }) => {
+    await page.goto(`${BASE}/nextjs-compat/javascript-urls/link-onclick`);
+    await waitForAppRouterHydration(page);
+    const initialUrl = page.url();
+
+    const unsafeLink = page.locator("#unsafe-link");
+    await expect(unsafeLink).not.toHaveAttribute("href", /.+/);
+
+    await unsafeLink.click();
+
+    await expect(page.locator("#click-count")).toHaveText("clicks: 1");
+    expect(page.url()).toBe(initialUrl);
+  });
 });

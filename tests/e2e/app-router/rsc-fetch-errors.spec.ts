@@ -113,7 +113,19 @@ test.describe("RSC fetch non-ok response handling", () => {
 
     const navigationPromise = page.waitForURL(`${BASE}${targetPath}`, { timeout: 10_000 });
     await page.evaluate(() => {
-      void (window as any).__VINEXT_RSC_NAVIGATE__("/rsc-fetch-error-target");
+      const runtime = Reflect.get(window, Symbol.for("vinext.navigationRuntime"));
+      const navigate =
+        typeof runtime === "object" &&
+        runtime !== null &&
+        "functions" in runtime &&
+        typeof runtime.functions === "object" &&
+        runtime.functions !== null &&
+        "navigate" in runtime.functions &&
+        typeof runtime.functions.navigate === "function"
+          ? runtime.functions.navigate
+          : null;
+      if (!navigate) throw new Error("App Router navigation runtime is not installed");
+      void navigate("/rsc-fetch-error-target");
     });
     await navigationPromise;
 

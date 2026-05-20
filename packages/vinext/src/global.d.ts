@@ -20,6 +20,10 @@ import type { Root } from "react-dom/client";
 import type { OnRequestErrorHandler } from "./server/instrumentation";
 import type { CachedRscResponse, PrefetchCacheEntry } from "vinext/shims/navigation";
 
+// `window.next` is declared inline in `./client/window-next.ts` (mirroring
+// Next.js's own pattern in `packages/next/src/client/next.ts`), not here, so
+// the type is co-located with the installer that owns the runtime shape.
+
 // ---------------------------------------------------------------------------
 // Window globals — browser-side state shared across module boundaries
 // ---------------------------------------------------------------------------
@@ -37,8 +41,9 @@ declare global {
     __VINEXT_ROOT__: Root | undefined;
 
     /**
-     * High-resolution timestamp recorded after client hydration completes.
-     * Used by instrumentation-client compatibility tests.
+     * High-resolution timestamp recorded after client hydration is usable.
+     * Pages Router writes after hydrateRoot() returns; App Router writes after
+     * the first committed tree attaches browser router state.
      */
     __VINEXT_HYDRATED_AT: number | undefined;
 
@@ -79,27 +84,6 @@ declare global {
     __VINEXT_RSC_ROOT__: Root | undefined;
 
     /**
-     * The client-side RSC navigation function for App Router.
-     * Registered by the browser RSC entry on `window` so that the navigation
-     * shim, Link, and Form can trigger RSC re-fetches without a direct import.
-     *
-     * @param href - The destination URL (may be absolute or relative).
-     * @param redirectDepth - Internal parameter used to detect redirect loops.
-     * @param navigationKind - Internal hint for traversal vs regular navigation.
-     * @param historyUpdateMode - Internal hint for when history should publish.
-     */
-    __VINEXT_RSC_NAVIGATE__:
-      | ((
-          href: string,
-          redirectDepth?: number,
-          navigationKind?: "navigate" | "traverse" | "refresh",
-          historyUpdateMode?: "push" | "replace",
-          previousNextUrlOverride?: string | null,
-          programmaticTransition?: boolean,
-        ) => Promise<void>)
-      | undefined;
-
-    /**
      * A Promise that resolves when the current in-flight popstate RSC navigation
      * finishes rendering.
      * Set by the popstate handler in the browser RSC entry; read by
@@ -129,6 +113,9 @@ declare global {
     // re-declare it here to avoid type conflicts. vinext-specific extensions
     // (__vinext) are accessed via the `VinextNextData` type in
     // `client/vinext-next-data.ts`.
+    //
+    // `window.next` is declared in `./client/window-next.ts` so its type
+    // (`WindowNext`) lives next to the installer that owns the runtime shape.
   }
 
   // ── self globals used inside server-injected inline scripts ───────────────
@@ -138,14 +125,16 @@ declare global {
   // compatibility with Web Workers (where `window` is undefined).
 
   /**
-   * Array of RSC Flight protocol text chunks streamed progressively by the
-   * server via inline `<script>` tags.
+   * Array of RSC Flight protocol chunks streamed progressively by the server
+   * via inline `<script>` tags. Text chunks are stored directly; non-UTF-8
+   * chunks are stored as `[3, base64]` binary chunks, matching Next.js'
+   * inlined Flight payload kind.
    * Each `<script>` calls `self.__VINEXT_RSC_CHUNKS__.push(chunk)`.
    * The browser RSC entry monkey-patches this array's `push` method to feed a
    * `ReadableStream` that is consumed by `react-server-dom-webpack`.
    */
   // oxlint-disable-next-line no-var
-  var __VINEXT_RSC_CHUNKS__: string[] | undefined;
+  var __VINEXT_RSC_CHUNKS__: (string | [3, string])[] | undefined;
 
   /**
    * Set to `true` by a final inline `<script>` when the server has finished
@@ -173,19 +162,6 @@ declare global {
    */
   // oxlint-disable-next-line no-var
   var __VINEXT_RSC_NAV__: { pathname: string; searchParams: [string, string][] } | undefined;
-
-  /**
-   * Legacy RSC embed format (pre-progressive-streaming).
-   * A single object containing all RSC chunks and the route params, embedded
-   * in a single `<script>` block.
-   * Still read by the browser entry for backwards compatibility with older
-   * cached HTML responses.
-   *
-   * @deprecated Use `__VINEXT_RSC_CHUNKS__` / `__VINEXT_RSC_DONE__` /
-   *   `__VINEXT_RSC_PARAMS__` instead.
-   */
-  // oxlint-disable-next-line no-var
-  var __VINEXT_RSC__: { rsc: string[]; params: Record<string, string | string[]> } | undefined;
 
   // ── globalThis globals — server-side / Cloudflare Workers ─────────────────
   //
@@ -275,6 +251,15 @@ declare global {
    */
   // oxlint-disable-next-line no-var
   var __VINEXT_onRequestErrorHandler__: OnRequestErrorHandler | undefined;
+
+  /**
+   * Vite RSC's SSR-side client-reference module loader.
+   * Set by `@vitejs/plugin-rsc` and read by the App Router SSR entry before
+   * React consumes the Flight stream, so first-request client references are
+   * already resolved when Fizz renders the shell.
+   */
+  // oxlint-disable-next-line no-var
+  var __vite_rsc_client_require__: ((id: string) => Promise<unknown>) | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +304,19 @@ declare global {
       __VINEXT_BUILD_ID?: string;
 
       /**
+       * Public App Router RSC compatibility identity injected via Vite
+       * `define`. Used by browser navigation code to reject RSC payloads from
+       * a different vinext build without exposing the raw build ID header.
+       */
+      __VINEXT_RSC_COMPATIBILITY_ID?: string;
+
+      /**
+       * Deployment ID string injected via Vite `define` when
+       * `NEXT_DEPLOYMENT_ID` is present at build time.
+       */
+      __VINEXT_DEPLOYMENT_ID?: string;
+
+      /**
        * JSON-encoded array of `RemotePattern` objects from
        * `next.config.js` → `images.remotePatterns`.
        */
@@ -347,6 +345,21 @@ declare global {
        * image optimizer (`next.config.js` → `images.dangerouslyAllowSVG`).
        */
       __VINEXT_IMAGE_DANGEROUSLY_ALLOW_SVG?: string;
+
+      /**
+       * `"true"` or `"false"` — whether hostnames resolving to private IPs
+       * are allowed (`next.config.js` → `images.dangerouslyAllowLocalIP`).
+       */
+      __VINEXT_IMAGE_DANGEROUSLY_ALLOW_LOCAL_IP?: string;
+
+      /**
+       * Next.js-compatible version string. vinext mirrors Next.js's
+       * `process.env.__NEXT_VERSION` define (from
+       * `packages/next/src/client/next.ts` line 5) so library code that
+       * reads it works unmodified. Value is the vinext package version,
+       * injected by the plugin at build time.
+       */
+      __NEXT_VERSION?: string;
     }
   }
 }
@@ -358,12 +371,12 @@ declare global {
 declare module "node:http" {
   interface IncomingMessage {
     /**
-     * The HTTP status code set by vinext middleware for Pages Router rewrite
-     * responses (e.g. 307 for a rewrite that should surface as a redirect).
-     * Written in `index.ts` when middleware emits a `rewriteStatus`, read by
-     * the downstream Pages Router handler to decide the final response status.
+     * The HTTP status code set by vinext middleware for Pages Router continue
+     * or rewrite responses. Written in `index.ts` when middleware emits a
+     * status override, read by the downstream Pages Router handler to decide
+     * the final response status.
      */
-    __vinextRewriteStatus?: number;
+    __vinextMiddlewareStatus?: number;
   }
 }
 

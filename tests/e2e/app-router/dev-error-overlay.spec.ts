@@ -135,9 +135,18 @@ test.describe("Dev error overlay", () => {
     // Wait for the Link's onClick handler to attach so the click drives a soft
     // RSC navigation (with historyUpdateMode = "push") instead of a full reload.
     await page.waitForFunction(
-      () =>
-        typeof (window as unknown as { __VINEXT_RSC_NAVIGATE__?: unknown })
-          .__VINEXT_RSC_NAVIGATE__ === "function",
+      () => {
+        const runtime = Reflect.get(window, Symbol.for("vinext.navigationRuntime"));
+        return (
+          typeof runtime === "object" &&
+          runtime !== null &&
+          "functions" in runtime &&
+          typeof runtime.functions === "object" &&
+          runtime.functions !== null &&
+          "navigate" in runtime.functions &&
+          typeof runtime.functions.navigate === "function"
+        );
+      },
       undefined,
       { timeout: 10_000 },
     );
@@ -192,13 +201,22 @@ test.describe("Dev error overlay", () => {
 
     // The boundary itself rendered null, so any in-page link inside the route
     // tree is gone. Drive a soft RSC navigation programmatically through the
-    // global hook the framework installs — the dispatched tree bumps
+    // navigation runtime the framework installs — the dispatched tree bumps
     // renderId, the boundary resets, and the home page renders without a
     // document reload.
     await page.evaluate(() => {
-      const navigate = (window as unknown as { __VINEXT_RSC_NAVIGATE__?: (href: string) => void })
-        .__VINEXT_RSC_NAVIGATE__;
-      if (!navigate) throw new Error("__VINEXT_RSC_NAVIGATE__ is not installed");
+      const runtime = Reflect.get(window, Symbol.for("vinext.navigationRuntime"));
+      const navigate =
+        typeof runtime === "object" &&
+        runtime !== null &&
+        "functions" in runtime &&
+        typeof runtime.functions === "object" &&
+        runtime.functions !== null &&
+        "navigate" in runtime.functions &&
+        typeof runtime.functions.navigate === "function"
+          ? runtime.functions.navigate
+          : null;
+      if (!navigate) throw new Error("App Router navigation runtime is not installed");
       navigate("/");
     });
     await expect(page.locator("h1")).toHaveText("Welcome to App Router");

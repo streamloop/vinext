@@ -1,23 +1,34 @@
-import type { AppRoute } from "../routing/app-router.js";
+import { convertSegmentsToRouteParts, type AppRoute } from "../routing/app-router.js";
 import { createMetadataRouteEntriesSource } from "../server/metadata-route-build-data.js";
 import type { MetadataFileRoute } from "../server/metadata-routes.js";
+import { normalizePathSeparators } from "./runtime-entry-module.js";
 
 type AppRscManifestCode = {
   imports: string[];
   routeEntries: string[];
   metaRouteEntries: string[];
   generateStaticParamsEntries: string[];
+  rootParamNameEntries: string[];
   rootNotFoundVar: string | null;
   rootForbiddenVar: string | null;
   rootUnauthorizedVar: string | null;
   rootLayoutVars: string[];
   globalErrorVar: string | null;
+  globalNotFoundVar: string | null;
 };
 
 type BuildAppRscManifestCodeOptions = {
   routes: AppRoute[];
   metadataRoutes?: MetadataFileRoute[];
   globalErrorPath?: string | null;
+  /**
+   * Optional `app/global-not-found.tsx` path. When present, route-miss 404s
+   * render this module standalone (it provides its own <html>/<body>) instead
+   * of wrapping the regular not-found boundary inside the root layout.
+   * Mirrors Next.js 16's `experimental.globalNotFound` behavior.
+   * @see https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/app-render.tsx
+   */
+  globalNotFoundPath?: string | null;
 };
 
 type ImportAllocator = {
@@ -39,7 +50,7 @@ function createImportAllocator(): ImportAllocator {
       if (existing) return existing;
 
       const varName = `mod_${importIdx++}`;
-      const absPath = filePath.replace(/\\/g, "/");
+      const absPath = normalizePathSeparators(filePath);
       imports.push(`import * as ${varName} from ${JSON.stringify(absPath)};`);
       importMap.set(filePath, varName);
       return varName;
@@ -58,6 +69,11 @@ function registerRouteModules(routes: AppRoute[], imports: ImportAllocator): voi
     if (route.layoutErrorPaths) {
       for (const ep of route.layoutErrorPaths) {
         if (ep) imports.getImportVar(ep);
+      }
+    }
+    if (route.errorPaths) {
+      for (const ep of route.errorPaths) {
+        imports.getImportVar(ep);
       }
     }
     if (route.notFoundPath) imports.getImportVar(route.notFoundPath);
@@ -112,12 +128,14 @@ function buildRouteEntries(routes: AppRoute[], imports: ImportAllocator): string
         (ir) => `        {
           convention: ${JSON.stringify(ir.convention)},
           targetPattern: ${JSON.stringify(ir.targetPattern)},
+          sourceMatchPattern: ${JSON.stringify(ir.sourceMatchPattern)},
           interceptLayouts: [${ir.layoutPaths.map((layoutPath) => imports.getImportVar(layoutPath)).join(", ")}],
           page: ${imports.getImportVar(ir.pagePath)},
           params: ${JSON.stringify(ir.params)},
         }`,
       );
       return `      ${JSON.stringify(slot.key)}: {
+        id: ${JSON.stringify(slot.id ?? null)},
         name: ${JSON.stringify(slot.name)},
         page: ${slot.pagePath ? imports.getImportVar(slot.pagePath) : "null"},
         default: ${slot.defaultPath ? imports.getImportVar(slot.defaultPath) : "null"},
@@ -136,9 +154,11 @@ ${interceptEntries.join(",\n")}
     const layoutErrorVars = (route.layoutErrorPaths || []).map((ep) =>
       ep ? imports.getImportVar(ep) : "null",
     );
+    const errorVars = (route.errorPaths ?? []).map((ep) => imports.getImportVar(ep));
     return `  {
     __buildTimeClassifications: __VINEXT_CLASS(${routeIdx}), // evaluated once at module load
     __buildTimeReasons: __classDebug ? __VINEXT_CLASS_REASONS(${routeIdx}) : null,
+    ids: ${JSON.stringify(route.ids ?? null)},
     pattern: ${JSON.stringify(route.pattern)},
     patternParts: ${JSON.stringify(route.patternParts)},
     isDynamic: ${route.isDynamic},
@@ -152,6 +172,8 @@ ${interceptEntries.join(",\n")}
     layoutTreePositions: ${JSON.stringify(route.layoutTreePositions)},
     templates: [${templateVars.join(", ")}],
     errors: [${layoutErrorVars.join(", ")}],
+    errorPaths: [${errorVars.join(", ")}],
+    errorTreePositions: ${JSON.stringify(route.errorTreePositions ?? null)},
     slots: {
 ${slotEntries.join(",\n")}
     },
@@ -167,15 +189,111 @@ ${slotEntries.join(",\n")}
   });
 }
 
-function buildGenerateStaticParamsEntries(routes: AppRoute[], imports: ImportAllocator): string[] {
-  const entries: string[] = [];
-  for (const route of routes) {
-    if (!route.isDynamic || !route.pagePath) continue;
-    entries.push(
-      `  ${JSON.stringify(route.pattern)}: ${imports.getImportVar(route.pagePath)}?.generateStaticParams ?? null,`,
-    );
+type RoutePatternPrefix = {
+  pattern: string;
+  paramNames: string[];
+};
+
+function createRoutePatternPrefix(
+  routeSegments: readonly string[],
+  treePosition: number,
+): RoutePatternPrefix | null {
+  // treePosition is always non-negative (represents tree depth).
+  const limit = Math.min(treePosition, routeSegments.length);
+  const converted = convertSegmentsToRouteParts(routeSegments.slice(0, limit));
+  if (!converted) return null;
+
+  return {
+    pattern: converted.urlSegments.length === 0 ? "/" : `/${converted.urlSegments.join("/")}`,
+    paramNames: converted.params,
+  };
+}
+
+function appendStaticParamSource(
+  sourcesByPattern: Map<string, string[]>,
+  pattern: string | null,
+  sourceVar: string,
+): void {
+  if (!pattern || pattern === "/" || !pattern.includes(":")) return;
+  const sources = sourcesByPattern.get(pattern) ?? [];
+  // ImportAllocator is path-stable, so the generated member expression is a
+  // deterministic key for deduping the same module across inherited routes.
+  if (!sources.includes(sourceVar)) sources.push(sourceVar);
+  sourcesByPattern.set(pattern, sources);
+}
+
+function buildRootParamNamesByPattern(routes: AppRoute[]): Map<string, string[]> {
+  const namesByPattern = new Map<string, string[]>();
+
+  function append(
+    pattern: string | null,
+    rootParamNames: readonly string[] | undefined,
+    paramNames: readonly string[],
+  ): void {
+    if (!pattern || pattern === "/" || !pattern.includes(":")) return;
+    const patternParams = new Set(paramNames);
+    const names = (rootParamNames ?? []).filter((name) => patternParams.has(name));
+    if (names.length === 0) return;
+
+    const existing = namesByPattern.get(pattern) ?? [];
+    for (const name of names) {
+      if (!existing.includes(name)) existing.push(name);
+    }
+    namesByPattern.set(pattern, existing);
   }
-  return entries;
+
+  for (const route of routes) {
+    if (!route.isDynamic) continue;
+    append(route.pattern, route.rootParamNames, route.params);
+    for (const treePosition of route.layoutTreePositions) {
+      const prefix = createRoutePatternPrefix(route.routeSegments, treePosition);
+      append(prefix?.pattern ?? null, route.rootParamNames, prefix?.paramNames ?? []);
+    }
+  }
+
+  return namesByPattern;
+}
+
+function buildGenerateStaticParamsEntries(
+  routes: AppRoute[],
+  imports: ImportAllocator,
+  namesByPattern: Map<string, string[]>,
+): string[] {
+  const sourcesByPattern = new Map<string, string[]>();
+
+  for (const route of routes) {
+    if (!route.isDynamic) continue;
+
+    for (const [index, layoutPath] of route.layouts.entries()) {
+      appendStaticParamSource(
+        sourcesByPattern,
+        createRoutePatternPrefix(route.routeSegments, route.layoutTreePositions[index] ?? 0)
+          ?.pattern ?? null,
+        `${imports.getImportVar(layoutPath)}?.generateStaticParams`,
+      );
+    }
+
+    if (route.pagePath) {
+      appendStaticParamSource(
+        sourcesByPattern,
+        route.pattern,
+        `${imports.getImportVar(route.pagePath)}?.generateStaticParams`,
+      );
+    }
+  }
+
+  return Array.from(sourcesByPattern.entries()).map(([pattern, sources]) => {
+    const rootParamNames = namesByPattern.get(pattern) ?? [];
+    return `  ${JSON.stringify(pattern)}: __createAppPrerenderStaticParamsResolver([${sources.join(
+      ", ",
+    )}], ${JSON.stringify(rootParamNames)}),`;
+  });
+}
+
+function buildRootParamNameEntries(namesByPattern: Map<string, string[]>): string[] {
+  return Array.from(namesByPattern.entries()).map(
+    ([pattern, names]) => `  ${JSON.stringify(pattern)}: ${JSON.stringify(names)},`,
+  );
 }
 
 export function buildAppRscManifestCode(
@@ -201,21 +319,32 @@ export function buildAppRscManifestCode(
   const globalErrorVar = options.globalErrorPath
     ? imports.getImportVar(options.globalErrorPath)
     : null;
+  const globalNotFoundVar = options.globalNotFoundPath
+    ? imports.getImportVar(options.globalNotFoundPath)
+    : null;
 
   const dynamicMetadataRoutes = metadataRoutes.filter((r) => r.isDynamic);
   for (const route of dynamicMetadataRoutes) {
     imports.getImportVar(route.filePath);
   }
 
+  const namesByPattern = buildRootParamNamesByPattern(options.routes);
+
   return {
     imports: imports.imports,
     routeEntries,
     metaRouteEntries: createMetadataRouteEntriesSource(metadataRoutes, imports.importMap),
-    generateStaticParamsEntries: buildGenerateStaticParamsEntries(options.routes, imports),
+    generateStaticParamsEntries: buildGenerateStaticParamsEntries(
+      options.routes,
+      imports,
+      namesByPattern,
+    ),
+    rootParamNameEntries: buildRootParamNameEntries(namesByPattern),
     rootNotFoundVar,
     rootForbiddenVar,
     rootUnauthorizedVar,
     rootLayoutVars,
     globalErrorVar,
+    globalNotFoundVar,
   };
 }

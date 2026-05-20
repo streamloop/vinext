@@ -3,7 +3,18 @@ import {
   NO_STORE_CACHE_CONTROL,
   STATIC_CACHE_CONTROL,
 } from "./cache-control.js";
+import {
+  VINEXT_CACHE_HEADER,
+  VINEXT_MOUNTED_SLOTS_HEADER,
+  VINEXT_PARAMS_HEADER,
+  VINEXT_TIMING_HEADER,
+} from "./headers.js";
 import { mergeMiddlewareResponseHeaders } from "./middleware-response-headers.js";
+import {
+  VINEXT_RSC_CONTENT_TYPE,
+  VINEXT_RSC_VARY_HEADER,
+  applyRscCompatibilityIdHeader,
+} from "./app-rsc-cache-busting.js";
 
 export type AppPageMiddlewareContext = {
   headers: Headers | null;
@@ -23,6 +34,7 @@ type AppPageResponsePolicy = {
 };
 
 type ResolveAppPageResponsePolicyBaseOptions = {
+  isDraftMode: boolean;
   isDynamicError: boolean;
   isForceDynamic: boolean;
   isForceStatic: boolean;
@@ -37,6 +49,7 @@ type ResolveAppPageRscResponsePolicyOptions = {
 
 type ResolveAppPageHtmlResponsePolicyOptions = {
   dynamicUsedDuringRender: boolean;
+  isProgressiveActionRender?: boolean;
   hasScriptNonce: boolean;
 } & ResolveAppPageResponsePolicyBaseOptions;
 
@@ -75,12 +88,16 @@ function applyTimingHeader(headers: Headers, timing?: AppPageResponseTiming): vo
       ? Math.round(timing.renderEnd - timing.compileEnd)
       : -1;
 
-  headers.set("x-vinext-timing", `${handlerStart},${compileMs},${renderMs}`);
+  headers.set(VINEXT_TIMING_HEADER, `${handlerStart},${compileMs},${renderMs}`);
 }
 
 export function resolveAppPageRscResponsePolicy(
   options: ResolveAppPageRscResponsePolicyOptions,
 ): AppPageResponsePolicy {
+  if (options.isDraftMode) {
+    return { cacheControl: NO_STORE_CACHE_CONTROL };
+  }
+
   if (options.isForceDynamic || options.dynamicUsedDuringBuild) {
     return { cacheControl: NO_STORE_CACHE_CONTROL };
   }
@@ -120,6 +137,13 @@ export function resolveAppPageRscResponsePolicy(
 export function resolveAppPageHtmlResponsePolicy(
   options: ResolveAppPageHtmlResponsePolicyOptions,
 ): AppPageHtmlResponsePolicy {
+  if (options.isDraftMode) {
+    return {
+      cacheControl: NO_STORE_CACHE_CONTROL,
+      shouldWriteToCache: false,
+    };
+  }
+
   if (options.isForceDynamic) {
     return {
       cacheControl: NO_STORE_CACHE_CONTROL,
@@ -128,6 +152,13 @@ export function resolveAppPageHtmlResponsePolicy(
   }
 
   if (options.hasScriptNonce) {
+    return {
+      cacheControl: NO_STORE_CACHE_CONTROL,
+      shouldWriteToCache: false,
+    };
+  }
+
+  if (options.isProgressiveActionRender) {
     return {
       cacheControl: NO_STORE_CACHE_CONTROL,
       shouldWriteToCache: false,
@@ -190,26 +221,26 @@ export function buildAppPageRscResponse(
   options: BuildAppPageRscResponseOptions,
 ): Response {
   const headers = new Headers({
-    "Content-Type": "text/x-component; charset=utf-8",
-    Vary: "RSC, Accept",
+    "Content-Type": VINEXT_RSC_CONTENT_TYPE,
+    Vary: VINEXT_RSC_VARY_HEADER,
   });
 
   if (options.params && Object.keys(options.params).length > 0) {
     // encodeURIComponent so non-ASCII params (e.g. Korean slugs) survive the
     // HTTP ByteString constraint — Headers.set() rejects chars above U+00FF.
-    headers.set("X-Vinext-Params", encodeURIComponent(JSON.stringify(options.params)));
+    headers.set(VINEXT_PARAMS_HEADER, encodeURIComponent(JSON.stringify(options.params)));
   }
   if (options.mountedSlotsHeader) {
-    headers.set("X-Vinext-Mounted-Slots", options.mountedSlotsHeader);
+    headers.set(VINEXT_MOUNTED_SLOTS_HEADER, options.mountedSlotsHeader);
   }
   if (options.policy.cacheControl) {
     headers.set("Cache-Control", options.policy.cacheControl);
   }
   if (options.policy.cacheState) {
-    headers.set("X-Vinext-Cache", options.policy.cacheState);
+    headers.set(VINEXT_CACHE_HEADER, options.policy.cacheState);
   }
-
   mergeMiddlewareResponseHeaders(headers, options.middlewareContext.headers);
+  applyRscCompatibilityIdHeader(headers);
 
   applyTimingHeader(headers, options.timing);
 
@@ -225,14 +256,14 @@ export function buildAppPageHtmlResponse(
 ): Response {
   const headers = new Headers({
     "Content-Type": "text/html; charset=utf-8",
-    Vary: "RSC, Accept",
+    Vary: VINEXT_RSC_VARY_HEADER,
   });
 
   if (options.policy.cacheControl) {
     headers.set("Cache-Control", options.policy.cacheControl);
   }
   if (options.policy.cacheState) {
-    headers.set("X-Vinext-Cache", options.policy.cacheState);
+    headers.set(VINEXT_CACHE_HEADER, options.policy.cacheState);
   }
   if (options.draftCookie) {
     headers.append("Set-Cookie", options.draftCookie);

@@ -1,18 +1,23 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { describe, expect, it, vi } from "vite-plus/test";
 import {
   handlePagesApiRoute,
   type PagesApiRouteMatch,
 } from "../packages/vinext/src/server/pages-api-route.js";
 
+type PagesApiRouteModule = PagesApiRouteMatch["route"]["module"];
+
 function createMatch(
-  handler: PagesApiRouteMatch["route"]["module"]["default"],
+  handler: PagesApiRouteModule["default"],
   params: Record<string, string | string[]> = {},
+  moduleConfig?: PagesApiRouteModule["config"],
 ): PagesApiRouteMatch {
   return {
     params,
     route: {
       pattern: "/api/test",
       module: {
+        config: moduleConfig,
         default: handler,
       },
     },
@@ -36,6 +41,25 @@ describe("pages api route", () => {
     await expect(response.json()).resolves.toEqual({
       id: "123",
       tag: ["a", "b"],
+    });
+  });
+
+  it("keeps dynamic params ahead of same-key query-string values", async () => {
+    const response = await handlePagesApiRoute({
+      match: createMatch(
+        (req, res) => {
+          res.json(req.query);
+        },
+        { id: "123" },
+      ),
+      request: new Request("https://example.com/api/users/123?id=evil&tag=a"),
+      url: "/api/users/123?id=evil&tag=a",
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      id: "123",
+      tag: "a",
     });
   });
 
@@ -234,5 +258,70 @@ describe("pages api route", () => {
     // Only one set-cookie header — the replacement
     const cookies = response.headers.getSetCookie();
     expect(cookies).toEqual(["session=xyz"]);
+  });
+
+  it("calls edge API route handlers with a Fetch Request and returns their Response", async () => {
+    // Ported from Next.js: test/e2e/edge-async-local-storage/index.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/edge-async-local-storage/index.test.ts
+    const response = await handlePagesApiRoute({
+      match: createMatch(
+        (request: Request) => {
+          const id = request.headers.get("req-id");
+          return Response.json({ id });
+        },
+        {},
+        { runtime: "edge" },
+      ),
+      request: new Request("https://example.com/api/test", {
+        headers: { "req-id": "req-42" },
+      }),
+      url: "/api/test",
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ id: "req-42" });
+  });
+
+  it("preserves nested AsyncLocalStorage state across concurrent edge API requests", async () => {
+    // Ported from Next.js: test/e2e/edge-async-local-storage/index.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/edge-async-local-storage/index.test.ts
+    const topStorage = new AsyncLocalStorage<{ id: string }>();
+    const ids = Array.from({ length: 100 }, (_, i) => `req-${i}`);
+
+    const responses = await Promise.all(
+      ids.map((id) =>
+        handlePagesApiRoute({
+          match: createMatch(
+            (request: Request) => {
+              const requestId = request.headers.get("req-id") ?? "";
+              return topStorage.run({ id: requestId }, async () => {
+                const nestedStorage = new AsyncLocalStorage<string>();
+                const nested = await nestedStorage.run(`nested-${requestId}`, async () => {
+                  await Promise.resolve();
+                  return { nestedId: nestedStorage.getStore() };
+                });
+
+                await Promise.resolve();
+                return Response.json({ ...nested, ...topStorage.getStore() });
+              });
+            },
+            {},
+            { runtime: "experimental-edge" },
+          ),
+          request: new Request("https://example.com/api/test", {
+            headers: { "req-id": id },
+          }),
+          url: "/api/test",
+        }),
+      ),
+    );
+
+    for (const [index, response] of responses.entries()) {
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({
+        id: ids[index],
+        nestedId: `nested-${ids[index]}`,
+      });
+    }
   });
 });

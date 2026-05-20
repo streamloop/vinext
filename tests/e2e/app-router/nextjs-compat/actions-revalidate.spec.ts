@@ -9,12 +9,102 @@
  * and that router.refresh() re-renders the page with fresh data.
  */
 
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 import { waitForAppRouterHydration } from "../../helpers";
 
 const BASE = "http://localhost:4174";
 
 test.describe("Next.js compat: actions-revalidate (browser)", () => {
+  function waitForActionDiscardingResponse(page: Page) {
+    return page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST" &&
+        response.url().includes("/nextjs-compat/action-discarding.rsc"),
+    );
+  }
+
+  async function expectActionRefreshPreservesLoading(page: Page, buttonSelector: string) {
+    const loadingLogs: string[] = [];
+    page.on("console", (message) => {
+      if (message.text() === "Action refresh loading mounted") {
+        loadingLogs.push(message.text());
+      }
+    });
+
+    await page.goto(`${BASE}/nextjs-compat/action-refresh-no-rerender`);
+    await waitForAppRouterHydration(page);
+    loadingLogs.length = 0;
+
+    const initialValue = await page.locator("#flag-value").textContent();
+
+    await page.click(buttonSelector);
+
+    await expect(async () => {
+      const nextValue = await page.locator("#flag-value").textContent();
+      expect(nextValue).toBeTruthy();
+      expect(nextValue).not.toBe(initialValue);
+    }).toPass({ timeout: 10_000 });
+
+    expect(await page.locator("#action-refresh-loading").count()).toBe(0);
+    expect(loadingLogs).toEqual([]);
+  }
+
+  test("server action followed by router.refresh does not mount route loading", async ({
+    page,
+  }) => {
+    await expectActionRefreshPreservesLoading(page, "#action-refresh");
+  });
+
+  test("refresh() inside server action does not mount route loading", async ({ page }) => {
+    await expectActionRefreshPreservesLoading(page, "#action-refresh-from-server");
+  });
+
+  // Ported from Next.js: test/e2e/app-dir/actions/app-action.test.ts
+  // "action discarding" coverage. Vinext uses a local counter instead of a
+  // remote fetch cache so the assertion is deterministic.
+  test("discarded server action without revalidation does not refresh current route", async ({
+    page,
+  }) => {
+    await page.goto(`${BASE}/nextjs-compat/action-discarding`);
+    await waitForAppRouterHydration(page);
+
+    const initialValue = await page.locator("#discarded-action-value").textContent();
+    if (!initialValue) {
+      throw new Error("Expected initial discarded action value");
+    }
+
+    const actionResponse = waitForActionDiscardingResponse(page);
+    await page.click("#slow-action");
+    await page.click("#navigate-discard-destination");
+    await expect(page.locator("#discard-destination")).toBeVisible();
+    await actionResponse;
+
+    await expect(page.locator("#discarded-action-value")).toHaveText(initialValue);
+  });
+
+  // Ported from Next.js: test/e2e/app-dir/actions/app-action.test.ts
+  // "should trigger a refresh for a server action that gets discarded due to
+  // a navigation (with revalidation)".
+  test("discarded server action with revalidation refreshes current route", async ({ page }) => {
+    await page.goto(`${BASE}/nextjs-compat/action-discarding`);
+    await waitForAppRouterHydration(page);
+
+    const initialValue = await page.locator("#discarded-action-value").textContent();
+    if (!initialValue) {
+      throw new Error("Expected initial discarded action value");
+    }
+
+    const actionResponse = waitForActionDiscardingResponse(page);
+    await page.click("#slow-action-refresh");
+    await page.click("#navigate-discard-destination");
+    await expect(page.locator("#discard-destination")).toBeVisible();
+    await actionResponse;
+
+    await expect(page.locator("#discarded-action-value")).not.toHaveText(initialValue, {
+      timeout: 10_000,
+    });
+  });
+
   // Next.js: 'should not remount the page + loading component when revalidating'
   // Adapted: Verify that clicking revalidate button updates the timestamp
   test("revalidatePath via server action updates page data", async ({ page }) => {

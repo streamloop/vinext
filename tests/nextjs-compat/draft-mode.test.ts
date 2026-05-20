@@ -15,9 +15,9 @@
  * - fixtures/app-basic/app/nextjs-compat/api/draft-status/
  */
 
-import { describe, it, expect, beforeAll, afterAll } from "vite-plus/test";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vite-plus/test";
 import type { ViteDevServer } from "vite-plus";
-import { APP_FIXTURE_DIR, startFixtureServer, fetchJson } from "../helpers.js";
+import { APP_FIXTURE_DIR, startFixtureServer, fetchJson, fetchHtml } from "../helpers.js";
 
 describe("Next.js compat: draft-mode", () => {
   let server: ViteDevServer;
@@ -84,8 +84,7 @@ describe("Next.js compat: draft-mode", () => {
       headersContextFromRequest,
     } = await import("../../packages/vinext/src/shims/headers.js");
 
-    const origEnv = process.env.NODE_ENV;
-    process.env.NODE_ENV = "production";
+    vi.stubEnv("NODE_ENV", "production");
     try {
       const ctx = headersContextFromRequest(new Request("http://localhost/test"));
       await runWithHeadersContext(ctx, async () => {
@@ -96,7 +95,7 @@ describe("Next.js compat: draft-mode", () => {
         expect(cookieHeader).toMatch(/;\s*Secure/i);
       });
     } finally {
-      process.env.NODE_ENV = origEnv;
+      vi.unstubAllEnvs();
     }
   });
 
@@ -108,8 +107,7 @@ describe("Next.js compat: draft-mode", () => {
       headersContextFromRequest,
     } = await import("../../packages/vinext/src/shims/headers.js");
 
-    const origEnv = process.env.NODE_ENV;
-    process.env.NODE_ENV = "production";
+    vi.stubEnv("NODE_ENV", "production");
     try {
       const ctx = headersContextFromRequest(new Request("https://preview.example.com/test"));
       await runWithHeadersContext(ctx, async () => {
@@ -121,7 +119,7 @@ describe("Next.js compat: draft-mode", () => {
         expect(cookieHeader).toMatch(/;\s*Secure/i);
       });
     } finally {
-      process.env.NODE_ENV = origEnv;
+      vi.unstubAllEnvs();
     }
   });
 
@@ -133,8 +131,7 @@ describe("Next.js compat: draft-mode", () => {
       headersContextFromRequest,
     } = await import("../../packages/vinext/src/shims/headers.js");
 
-    const origEnv = process.env.NODE_ENV;
-    process.env.NODE_ENV = "production";
+    vi.stubEnv("NODE_ENV", "production");
     try {
       const ctx = headersContextFromRequest(new Request("https://preview.example.com/test"));
       await runWithHeadersContext(ctx, async () => {
@@ -148,7 +145,7 @@ describe("Next.js compat: draft-mode", () => {
         expect(cookieHeader).not.toMatch(/;\s*Max-Age=0/i);
       });
     } finally {
-      process.env.NODE_ENV = origEnv;
+      vi.unstubAllEnvs();
     }
   });
 
@@ -161,11 +158,17 @@ describe("Next.js compat: draft-mode", () => {
     expect(bypassCookie).not.toMatch(/;\s*Secure/i);
   });
 
-  // ── draftMode() marks dynamic usage ──────────────────────────
-  // draftMode() reads from a request cookie, so it must opt out of
-  // static/ISR caching — same as headers() and cookies().
+  // ── draftMode() dynamic tracking ─────────────────────────────
+  // Calling `draftMode()` itself is NOT dynamic — `isEnabled` is a plain
+  // getter and merely awaiting `draftMode()` does not require bailing out
+  // of static prerendering. Only `enable()` / `disable()` mutate state and
+  // must be tracked as dynamic.
+  //
+  // Ported from Next.js: test/e2e/app-dir/draft-mode/draft-mode.test.ts
+  // ("should not generate rand when draft mode disabled during next start").
+  // Source: .nextjs-ref/packages/next/src/server/request/draft-mode.ts (trackDynamicDraftMode).
 
-  it("draftMode() marks dynamic usage so the render is uncacheable", async () => {
+  it("draftMode() does NOT mark dynamic usage on its own (allows static prerender)", async () => {
     const {
       draftMode: draftModeFn,
       consumeDynamicUsage,
@@ -175,10 +178,47 @@ describe("Next.js compat: draft-mode", () => {
 
     const ctx = headersContextFromRequest(new Request("http://localhost/test"));
     await runWithHeadersContext(ctx, async () => {
-      // Reset any prior dynamic usage
       consumeDynamicUsage();
+      const dm = await draftModeFn();
+      // Reading isEnabled is also non-dynamic.
+      // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+      dm.isEnabled;
+      expect(consumeDynamicUsage()).toBe(false);
+    });
+  });
 
-      await draftModeFn();
+  it("draftMode().enable() marks dynamic usage", async () => {
+    const {
+      draftMode: draftModeFn,
+      consumeDynamicUsage,
+      runWithHeadersContext,
+      headersContextFromRequest,
+    } = await import("../../packages/vinext/src/shims/headers.js");
+
+    const ctx = headersContextFromRequest(new Request("http://localhost/test"));
+    await runWithHeadersContext(ctx, async () => {
+      consumeDynamicUsage();
+      const dm = await draftModeFn();
+      expect(consumeDynamicUsage()).toBe(false);
+      dm.enable();
+      expect(consumeDynamicUsage()).toBe(true);
+    });
+  });
+
+  it("draftMode().disable() marks dynamic usage", async () => {
+    const {
+      draftMode: draftModeFn,
+      consumeDynamicUsage,
+      runWithHeadersContext,
+      headersContextFromRequest,
+    } = await import("../../packages/vinext/src/shims/headers.js");
+
+    const ctx = headersContextFromRequest(new Request("http://localhost/test"));
+    await runWithHeadersContext(ctx, async () => {
+      consumeDynamicUsage();
+      const dm = await draftModeFn();
+      expect(consumeDynamicUsage()).toBe(false);
+      dm.disable();
       expect(consumeDynamicUsage()).toBe(true);
     });
   });
@@ -207,5 +247,26 @@ describe("Next.js compat: draft-mode", () => {
       /Page with `dynamic = (?:&quot;|\\")error(?:&quot;|\\")` used a dynamic API/,
     );
     expect(res.headers.getSetCookie()).toEqual([]);
+  });
+
+  // ── Draft mode streams Suspense fallbacks ────────────────────
+  // Ported from Next.js: test/e2e/app-dir/cache-components/cache-components.draft-mode.test.ts
+  // https://github.com/vercel/next.js/pull/93417
+
+  it("should stream Suspense fallbacks when draft mode is enabled", async () => {
+    // Enable draft mode and extract the bypass cookie
+    const draftRes = await fetch(`${baseUrl}/nextjs-compat/api/draft-enable`);
+    const setCookies = draftRes.headers.getSetCookie();
+    const bypassCookie = setCookies.find((c) => c.includes("__prerender_bypass"));
+    expect(bypassCookie).toBeDefined();
+    const rawCookie = bypassCookie!.split(";")[0];
+
+    // Request the streaming page with the draft cookie
+    const { html } = await fetchHtml(baseUrl, "/nextjs-compat/draftmode/streaming", {
+      headers: { Cookie: rawCookie },
+    });
+
+    expect(html).toContain('id="draft-mode">true');
+    expect(html).toContain("Loading draft content...");
   });
 });

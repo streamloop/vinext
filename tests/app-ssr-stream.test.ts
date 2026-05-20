@@ -84,6 +84,17 @@ function createTextStream(chunks: string[]): ReadableStream<Uint8Array> {
   });
 }
 
+function createByteStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(chunk);
+      }
+      controller.close();
+    },
+  });
+}
+
 describe("createRscEmbedTransform raw buffer (#981)", () => {
   it("accumulates raw bytes while producing embed scripts", async () => {
     const sideStream = createTextStream(["chunk1", "chunk2"]);
@@ -96,8 +107,10 @@ describe("createRscEmbedTransform raw buffer (#981)", () => {
 
     // Embed scripts still work
     const finalScripts = await transform.finalize();
-    expect(finalScripts).toContain("__VINEXT_RSC_DONE__");
-    expect(finalScripts).toContain("__VINEXT_RSC_CHUNKS__");
+    expect(finalScripts).toContain('Symbol.for("vinext.navigationRuntime")');
+    expect(finalScripts).toContain(".done=true");
+    expect(finalScripts).toContain('.rsc.push("chunk1")');
+    expect(finalScripts).toContain('.rsc.push("chunk2")');
   });
 
   it("rejects getRawBuffer when the stream errors (#1002)", async () => {
@@ -127,6 +140,29 @@ describe("createRscEmbedTransform raw buffer (#981)", () => {
     // The fixed text "as=\"style\"" appears in the embed script after JSON escaping.
     // fixFlightHints turns "stylesheet" → "style" before the chunk is script-wrapped.
     expect(finalScripts).not.toContain("stylesheet");
-    expect(finalScripts).toContain("__VINEXT_RSC_DONE__");
+    expect(finalScripts).toContain(".done=true");
+  });
+
+  it("embeds non-UTF-8 RSC chunks as base64 binary chunks", async () => {
+    // Ported from Next.js: test/e2e/app-dir/binary/rsc-binary.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/binary/rsc-binary.test.ts
+    const transform = createRscEmbedTransform(
+      createByteStream([new Uint8Array([0xff, 0, 1, 2, 3])]),
+    );
+
+    const finalScripts = await transform.finalize();
+
+    expect(finalScripts).toContain('.rsc.push([3,"/wABAgM="])');
+  });
+
+  it("does not lose incomplete UTF-8 bytes before a binary chunk", async () => {
+    const transform = createRscEmbedTransform(
+      createByteStream([new Uint8Array([0x41, 0xc3]), new Uint8Array([0xff])]),
+    );
+
+    const finalScripts = await transform.finalize();
+
+    expect(finalScripts).toContain('.rsc.push([3,"QcM="])');
+    expect(finalScripts).toContain('.rsc.push([3,"/w=="])');
   });
 });

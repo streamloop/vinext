@@ -2,12 +2,22 @@ import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vite-plus/test";
 import React from "react";
 import {
+  APP_ARTIFACT_COMPATIBILITY_KEY,
   APP_LAYOUT_FLAGS_KEY,
+  APP_RENDER_OBSERVATION_KEY,
+  APP_ROOT_LAYOUT_KEY,
   isAppElementsRecord,
   type AppOutgoingElements,
 } from "../packages/vinext/src/server/app-elements.js";
+import {
+  APP_ELEMENTS_SCHEMA_VERSION,
+  ARTIFACT_COMPATIBILITY_SCHEMA_VERSION,
+  createArtifactCompatibilityGraphVersion,
+  RSC_PAYLOAD_SCHEMA_VERSION,
+} from "../packages/vinext/src/server/artifact-compatibility.js";
 import type { LayoutClassificationOptions } from "../packages/vinext/src/server/app-page-execution.js";
 import { renderAppPageLifecycle } from "../packages/vinext/src/server/app-page-render.js";
+import type { CachedAppPageValue } from "../packages/vinext/src/shims/cache.js";
 
 function captureRecord(value: ReactNode | AppOutgoingElements): Record<string, unknown> {
   if (!isAppElementsRecord(value)) {
@@ -46,6 +56,7 @@ function createCommonOptions() {
       _navContext: unknown,
       _fontData: unknown,
       options?: {
+        formState?: unknown;
         scriptNonce?: string;
         sideStream?: ReadableStream<Uint8Array>;
         capturedRscDataRef?: { value: Promise<ArrayBuffer> | null };
@@ -82,7 +93,15 @@ function createCommonOptions() {
         status: specialError.statusCode,
       }),
   );
-  const isrSet = vi.fn(async () => {});
+  const isrSet = vi.fn(
+    async (
+      _key: string,
+      _data: CachedAppPageValue,
+      _revalidateSeconds: number,
+      _tags: string[],
+      _expireSeconds?: number,
+    ) => {},
+  );
 
   return {
     isrSet,
@@ -124,8 +143,10 @@ function createCommonOptions() {
       handlerStart: 10,
       hasLoadingBoundary: false,
       isDynamicError: false,
+      isDraftMode: false,
       isForceDynamic: false,
       isForceStatic: false,
+      isProgressiveActionRender: false,
       isProduction: false,
       isRscRequest: false,
       isrHtmlKey(pathname: string) {
@@ -245,6 +266,37 @@ describe("clearRequestContext timing — issue #660", () => {
   });
 });
 
+describe("form state rendering", () => {
+  it("passes action form state to SSR and disables HTML cache writes", async () => {
+    const common = createCommonOptions();
+    const formState = ["action-result", "key-path", "reference-id", 1] as never;
+    const loadSsrHandler = vi.fn(async () => ({
+      async handleSsr(
+        _rscStream: ReadableStream<Uint8Array>,
+        _navContext: unknown,
+        _fontData: unknown,
+        options?: { formState?: unknown },
+      ) {
+        expect(options?.formState).toBe(formState);
+        return createStream(["<html>action state</html>"]);
+      },
+    }));
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      formState,
+      isProgressiveActionRender: true,
+      isProduction: true,
+      loadSsrHandler,
+      revalidateSeconds: 60,
+    });
+
+    expect(response.headers.get("cache-control")).toBe("no-store, must-revalidate");
+    expect(common.isrSet).not.toHaveBeenCalled();
+    await expect(response.text()).resolves.toBe("<html>action state</html>");
+  });
+});
+
 describe("app page render lifecycle", () => {
   it("returns pre-render special responses before starting the render stream", async () => {
     const common = createCommonOptions();
@@ -269,13 +321,19 @@ describe("app page render lifecycle", () => {
     const response = await renderAppPageLifecycle({
       ...common.options,
       consumeDynamicUsage,
+      consumeRenderObservationState() {
+        return {
+          dynamicFetches: ["https://api.example.test/posts?token=secret"],
+          requestApis: ["headers"],
+        };
+      },
       isProduction: true,
       isRscRequest: true,
       revalidateSeconds: 60,
     });
 
     expect(response.status).toBe(200);
-    expect(response.headers.get("content-type")).toBe("text/x-component; charset=utf-8");
+    expect(response.headers.get("content-type")).toBe("text/x-component");
     expect(response.headers.get("cache-control")).toBe("no-store, must-revalidate");
     expect(response.headers.get("x-vinext-cache")).toBe("MISS");
     await expect(response.text()).resolves.toBe("flight-data");
@@ -290,6 +348,24 @@ describe("app page render lifecycle", () => {
       ["_N_T_/posts/post"],
       undefined,
     );
+    const cachedValue = common.isrSet.mock.calls[0]?.[1];
+    expect(cachedValue?.renderObservation).toMatchObject({
+      boundaryOutcome: { kind: "success" },
+      cacheability: "public",
+      completeness: "complete",
+      output: {
+        kind: "app-rsc",
+        mountedSlotsFingerprint: null,
+        renderEpoch: null,
+        rootBoundaryId: null,
+        routeId: "route:/posts/[slug]",
+      },
+      requestApis: expect.arrayContaining([
+        { kind: "headers", status: "observed" },
+        { kind: "params", status: "observed" },
+      ]),
+    });
+    expect(JSON.stringify(cachedValue?.renderObservation)).not.toContain("secret");
     expect(consumeDynamicUsage).toHaveBeenCalledTimes(2);
   });
 
@@ -680,6 +756,7 @@ describe("layoutFlags injection into RSC payload", () => {
       handlerStart: 0,
       hasLoadingBoundary: false,
       isDynamicError: false,
+      isDraftMode: false,
       isForceDynamic: false,
       isForceStatic: false,
       isProduction: true,
@@ -766,6 +843,82 @@ describe("layoutFlags injection into RSC payload", () => {
 
     await renderAppPageLifecycle(options);
     expect(getCapturedElement()[APP_LAYOUT_FLAGS_KEY]).toEqual({});
+  });
+
+  it("injects concrete artifact compatibility metadata from the render boundary", async () => {
+    const originalBuildId = process.env.__VINEXT_BUILD_ID;
+    process.env.__VINEXT_BUILD_ID = "deploy-test";
+    const { options, getCapturedElement } = createRscOptions({
+      element: {
+        [APP_ROOT_LAYOUT_KEY]: "/(shop)",
+        "layout:/(shop)": "shop-layout",
+        "page:/shop": "shop-page",
+      },
+    });
+
+    try {
+      await renderAppPageLifecycle(options);
+    } finally {
+      if (originalBuildId === undefined) {
+        delete process.env.__VINEXT_BUILD_ID;
+      } else {
+        process.env.__VINEXT_BUILD_ID = originalBuildId;
+      }
+    }
+
+    expect(getCapturedElement()[APP_ARTIFACT_COMPATIBILITY_KEY]).toEqual({
+      schemaVersion: ARTIFACT_COMPATIBILITY_SCHEMA_VERSION,
+      graphVersion: createArtifactCompatibilityGraphVersion({
+        routePattern: "/test",
+        rootBoundaryId: "/(shop)",
+      }),
+      deploymentVersion: "deploy-test",
+      appElementsSchemaVersion: APP_ELEMENTS_SCHEMA_VERSION,
+      rscPayloadSchemaVersion: RSC_PAYLOAD_SCHEMA_VERSION,
+      rootBoundaryId: "/(shop)",
+      renderEpoch: null,
+    });
+  });
+
+  it("injects partial render observation metadata into outgoing AppElements payloads", async () => {
+    const { options, getCapturedElement } = createRscOptions({
+      element: {
+        [APP_ROOT_LAYOUT_KEY]: "/",
+        "layout:/": "root-layout",
+        "page:/test": "test-page",
+      },
+    });
+
+    await renderAppPageLifecycle({
+      ...options,
+      params: { id: "123" },
+      peekRenderObservationState() {
+        return {
+          dynamicFetches: ["https://api.example.test/posts?token=secret"],
+          requestApis: ["headers"],
+        };
+      },
+    });
+
+    const renderObservation = getCapturedElement()[APP_RENDER_OBSERVATION_KEY];
+
+    expect(renderObservation).toMatchObject({
+      boundaryOutcome: { kind: "unknown" },
+      cacheability: "unknown",
+      completeness: "partial",
+      output: {
+        kind: "app-rsc",
+        mountedSlotsFingerprint: null,
+        renderEpoch: null,
+        rootBoundaryId: "/",
+        routeId: "route:/test",
+      },
+      requestApis: expect.arrayContaining([
+        { kind: "headers", status: "observed" },
+        { kind: "params", status: "observed" },
+      ]),
+    });
+    expect(JSON.stringify(renderObservation)).not.toContain("secret");
   });
 
   it("injects __layoutFlags for multiple independently classified layouts", async () => {
@@ -856,5 +1009,201 @@ describe("layoutFlags injection into RSC payload", () => {
     for (const [_id, flag] of Object.entries(wireFlags as Record<string, unknown>)) {
       expect(flag === "s" || flag === "d").toBe(true);
     }
+  });
+});
+
+describe("dev error reporting for invalid dynamic usage — issue #1195", () => {
+  it("does not double-log an uncaught error that React already stamped with a digest", async () => {
+    const common = createCommonOptions();
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const errorWithDigest = Object.assign(new Error("cookies() inside use cache"), {
+      digest: "DYNAMIC_SERVER_USAGE",
+    });
+    let consumedError: unknown = null;
+    const consumeInvalidDynamicUsageError = vi.fn(() => {
+      if (consumedError !== null) return null;
+      consumedError = errorWithDigest;
+      return errorWithDigest;
+    });
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      consumeInvalidDynamicUsageError,
+      isRscRequest: true,
+    });
+
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(consumeInvalidDynamicUsageError).toHaveBeenCalled();
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+
+    consoleErrorSpy.mockRestore();
+  });
+
+  it("logs a caught error that has no digest (React never saw it)", async () => {
+    const common = createCommonOptions();
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const errorWithoutDigest = new Error("cookies() inside use cache");
+    let consumedError: unknown = null;
+    const consumeInvalidDynamicUsageError = vi.fn(() => {
+      if (consumedError !== null) return null;
+      consumedError = errorWithoutDigest;
+      return errorWithoutDigest;
+    });
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      consumeInvalidDynamicUsageError,
+      isRscRequest: true,
+    });
+
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(consumeInvalidDynamicUsageError).toHaveBeenCalled();
+    expect(consoleErrorSpy).toHaveBeenCalledTimes(1);
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      "[vinext] Invalid dynamic usage:",
+      errorWithoutDigest,
+    );
+
+    consoleErrorSpy.mockRestore();
+  });
+
+  it("does not log when no invalid dynamic usage error was recorded", async () => {
+    const common = createCommonOptions();
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const consumeInvalidDynamicUsageError = vi.fn(() => null);
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      consumeInvalidDynamicUsageError,
+      isRscRequest: true,
+    });
+
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(consumeInvalidDynamicUsageError).toHaveBeenCalled();
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+
+    consoleErrorSpy.mockRestore();
+  });
+
+  it("still dedups when the stream is cancelled before full consumption", async () => {
+    const common = createCommonOptions();
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const errorWithDigest = Object.assign(new Error("cookies() inside use cache"), {
+      digest: "DYNAMIC_SERVER_USAGE",
+    });
+    let consumedError: unknown = null;
+    const consumeInvalidDynamicUsageError = vi.fn(() => {
+      if (consumedError !== null) return null;
+      consumedError = errorWithDigest;
+      return errorWithDigest;
+    });
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      consumeInvalidDynamicUsageError,
+      isRscRequest: true,
+    });
+
+    // Cancel the stream before consuming any bytes
+    if (response.body) {
+      await response.body.cancel("client disconnect");
+    }
+    expect(consumeInvalidDynamicUsageError).toHaveBeenCalled();
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+
+    consoleErrorSpy.mockRestore();
+  });
+
+  it("still dedups when the stream errors during pull", async () => {
+    const common = createCommonOptions();
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const errorWithDigest = Object.assign(new Error("cookies() inside use cache"), {
+      digest: "DYNAMIC_SERVER_USAGE",
+    });
+    let consumedError: unknown = null;
+    const consumeInvalidDynamicUsageError = vi.fn(() => {
+      if (consumedError !== null) return null;
+      consumedError = errorWithDigest;
+      return errorWithDigest;
+    });
+
+    const renderToReadableStream = vi.fn(
+      () =>
+        new ReadableStream<Uint8Array>({
+          pull() {
+            throw new Error("stream blowup");
+          },
+        }),
+    );
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      consumeInvalidDynamicUsageError,
+      isRscRequest: true,
+      renderToReadableStream,
+    });
+
+    // Attempting to consume the stream will trigger the error
+    try {
+      await response.text();
+    } catch {
+      // Expected
+    }
+    expect(consumeInvalidDynamicUsageError).toHaveBeenCalled();
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+
+    consoleErrorSpy.mockRestore();
+  });
+
+  it("does not apply the wrapper in production mode", async () => {
+    const common = createCommonOptions();
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const errorWithoutDigest = new Error("cookies() inside use cache");
+    const consumeInvalidDynamicUsageError = vi.fn(() => errorWithoutDigest);
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      consumeInvalidDynamicUsageError,
+      isProduction: true,
+      isRscRequest: true,
+    });
+
+    expect(response.status).toBe(200);
+    await response.text();
+    // In production the wrapper is skipped entirely
+    expect(consumeInvalidDynamicUsageError).not.toHaveBeenCalled();
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+
+    consoleErrorSpy.mockRestore();
+  });
+
+  it("does not apply the wrapper for HTML (non-RSC) requests", async () => {
+    const common = createCommonOptions();
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const errorWithoutDigest = new Error("cookies() inside use cache");
+    const consumeInvalidDynamicUsageError = vi.fn(() => errorWithoutDigest);
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      consumeInvalidDynamicUsageError,
+      isRscRequest: false,
+    });
+
+    await response.text();
+    // HTML path intentionally defers dev error reporting
+    expect(consumeInvalidDynamicUsageError).not.toHaveBeenCalled();
+    expect(consoleErrorSpy).not.toHaveBeenCalled();
+
+    consoleErrorSpy.mockRestore();
   });
 });

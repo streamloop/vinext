@@ -70,6 +70,9 @@ export default {
         "src/server/app-request-context.ts",
         "src/server/app-rsc-error-handler.ts",
         "src/server/rsc-stream-hints.ts",
+        // #726-CACHE-01/04 defines the disabled proof boundary before runtime
+        // observation recording or cache reuse is wired in later slices.
+        "src/server/cache-proof.ts",
       ],
       project: ["src/**/*.{ts,tsx}"],
     },
@@ -88,11 +91,21 @@ export default {
     // probed via require.resolve
     "next-intl",
 
+    // Optional peer dep used by Vite's built-in SCSS preprocessor when the
+    // user installs it. `tests/scss.test.ts` dynamically imports it to skip
+    // the SCSS suite when sass is absent, so we never list it as a hard dep.
+    "sass",
+
     // vitest reporter used outside CI
     ...(process.env.CI ? [] : ["agent"]),
 
     // internal module name, not an actual dependency
     "private-next-instrumentation-client",
+
+    // Cloudflare Workers runtime virtual module — provides `env` for
+    // accessing wrangler bindings. Not an npm package. Knip strips the
+    // `cloudflare:workers` specifier down to the bare scheme.
+    "cloudflare",
   ],
   ignoreBinaries: [
     // workspace's own bin, invoked in CI

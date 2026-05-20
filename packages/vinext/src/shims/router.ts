@@ -5,22 +5,53 @@
  * Backed by the browser History API. Supports client-side navigation
  * by fetching new page data and re-rendering the React root.
  */
-import { useState, useEffect, useCallback, useMemo, createElement, type ReactElement } from "react";
+import {
+  useState,
+  useEffect,
+  useMemo,
+  useContext,
+  createElement,
+  type ReactElement,
+  type ReactNode,
+  type ComponentType,
+} from "react";
 import { RouterContext } from "./internal/router-context.js";
-import type { VinextNextData } from "../client/vinext-next-data.js";
+import {
+  applyVinextLocaleGlobals,
+  extractVinextNextDataJson,
+  parseVinextNextDataJson,
+  type VinextNextData,
+} from "../client/vinext-next-data.js";
 import { isValidModulePath } from "../client/validate-module-path.js";
-import { toBrowserNavigationHref, toSameOriginAppPath } from "./url-utils.js";
+import { installWindowNext, type PagesRouterPublicInstance } from "../client/window-next.js";
+import {
+  isAbsoluteOrProtocolRelativeUrl,
+  isHashOnlyBrowserUrlChange,
+  normalizePathTrailingSlash,
+  toBrowserNavigationHref,
+  toSameOriginAppPath,
+} from "./url-utils.js";
 import { stripBasePath } from "../utils/base-path.js";
-import { addLocalePrefix, getDomainLocaleUrl, type DomainLocale } from "../utils/domain-locale.js";
+import {
+  addLocalePrefix,
+  getDomainLocaleUrl,
+  getLocalePathPrefix,
+  type DomainLocale,
+} from "../utils/domain-locale.js";
 import {
   addQueryParam,
   appendSearchParamsToUrl,
   type UrlQuery,
   urlQueryToSearchParams,
 } from "../utils/query.js";
+import { matchRoutePattern, routePatternParts } from "../routing/route-pattern.js";
+import { scrollToHashTarget } from "./hash-scroll.js";
+import { setPagesRouterPopStateHandler } from "./pages-router-runtime.js";
 
 /** basePath from next.config.js, injected by the plugin at build time */
 const __basePath: string = process.env.__NEXT_ROUTER_BASEPATH ?? "";
+/** trailingSlash from next.config.js, injected by the plugin at build time */
+const __trailingSlash: boolean = process.env.__VINEXT_TRAILING_SLASH === "true";
 
 type BeforePopStateCallback = (state: {
   url: string;
@@ -78,7 +109,7 @@ type UrlObject = {
 type TransitionOptions = {
   shallow?: boolean;
   scroll?: boolean;
-  locale?: string;
+  locale?: string | false;
 };
 
 type RouterEvents = {
@@ -132,6 +163,12 @@ function resolveNavigationTarget(
   return applyNavigationLocale(as ?? resolveUrl(url), locale);
 }
 
+function resolveTransitionLocale(locale: TransitionOptions["locale"]): string | undefined {
+  if (typeof window === "undefined") return undefined;
+  if (locale === false) return window.__VINEXT_DEFAULT_LOCALE__;
+  return locale ?? window.__VINEXT_LOCALE__;
+}
+
 function getDomainLocales(): readonly DomainLocale[] | undefined {
   return (window.__NEXT_DATA__ as VinextNextData | undefined)?.domainLocales;
 }
@@ -156,7 +193,10 @@ export function applyNavigationLocale(url: string, locale?: string): string {
   if (!locale || typeof window === "undefined") return url;
   // Absolute and protocol-relative URLs must not be prefixed — locale
   // only applies to local paths.
-  if (url.startsWith("http://") || url.startsWith("https://") || url.startsWith("//")) {
+  if (isAbsoluteOrProtocolRelativeUrl(url)) {
+    return url;
+  }
+  if (getLocalePathPrefix(url, window.__VINEXT_LOCALES__)) {
     return url;
   }
 
@@ -166,9 +206,42 @@ export function applyNavigationLocale(url: string, locale?: string): string {
   return addLocalePrefix(url, locale, window.__VINEXT_DEFAULT_LOCALE__ ?? "");
 }
 
+function isDefaultLocaleRootNavigation(url: string, locale: string | undefined): boolean {
+  if (typeof window === "undefined") return false;
+  if (!locale || locale !== window.__VINEXT_DEFAULT_LOCALE__) return false;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(url, window.location.href);
+  } catch {
+    return false;
+  }
+
+  return stripBasePath(parsed.pathname, __basePath) === "/";
+}
+
+function getPagesHtmlFetchUrl(browserUrl: string, locale: string | undefined): string {
+  if (!isDefaultLocaleRootNavigation(browserUrl, locale)) return browserUrl;
+
+  // Browser URL stays unprefixed for the default locale, but the internal
+  // HTML fetch must bypass root Accept-Language detection.
+  const parsed = new URL(browserUrl, window.location.href);
+  const localeRoot = normalizePathTrailingSlash(`/${locale}`, __trailingSlash);
+  // Base path joining can change slash shape, then the final URL must still
+  // conform to the app's trailingSlash setting.
+  return normalizePathTrailingSlash(
+    toBrowserNavigationHref(
+      `${localeRoot}${parsed.search}${parsed.hash}`,
+      window.location.href,
+      __basePath,
+    ),
+    __trailingSlash,
+  );
+}
+
 /** Check if a URL is external (any URL scheme per RFC 3986, or protocol-relative) */
 export function isExternalUrl(url: string): boolean {
-  return /^[a-z][a-z0-9+.-]*:/i.test(url) || url.startsWith("//");
+  return isAbsoluteOrProtocolRelativeUrl(url);
 }
 
 /** Resolve a hash URL to a basePath-stripped app URL for event payloads */
@@ -189,23 +262,7 @@ function resolveHashUrl(url: string): string {
 export function isHashOnlyChange(href: string): boolean {
   if (href.startsWith("#")) return true;
   if (typeof window === "undefined") return false;
-  try {
-    const current = new URL(window.location.href);
-    const next = new URL(href, window.location.href);
-    return current.pathname === next.pathname && current.search === next.search && next.hash !== "";
-  } catch {
-    return false;
-  }
-}
-
-/** Scroll to hash target element, or top if no hash */
-function scrollToHash(hash: string): void {
-  if (!hash || hash === "#") {
-    window.scrollTo(0, 0);
-    return;
-  }
-  const el = document.getElementById(hash.slice(1));
-  if (el) el.scrollIntoView({ behavior: "auto" });
+  return isHashOnlyBrowserUrlChange(href, window.location.href, __basePath);
 }
 
 /** Save current scroll position into history state for back/forward restoration */
@@ -270,6 +327,86 @@ export function setSSRContext(ctx: SSRContext | null): void {
   _setSSRContextImpl(ctx);
 }
 
+type PagesNavigationContextShape = {
+  pathname: string;
+  searchParams: URLSearchParams;
+  params: Record<string, string | string[]>;
+};
+
+// Client-only cache for snapshot stability. useSyncExternalStore compares
+// snapshots with Object.is, so returning a fresh object on every render would
+// trigger re-render loops. We use a module-level cache keyed by URL inputs;
+// this is safe in the browser because there is exactly one request at a time
+// but it must NOT be used on the server (concurrent ALS-scoped requests).
+let _cachedClientPagesNavCtx: PagesNavigationContextShape | null = null;
+let _cachedClientPagesNavCtxKey: string | null = null;
+
+function _buildClientPagesNavigationContext(
+  routePattern: string,
+  resolvedPath: string,
+  searchString: string,
+): PagesNavigationContextShape {
+  const cacheKey = `${routePattern}|${resolvedPath}|${searchString}`;
+  if (_cachedClientPagesNavCtxKey === cacheKey && _cachedClientPagesNavCtx) {
+    return _cachedClientPagesNavCtx;
+  }
+  const searchParams = new URLSearchParams(searchString);
+  const params = routePattern ? (extractRouteParamsFromPath(routePattern, resolvedPath) ?? {}) : {};
+  const ctx: PagesNavigationContextShape = { pathname: resolvedPath, searchParams, params };
+  _cachedClientPagesNavCtx = ctx;
+  _cachedClientPagesNavCtxKey = cacheKey;
+  return ctx;
+}
+
+/**
+ * Cross-router compat shim source for `next/navigation` hooks.
+ *
+ * Returns the current Pages Router state shaped as a navigation context so
+ * the App Router hooks (useParams/useSearchParams/usePathname) can act as
+ * compat shims when invoked inside a Pages Router render. Mirrors Next.js's
+ * `adaptForPathParams` and `adaptForSearchParams` in
+ * .nextjs-ref/packages/next/src/shared/lib/router/adapters.tsx, which Next.js
+ * uses to populate SearchParamsContext / PathParamsContext for the Pages
+ * Router (see packages/next/src/server/render.tsx and
+ * packages/next/src/client/index.tsx).
+ *
+ * Returns `null` when there is no Pages Router state available — e.g. App
+ * Router pages, RSC-only renders, or pre-router renders. Callers should
+ * treat null as "App Router context, use normal app-router state".
+ */
+export function getPagesNavigationContext(): PagesNavigationContextShape | null {
+  if (typeof window === "undefined") {
+    const ssrCtx = _getSSRContext();
+    if (!ssrCtx) return null;
+    // ssrCtx.pathname is the route pattern (e.g. "/blog/[slug]").
+    // ssrCtx.asPath is the resolved URL with query string. For useSearchParams
+    // we want only the URL search string; for useParams we want only the
+    // dynamic route params. Build a fresh object each call — server scope is
+    // request-isolated via ALS but module state must not be cached across
+    // concurrent requests.
+    let searchParams: URLSearchParams;
+    let resolvedPath: string;
+    try {
+      const url = new URL(ssrCtx.asPath, "http://_");
+      searchParams = url.searchParams;
+      resolvedPath = url.pathname;
+    } catch {
+      searchParams = new URLSearchParams();
+      resolvedPath = ssrCtx.pathname;
+    }
+    const params = extractRouteParamsFromPath(ssrCtx.pathname, resolvedPath) ?? {};
+    return { pathname: resolvedPath, searchParams, params };
+  }
+
+  // Client: derive from window.location + __NEXT_DATA__. __NEXT_DATA__.page
+  // is the route pattern that was matched; navigateClient() keeps it in sync
+  // with the visible URL on every client-side navigation. Cached so
+  // useSyncExternalStore sees a stable snapshot between renders.
+  const resolvedPath = stripBasePath(window.location.pathname, __basePath);
+  const pattern = window.__NEXT_DATA__?.page ?? "";
+  return _buildClientPagesNavigationContext(pattern, resolvedPath, window.location.search);
+}
+
 /**
  * Extract param names from a Next.js route pattern.
  * E.g., "/posts/[id]" → ["id"], "/docs/[...slug]" → ["slug"],
@@ -279,17 +416,58 @@ export function setSSRContext(ctx: SSRContext | null): void {
 function extractRouteParamNames(pattern: string): string[] {
   const names: string[] = [];
   // Match Next.js bracket format: [id], [...slug], [[...slug]]
-  const bracketMatches = pattern.matchAll(/\[{1,2}(?:\.\.\.)?([\w-]+)\]{1,2}/g);
+  // Accepts any non-] characters inside brackets (Next.js PARAMETER_PATTERN parity).
+  const bracketMatches = pattern.matchAll(/\[{1,2}(?:\.\.\.)?([^\]]+)\]{1,2}/g);
   for (const m of bracketMatches) {
     names.push(m[1]);
   }
   if (names.length > 0) return names;
-  // Fallback: match internal :param format
-  const colonMatches = pattern.matchAll(/:([\w-]+)[+*]?/g);
+  // Fallback: match internal :param format (any chars except /, +, *)
+  const colonMatches = pattern.matchAll(/:([^/+*]+)[+*]?/g);
   for (const m of colonMatches) {
     names.push(m[1]);
   }
   return names;
+}
+
+type RouteQueryNextData = {
+  page?: string;
+  query?: Record<string, string | string[] | undefined>;
+};
+
+function splitPathSegments(pathname: string): string[] {
+  return pathname.split("/").filter(Boolean);
+}
+
+function extractRouteParamsFromPath(
+  pattern: string,
+  pathname: string,
+): Record<string, string | string[]> | null {
+  return matchRoutePattern(splitPathSegments(pathname), routePatternParts(pattern));
+}
+
+function getRouteQueryFromNextData(
+  nextData: RouteQueryNextData | undefined,
+  resolvedPath: string,
+): Record<string, string | string[]> {
+  const routeQuery: Record<string, string | string[]> = {};
+  if (!nextData?.query || !nextData.page) return routeQuery;
+
+  const routeParamNames = extractRouteParamNames(nextData.page);
+  if (routeParamNames.length === 0) return routeQuery;
+
+  const currentRouteParams = extractRouteParamsFromPath(nextData.page, resolvedPath);
+  if (currentRouteParams) return currentRouteParams;
+
+  for (const key of routeParamNames) {
+    const value = nextData.query[key];
+    if (typeof value === "string") {
+      routeQuery[key] = value;
+    } else if (Array.isArray(value)) {
+      routeQuery[key] = [...value];
+    }
+  }
+  return routeQuery;
 }
 
 function getPathnameAndQuery(): {
@@ -313,21 +491,8 @@ function getPathnameAndQuery(): {
   // not the resolved path ("/posts/42"). __NEXT_DATA__.page holds the route
   // pattern and is updated by navigateClient() on every client-side navigation.
   const pathname = window.__NEXT_DATA__?.page ?? resolvedPath;
-  const routeQuery: Record<string, string | string[]> = {};
-  // Include dynamic route params from __NEXT_DATA__ (e.g., { id: "42" } from /posts/[id]).
-  // Only include keys that are part of the route pattern (not stale query params).
   const nextData = window.__NEXT_DATA__;
-  if (nextData && nextData.query && nextData.page) {
-    const routeParamNames = extractRouteParamNames(nextData.page);
-    for (const key of routeParamNames) {
-      const value = nextData.query[key];
-      if (typeof value === "string") {
-        routeQuery[key] = value;
-      } else if (Array.isArray(value)) {
-        routeQuery[key] = [...value];
-      }
-    }
-  }
+  const routeQuery = getRouteQueryFromNextData(nextData, resolvedPath);
   // URL search params always reflect the current URL
   const searchQuery: Record<string, string | string[]> = {};
   const params = new URLSearchParams(window.location.search);
@@ -396,7 +561,7 @@ function scheduleHardNavigationAndThrow(url: string, message: string): never {
  * Throws on hard-navigation failures (non-OK response, missing data) so the
  * caller can distinguish success from failure for event emission.
  */
-async function navigateClient(url: string): Promise<void> {
+async function navigateClient(url: string, fetchUrl = url): Promise<void> {
   if (typeof window === "undefined") return;
 
   const root = window.__VINEXT_ROOT__;
@@ -424,7 +589,7 @@ async function navigateClient(url: string): Promise<void> {
     // Fetch the target page's SSR HTML
     let res: Response;
     try {
-      res = await fetch(url, {
+      res = await fetch(fetchUrl, {
         headers: { Accept: "text/html" },
         signal: controller.signal,
       });
@@ -454,12 +619,12 @@ async function navigateClient(url: string): Promise<void> {
     assertStillCurrent();
 
     // Extract __NEXT_DATA__ from the HTML
-    const match = html.match(/<script>window\.__NEXT_DATA__\s*=\s*(.*?)<\/script>/);
-    if (!match) {
+    const nextDataJson = extractVinextNextDataJson(html);
+    if (!nextDataJson) {
       scheduleHardNavigationAndThrow(url, "Navigation failed: missing __NEXT_DATA__ in response");
     }
 
-    const nextData = JSON.parse(match[1]);
+    const nextData = parseVinextNextDataJson(nextDataJson);
     const { pageProps } = nextData.props;
     // Defer writing window.__NEXT_DATA__ until just before root.render() —
     // writing it here would let a stale navigation briefly pollute the global
@@ -530,7 +695,7 @@ async function navigateClient(url: string): Promise<void> {
       element = React.createElement(PageComponent, pageProps);
     }
 
-    // Wrap with RouterContext.Provider so next/compat/router works
+    // Wrap with RouterContext.Provider so next/router and next/compat/router work.
     element = wrapWithRouterContext(element);
 
     // Commit __NEXT_DATA__ only after all assertStillCurrent() checks have passed,
@@ -540,6 +705,7 @@ async function navigateClient(url: string): Promise<void> {
     // root.render() is synchronous. If any step here ever becomes async, add
     // another assertStillCurrent() before writing __NEXT_DATA__.
     window.__NEXT_DATA__ = nextData;
+    applyVinextLocaleGlobals(window, nextData);
     root.render(element);
   } finally {
     // Clean up the abort controller if this navigation is still the active one
@@ -564,9 +730,10 @@ async function navigateClient(url: string): Promise<void> {
 async function runNavigateClient(
   fullUrl: string,
   resolvedUrl: string,
+  fetchUrl = fullUrl,
 ): Promise<"completed" | "cancelled" | "failed"> {
   try {
-    await navigateClient(fullUrl);
+    await navigateClient(fullUrl, fetchUrl);
     return "completed";
   } catch (err: unknown) {
     routerEvents.emit("routeChangeError", err, resolvedUrl, { shallow: false });
@@ -586,9 +753,8 @@ async function runNavigateClient(
 
 /**
  * Build the full router value object from the current pathname, query, asPath,
- * and a set of navigation methods.  Shared by useRouter() (which passes
- * hook-derived callbacks) and wrapWithRouterContext() (which passes the Router
- * singleton methods) so the shape stays in sync.
+ * and a set of navigation methods. Shared by the Pages Router context provider
+ * and tests so the public router shape stays in sync.
  */
 function buildRouterValue(
   pathname: string,
@@ -635,14 +801,137 @@ function buildRouterValue(
   };
 }
 
+/** Extract the hash fragment from a URL, including the leading `#`. */
+function extractHash(url: string): string {
+  const i = url.indexOf("#");
+  return i === -1 ? "" : url.slice(i);
+}
+
+/** Notify in-page listeners (e.g. useRouter hooks) that navigation occurred. */
+function dispatchNavigateEvent(): void {
+  window.dispatchEvent(new CustomEvent("vinext:navigate"));
+}
+
+/**
+ * Update history with the new URL and refresh the hash-only-detection tracker.
+ * Centralises the `pushState`/`replaceState` branch so callers don't repeat it.
+ */
+function updateHistory(mode: "push" | "replace", url: string): void {
+  if (mode === "push") window.history.pushState({}, "", url);
+  else window.history.replaceState({}, "", url);
+  _lastPathnameAndSearch = window.location.pathname + window.location.search;
+}
+
+/**
+ * Shared client-side navigation flow used by both `useRouter()` and the
+ * `Router` singleton. The only differences between push/replace are the
+ * history method (`pushState` vs `replaceState`), the external-URL fallback
+ * (`assign` vs `replace`), and the fact that push saves scroll position for
+ * back/forward restoration while replace does not.
+ *
+ * `onStateUpdate` lets the hook trigger a `setState` re-render at the same
+ * point that hashChangeComplete/routeChangeComplete fires; the singleton
+ * passes no callback.
+ */
+async function performNavigation(
+  url: string | UrlObject,
+  as: string | undefined,
+  options: TransitionOptions | undefined,
+  mode: "push" | "replace",
+  onStateUpdate?: () => void,
+): Promise<boolean> {
+  const navigationLocale = resolveTransitionLocale(options?.locale);
+  let resolved = resolveNavigationTarget(url, as, navigationLocale);
+
+  // External URLs — delegate to browser (unless same-origin)
+  if (isExternalUrl(resolved)) {
+    const localPath = toSameOriginAppPath(resolved, __basePath);
+    if (localPath == null) {
+      if (mode === "push") window.location.assign(resolved);
+      else window.location.replace(resolved);
+      return true;
+    }
+    resolved = localPath;
+  }
+
+  resolved = normalizePathTrailingSlash(resolved, __trailingSlash);
+  const full = normalizePathTrailingSlash(
+    toBrowserNavigationHref(resolved, window.location.href, __basePath),
+    __trailingSlash,
+  );
+  const htmlFetchUrl = getPagesHtmlFetchUrl(full, navigationLocale);
+  const shallow = options?.shallow ?? false;
+  const doScroll = options?.scroll !== false;
+
+  // Hash-only change — no page fetch needed
+  if (isHashOnlyChange(full)) {
+    const eventUrl = resolveHashUrl(full);
+    routerEvents.emit("hashChangeStart", eventUrl, { shallow });
+    updateHistory(mode, resolved.startsWith("#") ? resolved : full);
+    if (doScroll) scrollToHashTarget(extractHash(resolved));
+    onStateUpdate?.();
+    routerEvents.emit("hashChangeComplete", eventUrl, { shallow });
+    dispatchNavigateEvent();
+    return true;
+  }
+
+  if (mode === "push") saveScrollPosition();
+  routerEvents.emit("routeChangeStart", resolved, { shallow });
+  routerEvents.emit("beforeHistoryChange", resolved, { shallow });
+  updateHistory(mode, full);
+  if (!shallow) {
+    const result = await runNavigateClient(full, resolved, htmlFetchUrl);
+    if (result === "cancelled") return true;
+    if (result === "failed") return false;
+  }
+  onStateUpdate?.();
+  routerEvents.emit("routeChangeComplete", resolved, { shallow });
+
+  const hash = extractHash(resolved);
+  if (doScroll) {
+    if (hash) scrollToHashTarget(hash);
+    else window.scrollTo(0, 0);
+  }
+  dispatchNavigateEvent();
+  return true;
+}
+
+/** Inject a `<link rel="prefetch">` for the target page. */
+async function prefetchUrl(url: string): Promise<void> {
+  if (typeof document !== "undefined") {
+    const link = document.createElement("link");
+    link.rel = "prefetch";
+    link.href = url;
+    link.as = "document";
+    document.head.appendChild(link);
+  }
+}
+
 /**
  * useRouter hook - Pages Router compatible.
+ *
+ * Ported from Next.js: packages/next/src/client/router.ts
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/client/router.ts
  */
 export function useRouter(): NextRouter {
+  const router = useContext(RouterContext);
+  if (!router) {
+    throw new Error(
+      "NextRouter was not mounted. https://nextjs.org/docs/messages/next-router-not-mounted",
+    );
+  }
+
+  return router;
+}
+
+function PagesRouterProvider({ children }: { children: ReactNode }): ReactElement {
   const [{ pathname, query, asPath }, setState] = useState(getPathnameAndQuery);
 
-  // Popstate is handled by the module-level listener below so beforePopState()
-  // is consistently enforced even when multiple components mount useRouter().
+  // Popstate is handled by the Pages Router client entry via
+  // installPagesRouterRuntime() so beforePopState() is consistently enforced
+  // regardless of hook consumers. Keep URL snapshot subscriptions at the
+  // provider boundary so many useRouter() calls share one router state and one
+  // vinext:navigate listener.
   useEffect(() => {
     const onNavigate = ((_e: CustomEvent) => {
       setState(getPathnameAndQuery());
@@ -651,160 +940,20 @@ export function useRouter(): NextRouter {
     return () => window.removeEventListener("vinext:navigate", onNavigate);
   }, []);
 
-  const push = useCallback(
-    async (url: string | UrlObject, as?: string, options?: TransitionOptions): Promise<boolean> => {
-      let resolved = resolveNavigationTarget(url, as, options?.locale);
-
-      // External URLs — delegate to browser (unless same-origin)
-      if (isExternalUrl(resolved)) {
-        const localPath = toSameOriginAppPath(resolved, __basePath);
-        if (localPath == null) {
-          window.location.assign(resolved);
-          return true;
-        }
-        resolved = localPath;
-      }
-
-      const full = toBrowserNavigationHref(resolved, window.location.href, __basePath);
-
-      // Hash-only change — no page fetch needed
-      if (isHashOnlyChange(resolved)) {
-        const eventUrl = resolveHashUrl(resolved);
-        routerEvents.emit("hashChangeStart", eventUrl, {
-          shallow: options?.shallow ?? false,
-        });
-        const hash = resolved.includes("#") ? resolved.slice(resolved.indexOf("#")) : "";
-        window.history.pushState({}, "", resolved.startsWith("#") ? resolved : full);
-        _lastPathnameAndSearch = window.location.pathname + window.location.search;
-        scrollToHash(hash);
-        setState(getPathnameAndQuery());
-        routerEvents.emit("hashChangeComplete", eventUrl, {
-          shallow: options?.shallow ?? false,
-        });
-        window.dispatchEvent(new CustomEvent("vinext:navigate"));
-        return true;
-      }
-
-      saveScrollPosition();
-      routerEvents.emit("routeChangeStart", resolved, { shallow: options?.shallow ?? false });
-      routerEvents.emit("beforeHistoryChange", resolved, { shallow: options?.shallow ?? false });
-      window.history.pushState({}, "", full);
-      _lastPathnameAndSearch = window.location.pathname + window.location.search;
-      if (!options?.shallow) {
-        const result = await runNavigateClient(full, resolved);
-        if (result === "cancelled") return true;
-        if (result === "failed") return false;
-      }
-      setState(getPathnameAndQuery());
-      routerEvents.emit("routeChangeComplete", resolved, { shallow: options?.shallow ?? false });
-
-      // Scroll: handle hash target, else scroll to top unless scroll:false
-      const hash = resolved.includes("#") ? resolved.slice(resolved.indexOf("#")) : "";
-      if (hash) {
-        scrollToHash(hash);
-      } else if (options?.scroll !== false) {
-        window.scrollTo(0, 0);
-      }
-      window.dispatchEvent(new CustomEvent("vinext:navigate"));
-      return true;
-    },
-    [],
-  );
-
-  const replace = useCallback(
-    async (url: string | UrlObject, as?: string, options?: TransitionOptions): Promise<boolean> => {
-      let resolved = resolveNavigationTarget(url, as, options?.locale);
-
-      // External URLs — delegate to browser (unless same-origin)
-      if (isExternalUrl(resolved)) {
-        const localPath = toSameOriginAppPath(resolved, __basePath);
-        if (localPath == null) {
-          window.location.replace(resolved);
-          return true;
-        }
-        resolved = localPath;
-      }
-
-      const full = toBrowserNavigationHref(resolved, window.location.href, __basePath);
-
-      // Hash-only change — no page fetch needed
-      if (isHashOnlyChange(resolved)) {
-        const eventUrl = resolveHashUrl(resolved);
-        routerEvents.emit("hashChangeStart", eventUrl, {
-          shallow: options?.shallow ?? false,
-        });
-        const hash = resolved.includes("#") ? resolved.slice(resolved.indexOf("#")) : "";
-        window.history.replaceState({}, "", resolved.startsWith("#") ? resolved : full);
-        _lastPathnameAndSearch = window.location.pathname + window.location.search;
-        scrollToHash(hash);
-        setState(getPathnameAndQuery());
-        routerEvents.emit("hashChangeComplete", eventUrl, {
-          shallow: options?.shallow ?? false,
-        });
-        window.dispatchEvent(new CustomEvent("vinext:navigate"));
-        return true;
-      }
-
-      routerEvents.emit("routeChangeStart", resolved, { shallow: options?.shallow ?? false });
-      routerEvents.emit("beforeHistoryChange", resolved, { shallow: options?.shallow ?? false });
-      window.history.replaceState({}, "", full);
-      _lastPathnameAndSearch = window.location.pathname + window.location.search;
-      if (!options?.shallow) {
-        const result = await runNavigateClient(full, resolved);
-        if (result === "cancelled") return true;
-        if (result === "failed") return false;
-      }
-      setState(getPathnameAndQuery());
-      routerEvents.emit("routeChangeComplete", resolved, { shallow: options?.shallow ?? false });
-
-      // Scroll: handle hash target, else scroll to top unless scroll:false
-      const hash = resolved.includes("#") ? resolved.slice(resolved.indexOf("#")) : "";
-      if (hash) {
-        scrollToHash(hash);
-      } else if (options?.scroll !== false) {
-        window.scrollTo(0, 0);
-      }
-      window.dispatchEvent(new CustomEvent("vinext:navigate"));
-      return true;
-    },
-    [],
-  );
-
-  const back = useCallback(() => {
-    window.history.back();
-  }, []);
-
-  const reload = useCallback(() => {
-    window.location.reload();
-  }, []);
-
-  const prefetch = useCallback(async (url: string): Promise<void> => {
-    // Inject a <link rel="prefetch"> for the target page
-    if (typeof document !== "undefined") {
-      const link = document.createElement("link");
-      link.rel = "prefetch";
-      link.href = url;
-      link.as = "document";
-      document.head.appendChild(link);
-    }
-  }, []);
-
   const router = useMemo(
     (): NextRouter =>
       buildRouterValue(pathname, query, asPath, {
-        push,
-        replace,
-        back,
-        reload,
-        prefetch,
-        beforePopState: (cb: BeforePopStateCallback) => {
-          _beforePopStateCb = cb;
-        },
+        push: Router.push,
+        replace: Router.replace,
+        back: Router.back,
+        reload: Router.reload,
+        prefetch: Router.prefetch,
+        beforePopState: Router.beforePopState,
       }),
-    [pathname, query, asPath, push, replace, back, reload, prefetch],
+    [pathname, query, asPath],
   );
 
-  return router;
+  return createElement(RouterContext.Provider, { value: router }, children);
 }
 
 // beforePopState callback: called before handling browser back/forward.
@@ -817,209 +966,201 @@ let _beforePopStateCb: BeforePopStateCallback | undefined;
 let _lastPathnameAndSearch =
   typeof window !== "undefined" ? window.location.pathname + window.location.search : "";
 
-// Module-level popstate listener: handles browser back/forward by re-rendering
-// the React root with the page at the new URL. This runs regardless of whether
-// any component calls useRouter().
-if (typeof window !== "undefined") {
-  window.addEventListener("popstate", (e: PopStateEvent) => {
-    const browserUrl = window.location.pathname + window.location.search;
-    const appUrl = stripBasePath(window.location.pathname, __basePath) + window.location.search;
+function handlePagesRouterPopState(e: PopStateEvent): void {
+  const browserUrl = window.location.pathname + window.location.search;
+  const appUrl = stripBasePath(window.location.pathname, __basePath) + window.location.search;
 
-    // Detect hash-only back/forward: pathname+search unchanged, only hash differs.
-    const isHashOnly = browserUrl === _lastPathnameAndSearch;
+  // Detect hash-only back/forward: pathname+search unchanged, only hash differs.
+  const isHashOnly = browserUrl === _lastPathnameAndSearch;
 
-    // Check beforePopState callback
-    if (_beforePopStateCb !== undefined) {
-      const shouldContinue = (_beforePopStateCb as BeforePopStateCallback)({
-        url: appUrl,
-        as: appUrl,
-        options: { shallow: false },
-      });
-      if (!shouldContinue) return;
+  // Check beforePopState callback
+  if (_beforePopStateCb !== undefined) {
+    const shouldContinue = _beforePopStateCb({
+      url: appUrl,
+      as: appUrl,
+      options: { shallow: false },
+    });
+    if (!shouldContinue) return;
+  }
+
+  // Update tracker only after beforePopState confirms navigation proceeds.
+  // If beforePopState cancels, the tracker must retain the previous value
+  // so the next popstate compares against the correct baseline.
+  _lastPathnameAndSearch = browserUrl;
+
+  if (isHashOnly) {
+    // Hash-only back/forward — no page fetch needed
+    const hashUrl = appUrl + window.location.hash;
+    routerEvents.emit("hashChangeStart", hashUrl, { shallow: false });
+    scrollToHashTarget(window.location.hash);
+    routerEvents.emit("hashChangeComplete", hashUrl, { shallow: false });
+    dispatchNavigateEvent();
+    return;
+  }
+
+  const fullAppUrl = appUrl + window.location.hash;
+  routerEvents.emit("routeChangeStart", fullAppUrl, { shallow: false });
+  // Note: The browser has already updated window.location by the time popstate
+  // fires, so this is not truly "before" the URL change. In Next.js the popstate
+  // handler calls replaceState to store history metadata — beforeHistoryChange
+  // precedes that call, not the URL change itself. We emit it here for API
+  // compatibility.
+  routerEvents.emit("beforeHistoryChange", fullAppUrl, { shallow: false });
+  void (async () => {
+    const result = await runNavigateClient(
+      browserUrl,
+      fullAppUrl,
+      getPagesHtmlFetchUrl(browserUrl, window.__VINEXT_LOCALE__),
+    );
+    if (result === "completed") {
+      routerEvents.emit("routeChangeComplete", fullAppUrl, { shallow: false });
+      restoreScrollPosition(e.state);
+      dispatchNavigateEvent();
     }
-
-    // Update tracker only after beforePopState confirms navigation proceeds.
-    // If beforePopState cancels, the tracker must retain the previous value
-    // so the next popstate compares against the correct baseline.
-    _lastPathnameAndSearch = browserUrl;
-
-    if (isHashOnly) {
-      // Hash-only back/forward — no page fetch needed
-      const hashUrl = appUrl + window.location.hash;
-      routerEvents.emit("hashChangeStart", hashUrl, { shallow: false });
-      scrollToHash(window.location.hash);
-      routerEvents.emit("hashChangeComplete", hashUrl, { shallow: false });
-      window.dispatchEvent(new CustomEvent("vinext:navigate"));
-      return;
-    }
-
-    const fullAppUrl = appUrl + window.location.hash;
-    routerEvents.emit("routeChangeStart", fullAppUrl, { shallow: false });
-    // Note: The browser has already updated window.location by the time popstate
-    // fires, so this is not truly "before" the URL change. In Next.js the popstate
-    // handler calls replaceState to store history metadata — beforeHistoryChange
-    // precedes that call, not the URL change itself. We emit it here for API
-    // compatibility.
-    routerEvents.emit("beforeHistoryChange", fullAppUrl, { shallow: false });
-    void (async () => {
-      const result = await runNavigateClient(browserUrl, fullAppUrl);
-      if (result === "completed") {
-        routerEvents.emit("routeChangeComplete", fullAppUrl, { shallow: false });
-        restoreScrollPosition(e.state);
-        window.dispatchEvent(new CustomEvent("vinext:navigate"));
-      }
-      // "cancelled": superseded by a newer navigation, so this popstate no longer wins.
-      // "failed": runNavigateClient already scheduled the hard-navigation fallback.
-    })();
-  });
+    // "cancelled": superseded by a newer navigation, so this popstate no longer wins.
+    // "failed": runNavigateClient already scheduled the hard-navigation fallback.
+  })();
 }
+
+setPagesRouterPopStateHandler(handlePagesRouterPopState);
 
 /**
  * Wrap a React element in a RouterContext.Provider so that
  * next/compat/router's useRouter() returns the real Pages Router value.
  *
- * This is a plain function, NOT a React component — it builds the router
- * value object directly from the current SSR context (server) or
- * window.location + Router singleton (client), avoiding duplicate state
- * that a hook-based component would create.
+ * The provider owns the reactive Pages Router snapshot so next/router and
+ * next/compat/router consumers share one context value instead of each hook
+ * installing its own global URL-change listener.
  */
 export function wrapWithRouterContext(element: ReactElement): ReactElement {
-  const { pathname, query, asPath } = getPathnameAndQuery();
-
-  const routerValue = buildRouterValue(pathname, query, asPath, {
-    push: Router.push,
-    replace: Router.replace,
-    back: Router.back,
-    reload: Router.reload,
-    prefetch: Router.prefetch,
-    beforePopState: Router.beforePopState,
-  });
-
-  return createElement(RouterContext.Provider, { value: routerValue }, element) as ReactElement;
+  return createElement(PagesRouterProvider, null, element);
 }
+
+/**
+ * Props injected by `withRouter` into the wrapped component.
+ *
+ * Ported from Next.js: packages/next/src/client/with-router.tsx
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/client/with-router.tsx
+ */
+export type WithRouterProps = {
+  router: NextRouter;
+};
+
+/**
+ * Pick<P, Exclude<keyof P, keyof WithRouterProps>> — the props of the
+ * composed component minus the `router` prop that `withRouter` injects.
+ *
+ * Ported from Next.js: packages/next/src/client/with-router.tsx
+ */
+export type ExcludeRouterProps<P> = Pick<P, Exclude<keyof P, keyof WithRouterProps>>;
+
+/**
+ * Higher-order component that injects the Pages Router `router` instance as
+ * a `router` prop into a wrapped component. Primarily used by class
+ * components (which cannot call hooks) to access the router. The wrapped
+ * component receives the same props as the original, minus `router`, which
+ * is filled in by the HOC.
+ *
+ * Ported from Next.js: packages/next/src/client/with-router.tsx
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/client/with-router.tsx
+ *
+ * Differences from Next.js:
+ * - We type the composed component as `ComponentType<P>` instead of
+ *   `NextComponentType<C, any, P>` because vinext does not expose
+ *   `NextComponentType` from this shim. The runtime shape (and the props
+ *   the wrapper forwards) is identical.
+ * - We forward `getInitialProps` and `origGetInitialProps` from the
+ *   composed component so `_app` parity holds for class components that
+ *   define `getInitialProps`.
+ */
+export function withRouter<P extends WithRouterProps>(
+  ComposedComponent: ComponentType<P>,
+): ComponentType<ExcludeRouterProps<P>> {
+  function WithRouterWrapper(props: ExcludeRouterProps<P>): ReactElement {
+    const router = useRouter();
+    // Match Next.js spread order:
+    // `<ComposedComponent router={useRouter()} {...props} />`
+    // The injected `router` is placed first, and `{...props}` is spread
+    // after, so a user-passed `router` prop overrides the HOC-injected
+    // one (last-spread wins). Mirrors
+    // packages/next/src/client/with-router.tsx. At the type level
+    // `props: ExcludeRouterProps<P>` has no `router` key, but TS still
+    // sees `P` as `WithRouterProps`-extending when checking the literal,
+    // so we widen to a `Record` for the final prop bag.
+    const merged: Record<string, unknown> = { router, ...(props as Record<string, unknown>) };
+    return createElement(ComposedComponent, merged as unknown as P);
+  }
+
+  // Forward getInitialProps so class-component pages that define it keep
+  // working when wrapped. Mirrors Next.js's with-router.tsx.
+  const composed = ComposedComponent as ComponentType<P> & {
+    getInitialProps?: unknown;
+    origGetInitialProps?: unknown;
+  };
+  (WithRouterWrapper as unknown as { getInitialProps?: unknown }).getInitialProps =
+    composed.getInitialProps;
+  (WithRouterWrapper as unknown as { origGetInitialProps?: unknown }).origGetInitialProps =
+    composed.origGetInitialProps;
+
+  if (process.env.NODE_ENV !== "production") {
+    const name = composed.displayName || composed.name || "Unknown";
+    WithRouterWrapper.displayName = `withRouter(${name})`;
+  }
+
+  return WithRouterWrapper;
+}
+
+// Note: `withRouter` is exposed only as a named export from `next/router`.
+// The default export of that module is the Router singleton declared below.
 
 // Also export a default Router singleton for `import Router from 'next/router'`
 const Router = {
-  push: async (url: string | UrlObject, as?: string, options?: TransitionOptions) => {
-    let resolved = resolveNavigationTarget(url, as, options?.locale);
-
-    // External URLs (unless same-origin)
-    if (isExternalUrl(resolved)) {
-      const localPath = toSameOriginAppPath(resolved, __basePath);
-      if (localPath == null) {
-        window.location.assign(resolved);
-        return true;
-      }
-      resolved = localPath;
-    }
-
-    const full = toBrowserNavigationHref(resolved, window.location.href, __basePath);
-
-    // Hash-only change
-    if (isHashOnlyChange(resolved)) {
-      const eventUrl = resolveHashUrl(resolved);
-      routerEvents.emit("hashChangeStart", eventUrl, {
-        shallow: options?.shallow ?? false,
-      });
-      const hash = resolved.includes("#") ? resolved.slice(resolved.indexOf("#")) : "";
-      window.history.pushState({}, "", resolved.startsWith("#") ? resolved : full);
-      _lastPathnameAndSearch = window.location.pathname + window.location.search;
-      scrollToHash(hash);
-      routerEvents.emit("hashChangeComplete", eventUrl, {
-        shallow: options?.shallow ?? false,
-      });
-      window.dispatchEvent(new CustomEvent("vinext:navigate"));
-      return true;
-    }
-
-    saveScrollPosition();
-    routerEvents.emit("routeChangeStart", resolved, { shallow: options?.shallow ?? false });
-    routerEvents.emit("beforeHistoryChange", resolved, { shallow: options?.shallow ?? false });
-    window.history.pushState({}, "", full);
-    _lastPathnameAndSearch = window.location.pathname + window.location.search;
-    if (!options?.shallow) {
-      const result = await runNavigateClient(full, resolved);
-      if (result === "cancelled") return true;
-      if (result === "failed") return false;
-    }
-    routerEvents.emit("routeChangeComplete", resolved, { shallow: options?.shallow ?? false });
-
-    const hash = resolved.includes("#") ? resolved.slice(resolved.indexOf("#")) : "";
-    if (hash) {
-      scrollToHash(hash);
-    } else if (options?.scroll !== false) {
-      window.scrollTo(0, 0);
-    }
-    window.dispatchEvent(new CustomEvent("vinext:navigate"));
-    return true;
-  },
-  replace: async (url: string | UrlObject, as?: string, options?: TransitionOptions) => {
-    let resolved = resolveNavigationTarget(url, as, options?.locale);
-
-    // External URLs (unless same-origin)
-    if (isExternalUrl(resolved)) {
-      const localPath = toSameOriginAppPath(resolved, __basePath);
-      if (localPath == null) {
-        window.location.replace(resolved);
-        return true;
-      }
-      resolved = localPath;
-    }
-
-    const full = toBrowserNavigationHref(resolved, window.location.href, __basePath);
-
-    // Hash-only change
-    if (isHashOnlyChange(resolved)) {
-      const eventUrl = resolveHashUrl(resolved);
-      routerEvents.emit("hashChangeStart", eventUrl, {
-        shallow: options?.shallow ?? false,
-      });
-      const hash = resolved.includes("#") ? resolved.slice(resolved.indexOf("#")) : "";
-      window.history.replaceState({}, "", resolved.startsWith("#") ? resolved : full);
-      _lastPathnameAndSearch = window.location.pathname + window.location.search;
-      scrollToHash(hash);
-      routerEvents.emit("hashChangeComplete", eventUrl, {
-        shallow: options?.shallow ?? false,
-      });
-      window.dispatchEvent(new CustomEvent("vinext:navigate"));
-      return true;
-    }
-
-    routerEvents.emit("routeChangeStart", resolved, { shallow: options?.shallow ?? false });
-    routerEvents.emit("beforeHistoryChange", resolved, { shallow: options?.shallow ?? false });
-    window.history.replaceState({}, "", full);
-    _lastPathnameAndSearch = window.location.pathname + window.location.search;
-    if (!options?.shallow) {
-      const result = await runNavigateClient(full, resolved);
-      if (result === "cancelled") return true;
-      if (result === "failed") return false;
-    }
-    routerEvents.emit("routeChangeComplete", resolved, { shallow: options?.shallow ?? false });
-
-    const hash = resolved.includes("#") ? resolved.slice(resolved.indexOf("#")) : "";
-    if (hash) {
-      scrollToHash(hash);
-    } else if (options?.scroll !== false) {
-      window.scrollTo(0, 0);
-    }
-    window.dispatchEvent(new CustomEvent("vinext:navigate"));
-    return true;
-  },
+  push: (url: string | UrlObject, as?: string, options?: TransitionOptions) =>
+    performNavigation(url, as, options, "push"),
+  replace: (url: string | UrlObject, as?: string, options?: TransitionOptions) =>
+    performNavigation(url, as, options, "replace"),
   back: () => window.history.back(),
   reload: () => window.location.reload(),
-  prefetch: async (url: string) => {
-    if (typeof document !== "undefined") {
-      const link = document.createElement("link");
-      link.rel = "prefetch";
-      link.href = url;
-      link.as = "document";
-      document.head.appendChild(link);
-    }
-  },
+  prefetch: prefetchUrl,
   beforePopState: (cb: BeforePopStateCallback) => {
     _beforePopStateCb = cb;
   },
   events: routerEvents,
 };
+
+// Expose `window.next.router` for Next.js parity. Pages Router test suites,
+// userland scripts, and third-party libraries reach for this global directly
+// (e.g. `window.next.router.push(...)`, `window.next.router.events.on(...)`).
+// Without this assignment, those callers crash with
+// `TypeError: Cannot read properties of undefined (reading 'router')`.
+//
+// Ported from Next.js: `packages/next/src/client/next.ts` (line 13). We do
+// NOT use a live-binding getter like Next.js does because vinext's Router
+// singleton is constructed synchronously here, so by the time this module
+// finishes loading the value is final.
+if (typeof window !== "undefined") {
+  // Cast: `NextRouter.push`/`replace` are typed with narrow parameters
+  // (UrlObject | string) while `PagesRouterPublicInstance` accepts unknown
+  // args. The two are structurally compatible at runtime; TypeScript flags
+  // the narrowing of contravariant function params, which is benign here
+  // because callers reading off `window.next.router` are tests/userland
+  // and treat the surface as opaque.
+  installWindowNext({ router: Router as unknown as PagesRouterPublicInstance });
+}
+
+// Register the Pages Router compat shim source for `next/navigation` hooks
+// (useParams / useSearchParams / usePathname). The accessor is exposed
+// through a well-known Symbol.for so navigation.ts can read it without
+// importing this module — that avoids triggering navigation.ts's
+// `window.history.pushState` patch in tests that only need next/router.
+//
+// Mirrors Next.js's behavior where the pages-router server (render.tsx) and
+// client (client/index.tsx) wrap pages with SearchParamsContext /
+// PathParamsContext / PathnameContext providers populated from the router.
+const _PAGES_NAVIGATION_ACCESSOR_KEY = Symbol.for(
+  "vinext.navigation.pagesNavigationContextAccessor",
+);
+(globalThis as Record<PropertyKey, unknown>)[_PAGES_NAVIGATION_ACCESSOR_KEY] =
+  getPagesNavigationContext;
 
 export default Router;

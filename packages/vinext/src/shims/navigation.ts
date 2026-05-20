@@ -11,12 +11,28 @@
 // would throw at link time for missing bindings. With `import * as React`, the
 // bindings are just `undefined` on the namespace object and we can guard at runtime.
 import * as React from "react";
+import { getNavigationRuntime, hasAppNavigationRuntime } from "../client/navigation-runtime.js";
 import { notifyAppRouterTransitionStart } from "../client/instrumentation-client-state.js";
-import { createAppPayloadCacheKey } from "../server/app-elements.js";
-import { toBrowserNavigationHref, toSameOriginAppPath } from "./url-utils.js";
+import { AppElementsWire } from "../server/app-elements.js";
+import { createExternalHistoryStatePreservingMetadata } from "../server/app-history-state.js";
+import {
+  createRscRequestHeaders,
+  createRscRequestUrl,
+  VINEXT_RSC_COMPATIBILITY_ID_HEADER,
+  VINEXT_RSC_CONTENT_TYPE,
+} from "../server/app-rsc-cache-busting.js";
+import { VINEXT_MOUNTED_SLOTS_HEADER, VINEXT_PARAMS_HEADER } from "../server/headers.js";
+import {
+  isAbsoluteOrProtocolRelativeUrl,
+  isHashOnlyBrowserUrlChange,
+  toBrowserNavigationHref,
+  toSameOriginAppPath,
+} from "./url-utils.js";
 import { stripBasePath } from "../utils/base-path.js";
 import { ReadonlyURLSearchParams } from "./readonly-url-search-params.js";
 import { assertSafeNavigationUrl } from "./url-safety.js";
+import { AppRouterContext } from "./internal/app-router-context.js";
+import { scrollToHashTarget } from "./hash-scroll.js";
 
 // ─── Layout segment context ───────────────────────────────────────────────────
 // Stores the child segments below the current layout. Each layout wraps its
@@ -239,6 +255,49 @@ export function _registerStateAccessors(accessors: _StateAccessors): void {
   _clearInsertedHTMLCallbacks = accessors.clearInsertedHTMLCallbacks;
 }
 
+// ---------------------------------------------------------------------------
+// Pages Router compat source.
+//
+// `next/navigation` is the App Router API surface, but Next.js exposes the
+// same hook names to Pages Router pages as a compat shim. In Next.js this is
+// done by wrapping pages with SearchParamsContext / PathParamsContext /
+// PathnameContext providers populated from the Pages Router's state — see:
+// .nextjs-ref/packages/next/src/server/render.tsx
+// .nextjs-ref/packages/next/src/client/index.tsx
+// .nextjs-ref/packages/next/src/shared/lib/router/adapters.tsx
+//
+// vinext drives these hooks from a module-level navigation context instead of
+// React Context, so we fall back to a Pages Router accessor when no App
+// Router context is set. The accessor is published by next/router via a
+// global Symbol.for handle (see packages/vinext/src/shims/router.ts); we do
+// NOT import router.ts here because doing so would force navigation.ts to be
+// loaded for every consumer of next/router, triggering window.history
+// patches in unit tests that only want the router shim.
+// ---------------------------------------------------------------------------
+
+type PagesNavigationContext = {
+  pathname: string;
+  searchParams: URLSearchParams;
+  params: Record<string, string | string[]>;
+};
+
+const PAGES_NAVIGATION_ACCESSOR_KEY = Symbol.for(
+  "vinext.navigation.pagesNavigationContextAccessor",
+);
+type _GlobalWithPagesAccessor = typeof globalThis & {
+  [PAGES_NAVIGATION_ACCESSOR_KEY]?: () => PagesNavigationContext | null;
+};
+
+function _getPagesNavigationContext(): PagesNavigationContext | null {
+  const accessor = (globalThis as _GlobalWithPagesAccessor)[PAGES_NAVIGATION_ACCESSOR_KEY];
+  if (!accessor) return null;
+  try {
+    return accessor();
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Get the navigation context for the current SSR/RSC render.
  * Reads from AsyncLocalStorage when available (concurrent-safe),
@@ -277,6 +336,7 @@ export const PREFETCH_CACHE_TTL = 30_000;
 
 /** A buffered RSC response stored as an ArrayBuffer for replay. */
 export type CachedRscResponse = {
+  compatibilityIdHeader?: string | null;
   buffer: ArrayBuffer;
   contentType: string;
   mountedSlotsHeader?: string | null;
@@ -284,27 +344,19 @@ export type CachedRscResponse = {
   url: string;
 };
 
+export type PrefetchOptions = {
+  kind?: unknown;
+  onInvalidate?: () => void;
+};
+
 export type PrefetchCacheEntry = {
+  invalidationTimer?: ReturnType<typeof setTimeout>;
+  onInvalidateCallbacks?: Set<() => void>;
+  outcome: "pending" | "cache-seeded";
   snapshot?: CachedRscResponse;
   pending?: Promise<void>;
   timestamp: number;
 };
-
-/**
- * Convert a pathname (with optional query/hash) to its .rsc URL.
- * Strips trailing slashes before appending `.rsc` so that cache keys
- * are consistent regardless of the `trailingSlash` config setting.
- */
-export function toRscUrl(href: string): string {
-  const [beforeHash] = href.split("#");
-  const qIdx = beforeHash.indexOf("?");
-  const pathname = qIdx === -1 ? beforeHash : beforeHash.slice(0, qIdx);
-  const query = qIdx === -1 ? "" : beforeHash.slice(qIdx);
-  // Strip trailing slash (but preserve "/" root) for consistent cache keys
-  const normalizedPath =
-    pathname.length > 1 && pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
-  return normalizedPath + ".rsc" + query;
-}
 
 export function getCurrentInterceptionContext(): string | null {
   if (isServer) {
@@ -356,19 +408,120 @@ function evictPrefetchCacheIfNeeded(): void {
 
   for (const [key, entry] of cache) {
     if (now - entry.timestamp >= PREFETCH_CACHE_TTL) {
-      cache.delete(key);
-      prefetched.delete(key);
+      deletePrefetchCacheEntry(cache, prefetched, key, entry, true);
     }
   }
 
   while (cache.size >= MAX_PREFETCH_CACHE_SIZE) {
     const oldest = cache.keys().next().value;
     if (oldest !== undefined) {
-      cache.delete(oldest);
-      prefetched.delete(oldest);
+      const entry = cache.get(oldest);
+      if (entry) {
+        deletePrefetchCacheEntry(cache, prefetched, oldest, entry, true);
+      } else {
+        cache.delete(oldest);
+        prefetched.delete(oldest);
+      }
     } else {
       break;
     }
+  }
+}
+
+function clearPrefetchInvalidation(entry: PrefetchCacheEntry): void {
+  if (entry.invalidationTimer !== undefined) {
+    clearTimeout(entry.invalidationTimer);
+    entry.invalidationTimer = undefined;
+  }
+}
+
+function notifyPrefetchInvalidated(entry: PrefetchCacheEntry): void {
+  clearPrefetchInvalidation(entry);
+  const callbacks = entry.onInvalidateCallbacks;
+  entry.onInvalidateCallbacks = undefined;
+  if (callbacks === undefined) return;
+
+  for (const onInvalidate of callbacks) {
+    try {
+      onInvalidate();
+    } catch (error) {
+      if (typeof reportError === "function") {
+        reportError(error);
+      } else {
+        console.error(error);
+      }
+    }
+  }
+}
+
+function deletePrefetchCacheEntry(
+  cache: Map<string, PrefetchCacheEntry>,
+  prefetched: Set<string>,
+  cacheKey: string,
+  entry: PrefetchCacheEntry,
+  notify: boolean,
+): void {
+  cache.delete(cacheKey);
+  prefetched.delete(cacheKey);
+  if (notify) {
+    notifyPrefetchInvalidated(entry);
+  } else {
+    clearPrefetchInvalidation(entry);
+    entry.onInvalidateCallbacks = undefined;
+  }
+}
+
+function invalidatePrefetchCacheEntry(cacheKey: string): void {
+  const cache = getPrefetchCache();
+  const entry = cache.get(cacheKey);
+  if (!entry) return;
+  deletePrefetchCacheEntry(cache, getPrefetchedUrls(), cacheKey, entry, true);
+}
+
+function schedulePrefetchInvalidation(cacheKey: string, entry: PrefetchCacheEntry): void {
+  if (entry.onInvalidateCallbacks === undefined || entry.onInvalidateCallbacks.size === 0) return;
+
+  clearPrefetchInvalidation(entry);
+  const elapsed = Date.now() - entry.timestamp;
+  const delay = Math.max(0, PREFETCH_CACHE_TTL - elapsed);
+  entry.invalidationTimer = setTimeout(() => {
+    invalidatePrefetchCacheEntry(cacheKey);
+  }, delay);
+}
+
+function addPrefetchInvalidationCallback(
+  entry: PrefetchCacheEntry,
+  onInvalidate: (() => void) | undefined,
+): void {
+  if (onInvalidate === undefined) return;
+  if (entry.onInvalidateCallbacks === undefined) {
+    entry.onInvalidateCallbacks = new Set();
+  }
+  entry.onInvalidateCallbacks.add(onInvalidate);
+}
+
+function attachPrefetchInvalidationCallback(
+  cacheKey: string,
+  onInvalidate: (() => void) | undefined,
+): void {
+  if (onInvalidate === undefined) return;
+  const entry = getPrefetchCache().get(cacheKey);
+  if (!entry) return;
+  addPrefetchInvalidationCallback(entry, onInvalidate);
+  if (entry.outcome === "cache-seeded") {
+    schedulePrefetchInvalidation(cacheKey, entry);
+  }
+}
+
+export function invalidatePrefetchCache(): void {
+  const cache = getPrefetchCache();
+  const prefetched = getPrefetchedUrls();
+  for (const [cacheKey, entry] of cache) {
+    deletePrefetchCacheEntry(cache, prefetched, cacheKey, entry, true);
+  }
+  prefetched.clear();
+  if (!isServer) {
+    getNavigationRuntime()?.functions.pingVisibleLinks?.();
   }
 }
 
@@ -392,21 +545,45 @@ export function storePrefetchResponse(
   rscUrl: string,
   response: Response,
   interceptionContext: string | null = null,
+  options?: PrefetchOptions,
 ): void {
-  const cacheKey = createAppPayloadCacheKey(rscUrl, interceptionContext);
+  const cacheKey = AppElementsWire.encodeCacheKey(rscUrl, interceptionContext);
   evictPrefetchCacheIfNeeded();
-  const entry: PrefetchCacheEntry = { timestamp: Date.now() };
+  const entry: PrefetchCacheEntry = {
+    outcome: "pending",
+    timestamp: Date.now(),
+  };
+  addPrefetchInvalidationCallback(entry, options?.onInvalidate);
   entry.pending = snapshotRscResponse(response)
     .then((snapshot) => {
       entry.snapshot = snapshot;
     })
     .catch(() => {
-      getPrefetchCache().delete(cacheKey);
+      deletePrefetchCacheEntry(getPrefetchCache(), getPrefetchedUrls(), cacheKey, entry, false);
     })
     .finally(() => {
       entry.pending = undefined;
+      if (entry.snapshot) {
+        entry.outcome = "cache-seeded";
+        schedulePrefetchInvalidation(cacheKey, entry);
+      }
     });
   getPrefetchCache().set(cacheKey, entry);
+}
+
+export function createCachedRscResponseSnapshot(
+  response: Response,
+  buffer: ArrayBuffer,
+  responseUrl: string | null = null,
+): CachedRscResponse {
+  return {
+    compatibilityIdHeader: response.headers.get(VINEXT_RSC_COMPATIBILITY_ID_HEADER),
+    buffer,
+    contentType: response.headers.get("content-type") ?? VINEXT_RSC_CONTENT_TYPE,
+    mountedSlotsHeader: response.headers.get(VINEXT_MOUNTED_SLOTS_HEADER),
+    paramsHeader: response.headers.get(VINEXT_PARAMS_HEADER),
+    url: responseUrl ?? response.url,
+  };
 }
 
 /**
@@ -414,14 +591,7 @@ export function storePrefetchResponse(
  * Consumes the response body and stores it with content-type and URL metadata.
  */
 export async function snapshotRscResponse(response: Response): Promise<CachedRscResponse> {
-  const buffer = await response.arrayBuffer();
-  return {
-    buffer,
-    contentType: response.headers.get("content-type") ?? "text/x-component",
-    mountedSlotsHeader: response.headers.get("X-Vinext-Mounted-Slots"),
-    paramsHeader: response.headers.get("X-Vinext-Params"),
-    url: response.url,
-  };
+  return createCachedRscResponseSnapshot(response, await response.arrayBuffer());
 }
 
 /**
@@ -442,10 +612,13 @@ export async function snapshotRscResponse(response: Response): Promise<CachedRsc
 export function restoreRscResponse(cached: CachedRscResponse, copy = true): Response {
   const headers = new Headers({ "content-type": cached.contentType });
   if (cached.mountedSlotsHeader != null) {
-    headers.set("X-Vinext-Mounted-Slots", cached.mountedSlotsHeader);
+    headers.set(VINEXT_MOUNTED_SLOTS_HEADER, cached.mountedSlotsHeader);
+  }
+  if (cached.compatibilityIdHeader != null) {
+    headers.set(VINEXT_RSC_COMPATIBILITY_ID_HEADER, cached.compatibilityIdHeader);
   }
   if (cached.paramsHeader != null) {
-    headers.set("X-Vinext-Params", cached.paramsHeader);
+    headers.set(VINEXT_PARAMS_HEADER, cached.paramsHeader);
   }
 
   return new Response(copy ? cached.buffer.slice(0) : cached.buffer, {
@@ -466,13 +639,18 @@ export function prefetchRscResponse(
   fetchPromise: Promise<Response>,
   interceptionContext: string | null = null,
   mountedSlotsHeader: string | null = null,
+  options?: PrefetchOptions,
 ): void {
-  const cacheKey = createAppPayloadCacheKey(rscUrl, interceptionContext);
+  const cacheKey = AppElementsWire.encodeCacheKey(rscUrl, interceptionContext);
   const cache = getPrefetchCache();
   const prefetched = getPrefetchedUrls();
   const now = Date.now();
 
-  const entry: PrefetchCacheEntry = { timestamp: now };
+  const entry: PrefetchCacheEntry = {
+    outcome: "pending",
+    timestamp: now,
+  };
+  addPrefetchInvalidationCallback(entry, options?.onInvalidate);
 
   entry.pending = fetchPromise
     .then(async (response) => {
@@ -484,16 +662,18 @@ export function prefetchRscResponse(
           mountedSlotsHeader,
         };
       } else {
-        prefetched.delete(cacheKey);
-        cache.delete(cacheKey);
+        deletePrefetchCacheEntry(cache, prefetched, cacheKey, entry, false);
       }
     })
     .catch(() => {
-      prefetched.delete(cacheKey);
-      cache.delete(cacheKey);
+      deletePrefetchCacheEntry(cache, prefetched, cacheKey, entry, false);
     })
     .finally(() => {
       entry.pending = undefined;
+      if (entry.snapshot) {
+        entry.outcome = "cache-seeded";
+        schedulePrefetchInvalidation(cacheKey, entry);
+      }
     });
 
   // Insert the new entry before evicting. FIFO evicts from the front of the
@@ -513,16 +693,16 @@ export function consumePrefetchResponse(
   interceptionContext: string | null = null,
   mountedSlotsHeader: string | null = null,
 ): CachedRscResponse | null {
-  const cacheKey = createAppPayloadCacheKey(rscUrl, interceptionContext);
+  const cacheKey = AppElementsWire.encodeCacheKey(rscUrl, interceptionContext);
   const cache = getPrefetchCache();
   const entry = cache.get(cacheKey);
   if (!entry) return null;
 
-  // Don't consume pending entries — let the navigation fetch independently.
-  if (entry.pending) return null;
+  // Skip in-flight snapshots and error-path residue where pending cleared
+  // without a successful transition to a cache-seeded entry.
+  if (entry.pending || entry.outcome !== "cache-seeded") return null;
 
-  cache.delete(cacheKey);
-  getPrefetchedUrls().delete(cacheKey);
+  deletePrefetchCacheEntry(cache, getPrefetchedUrls(), cacheKey, entry, false);
 
   if (entry.snapshot) {
     if ((entry.snapshot.mountedSlotsHeader ?? null) !== mountedSlotsHeader) {
@@ -686,7 +866,13 @@ function getServerSearchParamsSnapshot(): ReadonlyURLSearchParams {
   const ctx = _getServerContext() as NavigationContextWithReadonlyCache | null;
 
   if (!ctx) {
-    // No server context available - return cached empty instance
+    // No App Router server context - try Pages Router compat shim.
+    // See `adaptForSearchParams` in Next.js's adapters:
+    // .nextjs-ref/packages/next/src/shared/lib/router/adapters.tsx
+    const pagesCtx = _getPagesNavigationContext();
+    if (pagesCtx) {
+      return new ReadonlyURLSearchParams(pagesCtx.searchParams);
+    }
     if (_cachedEmptyServerSearchParams === null) {
       _cachedEmptyServerSearchParams = new ReadonlyURLSearchParams();
     }
@@ -862,7 +1048,25 @@ export function clearPendingPathname(navId: number): void {
 }
 
 function getClientParamsSnapshot(): Record<string, string | string[]> {
-  return getClientNavigationState()?.clientParams ?? _EMPTY_PARAMS;
+  const state = getClientNavigationState();
+  if (state && Object.keys(state.clientParams).length > 0) {
+    return state.clientParams;
+  }
+  // Fall back to the Pages Router compat shim if nothing has populated the
+  // App Router client params (Pages Router pages never call setClientParams).
+  const pagesCtx = _getPagesNavigationContext();
+  if (pagesCtx) return pagesCtx.params;
+  return state?.clientParams ?? _EMPTY_PARAMS;
+}
+
+function getServerParamsSnapshot(): Record<string, string | string[]> {
+  const ctx = _getServerContext();
+  if (ctx) return ctx.params;
+  // No App Router navigation context — fall back to Pages Router state.
+  // See `adaptForPathParams` in Next.js's pages-router adapter:
+  // .nextjs-ref/packages/next/src/shared/lib/router/adapters.tsx
+  const pagesCtx = _getPagesNavigationContext();
+  return pagesCtx?.params ?? _EMPTY_PARAMS;
 }
 
 function subscribeToNavigation(cb: () => void): () => void {
@@ -884,7 +1088,10 @@ export function usePathname(): string {
   if (isServer) {
     // During SSR of "use client" components, the navigation context may not be set.
     // Return a safe fallback — the client will hydrate with the real value.
-    return _getServerContext()?.pathname ?? "/";
+    const ctx = _getServerContext();
+    if (ctx) return ctx.pathname;
+    // Pages Router compat shim: derive pathname from the Pages Router state.
+    return _getPagesNavigationContext()?.pathname ?? "/";
   }
   const renderSnapshot = useClientNavigationRenderSnapshot();
   // Client-side: use the hook system for reactivity
@@ -893,7 +1100,7 @@ export function usePathname(): string {
   const pathname = React.useSyncExternalStore(
     subscribeToNavigation,
     getPathnameSnapshot,
-    getPathnameSnapshot,
+    () => _getServerContext()?.pathname ?? _getPagesNavigationContext()?.pathname ?? "/",
   );
   // Prefer the render snapshot during an active navigation transition so
   // hooks return the pending URL, not the stale committed one. After commit,
@@ -913,7 +1120,7 @@ export function usePathname(): string {
 export function useSearchParams(): ReadonlyURLSearchParams {
   if (isServer) {
     // During SSR for "use client" components, the navigation context may not be set.
-    // Return a safe fallback — the client will hydrate with the real value.
+    // getServerSearchParamsSnapshot also covers the Pages Router compat shim.
     return getServerSearchParamsSnapshot();
   }
   const renderSnapshot = useClientNavigationRenderSnapshot();
@@ -938,7 +1145,8 @@ export function useParams<
 >(): T {
   if (isServer) {
     // During SSR for "use client" components, the navigation context may not be set.
-    return (_getServerContext()?.params ?? _EMPTY_PARAMS) as T;
+    // getServerParamsSnapshot covers both App Router and Pages Router compat.
+    return getServerParamsSnapshot() as T;
   }
   const renderSnapshot = useClientNavigationRenderSnapshot();
   const params = React.useSyncExternalStore(
@@ -957,7 +1165,7 @@ export function useParams<
  * Check if a href is an external URL (any URL scheme per RFC 3986, or protocol-relative).
  */
 function isExternalUrl(href: string): boolean {
-  return /^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith("//");
+  return isAbsoluteOrProtocolRelativeUrl(href);
 }
 
 /**
@@ -966,34 +1174,7 @@ function isExternalUrl(href: string): boolean {
 function isHashOnlyChange(href: string): boolean {
   if (typeof window === "undefined") return false;
   if (href.startsWith("#")) return true;
-  try {
-    const current = new URL(window.location.href);
-    const next = new URL(href, window.location.href);
-    // Strip basePath from both pathnames for consistent comparison
-    // (matches how isSameRoute handles basePath in app-browser-entry.ts)
-    const strippedCurrentPath = stripBasePath(current.pathname, __basePath);
-    const strippedNextPath = stripBasePath(next.pathname, __basePath);
-    return (
-      strippedCurrentPath === strippedNextPath && current.search === next.search && next.hash !== ""
-    );
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Scroll to a hash target element, or to the top if no hash.
- */
-function scrollToHash(hash: string): void {
-  if (!hash || hash === "#") {
-    window.scrollTo(0, 0);
-    return;
-  }
-  const id = hash.slice(1);
-  const element = document.getElementById(id);
-  if (element) {
-    element.scrollIntoView({ behavior: "auto" });
-  }
+  return isHashOnlyBrowserUrlChange(href, window.location.href, __basePath);
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,6 +1243,7 @@ export function commitClientNavigationState(
 
   if (shouldNotify) {
     notifyNavigationListeners();
+    getNavigationRuntime()?.functions.pingVisibleLinks?.();
   }
 }
 
@@ -1102,12 +1284,26 @@ function saveScrollPosition(): void {
   );
 }
 
+function commitHashOnlyHistoryState(href: string, mode: "push" | "replace", scroll: boolean): void {
+  const commitAppRouterHashNavigation = getNavigationRuntime()?.functions.commitHashNavigation;
+  if (commitAppRouterHashNavigation) {
+    commitAppRouterHashNavigation(href, mode, scroll);
+    return;
+  }
+
+  if (mode === "replace") {
+    replaceHistoryStateWithoutNotify(null, "", href);
+  } else {
+    pushHistoryStateWithoutNotify(null, "", href);
+  }
+}
+
 /**
  * Restore scroll position from a history state object (used on popstate).
  *
  * When an RSC navigation is in flight (back/forward triggers both this
- * handler and the browser entry's popstate handler which calls
- * __VINEXT_RSC_NAVIGATE__), we must wait for the new content to render
+ * handler and the browser entry's popstate handler which calls the registered
+ * navigation runtime), we must wait for the new content to render
  * before scrolling. Otherwise the user sees old content flash at the
  * restored scroll position.
  *
@@ -1185,14 +1381,10 @@ export async function navigateClientSide(
   // Hash-only change: update URL and scroll to target, skip RSC fetch
   if (isHashOnlyChange(fullHref)) {
     const hash = fullHref.includes("#") ? fullHref.slice(fullHref.indexOf("#")) : "";
-    if (mode === "replace") {
-      replaceHistoryStateWithoutNotify(null, "", fullHref);
-    } else {
-      pushHistoryStateWithoutNotify(null, "", fullHref);
-    }
+    commitHashOnlyHistoryState(fullHref, mode, scroll);
     commitClientNavigationState();
     if (scroll) {
-      scrollToHash(hash);
+      scrollToHashTarget(hash);
     }
     return;
   }
@@ -1208,16 +1400,10 @@ export async function navigateClientSide(
   // History is NOT pushed here for RSC navigations — the commit effect inside
   // navigateRsc owns the push/replace exclusively. This avoids a fragile
   // double-push and ensures window.location still reflects the *current* URL
-  // when navigateRsc computes isSameRoute (cross-route vs same-route).
-  if (typeof window.__VINEXT_RSC_NAVIGATE__ === "function") {
-    await window.__VINEXT_RSC_NAVIGATE__(
-      fullHref,
-      0,
-      "navigate",
-      mode,
-      undefined,
-      programmaticTransition,
-    );
+  // when navigateRsc publishes the committed URL.
+  const appNavigate = getNavigationRuntime()?.functions.navigate;
+  if (appNavigate) {
+    await appNavigate(fullHref, 0, "navigate", mode, undefined, programmaticTransition);
   } else {
     if (mode === "replace") {
       replaceHistoryStateWithoutNotify(null, "", fullHref);
@@ -1229,7 +1415,7 @@ export async function navigateClientSide(
 
   if (scroll) {
     if (hash) {
-      scrollToHash(hash);
+      scrollToHashTarget(hash);
     } else {
       window.scrollTo(0, 0);
     }
@@ -1246,7 +1432,17 @@ export async function navigateClientSide(
 // useEffect dependency arrays, React.memo bailouts).
 // ---------------------------------------------------------------------------
 
+/**
+ * App Router public router instance. Mirrors Next.js's
+ * `publicAppRouterInstance` from
+ * `packages/next/src/client/components/app-router-instance.ts`.
+ *
+ * Exported so the App Router browser entry can install it on
+ * `window.next.router` for Next.js parity (see `client/window-next.ts`).
+ * Internal callers in this file continue to use `_appRouter` for brevity.
+ */
 const _appRouter = {
+  bfcacheId: "0",
   push(href: string, options?: { scroll?: boolean }): void {
     assertSafeNavigationUrl(href);
     if (isServer) return;
@@ -1271,48 +1467,79 @@ const _appRouter = {
   },
   refresh(): void {
     if (isServer) return;
+    // Drop cached RSC payloads for every previously-visited / prefetched route
+    // before re-fetching. Next.js's refresh-reducer invalidates the entire
+    // segment cache (refresh-reducer.ts → invalidateSegmentCacheEntries), so
+    // without this, a stale cached payload for a sibling route (e.g. a page
+    // gated by a session that has since been cleared) would still satisfy a
+    // subsequent client navigation and bypass the server's redirect logic.
+    getNavigationRuntime()?.functions.clearNavigationCaches?.();
     // Re-fetch the current page's RSC stream
-    const rscNavigate = window.__VINEXT_RSC_NAVIGATE__;
-    if (typeof rscNavigate === "function") {
+    const rscNavigate = getNavigationRuntime()?.functions.navigate;
+    if (rscNavigate) {
       const navigate = () => {
         void rscNavigate(window.location.href, 0, "refresh", undefined, undefined, true);
       };
       React.startTransition(navigate);
     }
   },
-  prefetch(href: string): void {
+  prefetch(href: string, options?: PrefetchOptions): void {
     assertSafeNavigationUrl(href);
     if (isServer) return;
-    // Prefetch the RSC payload for the target route and store in cache.
-    // We must add to prefetchedUrls manually for deduplication.
-    // prefetchRscResponse only manages the cache Map, not the URL set.
-    const fullHref = toBrowserNavigationHref(href, window.location.href, __basePath);
-    const rscUrl = toRscUrl(fullHref);
-    const interceptionContext = getCurrentInterceptionContext();
-    const cacheKey = createAppPayloadCacheKey(rscUrl, interceptionContext);
-    const prefetched = getPrefetchedUrls();
-    if (prefetched.has(cacheKey)) return;
-    prefetched.add(cacheKey);
-    const mountedSlotsHeader = getMountedSlotsHeader();
-    const headers = new Headers({ Accept: "text/x-component" });
-    if (mountedSlotsHeader) {
-      headers.set("X-Vinext-Mounted-Slots", mountedSlotsHeader);
-    }
-    if (interceptionContext !== null) {
-      headers.set("X-Vinext-Interception-Context", interceptionContext);
-    }
-    prefetchRscResponse(
-      rscUrl,
-      fetch(rscUrl, {
-        headers,
-        credentials: "include",
-        priority: "low" as RequestInit["priority"],
-      }),
-      interceptionContext,
-      mountedSlotsHeader,
-    );
+    void (async () => {
+      // Normalize same-origin absolute URLs to local paths; no-op for external
+      // origins so we don't pollute the prefetch cache with a same-path .rsc on
+      // the current origin. Mirrors Link's prefetchUrl and navigateClientSide.
+      let prefetchHref = href;
+      if (isAbsoluteOrProtocolRelativeUrl(href)) {
+        const localPath = toSameOriginAppPath(href, __basePath);
+        if (localPath == null) return;
+        prefetchHref = localPath;
+      }
+
+      // Prefetch the RSC payload for the target route and store in cache.
+      // We must add to prefetchedUrls manually for deduplication.
+      // prefetchRscResponse only manages the cache Map, not the URL set.
+      const fullHref = toBrowserNavigationHref(prefetchHref, window.location.href, __basePath);
+      const interceptionContext = getCurrentInterceptionContext();
+      const mountedSlotsHeader = getMountedSlotsHeader();
+      const headers = createRscRequestHeaders({ interceptionContext });
+      if (mountedSlotsHeader) {
+        headers.set(VINEXT_MOUNTED_SLOTS_HEADER, mountedSlotsHeader);
+      }
+      const rscUrl = await createRscRequestUrl(fullHref, headers);
+      const cacheKey = AppElementsWire.encodeCacheKey(rscUrl, interceptionContext);
+      const prefetched = getPrefetchedUrls();
+      if (prefetched.has(cacheKey)) {
+        attachPrefetchInvalidationCallback(cacheKey, options?.onInvalidate);
+        return;
+      }
+      prefetched.add(cacheKey);
+      prefetchRscResponse(
+        rscUrl,
+        fetch(rscUrl, {
+          headers,
+          credentials: "include",
+          priority: "low" as RequestInit["priority"],
+        }),
+        interceptionContext,
+        mountedSlotsHeader,
+        options,
+      );
+    })().catch((error) => {
+      console.error("[vinext] RSC prefetch setup error:", error);
+    });
   },
 };
+
+/**
+ * Public App Router instance, exposed for the browser entry so it can wire
+ * `window.next.router` to the same singleton returned from `useRouter()`.
+ *
+ * Mirrors `publicAppRouterInstance` from Next.js's
+ * `packages/next/src/client/components/app-router-instance.ts` (line 392).
+ */
+export const appRouterInstance = _appRouter;
 
 /**
  * App Router's useRouter — returns push/replace/back/forward/refresh.
@@ -1323,7 +1550,14 @@ const _appRouter = {
  * (e.g. useMemo / useEffect deps, React.memo) don't re-render unnecessarily.
  */
 export function useRouter() {
-  return _appRouter;
+  if (!AppRouterContext || typeof React.useContext !== "function") {
+    throw new Error("invariant expected app router to be mounted");
+  }
+  const router = React.useContext(AppRouterContext);
+  if (router === null) {
+    throw new Error("invariant expected app router to be mounted");
+  }
+  return router;
 }
 
 /**
@@ -1560,6 +1794,269 @@ export function unauthorized(): never {
 }
 
 // ---------------------------------------------------------------------------
+// Internal-error predicates and rethrow
+//
+// `unstable_rethrow` is part of Next.js's public API. User code in try/catch
+// wrappers calls it to let Next.js's control-flow signals (redirect, notFound,
+// forbidden, unauthorized, dynamic-server-usage, bailout-to-CSR, …)
+// propagate up to the framework instead of being swallowed. The canonical
+// use case is a `fetch()` retry helper that needs to bail out the moment
+// fetch throws a framework signal — see Next.js's
+// test/e2e/app-dir/app-static/lib/fetch-retry.js.
+//
+// Ported from Next.js:
+//   - packages/next/src/client/components/unstable-rethrow.ts (dispatcher)
+//   - packages/next/src/client/components/unstable-rethrow.browser.ts
+//   - packages/next/src/client/components/unstable-rethrow.server.ts
+//   - packages/next/src/client/components/is-next-router-error.ts
+//   - packages/next/src/client/components/redirect-error.ts
+//   - packages/next/src/shared/lib/lazy-dynamic/bailout-to-csr.ts
+//   - packages/next/src/client/components/hooks-server-context.ts
+//
+// Coverage of Next.js's 7 server-side categories (server build):
+//   ✓ isNextRouterError (#1) — redirect + HTTP access fallback
+//   ✓ isBailoutToCSRError (#2) — digest === "BAILOUT_TO_CLIENT_SIDE_RENDERING"
+//   ✓ isDynamicServerError (#3) — digest === "DYNAMIC_SERVER_USAGE"
+//   ✗ isDynamicPostpone (#4) — PPR-internal message check; vinext has no PPR
+//   ✗ isPostpone (#5) — React.unstable_postpone signal; vinext has no PPR
+//   ✗ isHangingPromiseRejectionError (#6) — prerender abort signal
+//   ✗ isPrerenderInterruptedError (#7) — prerender controller interrupt
+//
+// The four uncovered categories are server-only Next.js internals tied to
+// prerender-machinery vinext does not implement; user code cannot construct
+// them in normal use. They will be added if/when vinext grows PPR support.
+// ---------------------------------------------------------------------------
+
+type _RedirectErrorShape = Error & { digest: string };
+
+/**
+ * Check whether an error was produced by `redirect()` or `permanentRedirect()`.
+ *
+ * **Note on vinext public surface:** Next.js does NOT expose `isRedirectError`
+ * from `next/navigation` — it's an internal predicate. vinext exposes it for
+ * symmetry with the already-public `isHTTPAccessFallbackError` and because
+ * `unstable_rethrow` consumers benefit from being able to narrow types.
+ * Treat it as a vinext-only extension.
+ *
+ * **Divergence from Next.js:** Next.js's internal `isRedirectError` performs
+ * full 4-segment validation — it splits the digest on `;`, checks `type` ∈
+ * {push, replace}, requires a non-empty destination, and validates the
+ * status code (303, 307, 308). See:
+ *   https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/redirect-error.ts
+ *
+ * vinext instead uses a simple prefix check (`startsWith("NEXT_REDIRECT;")`).
+ * Reasons:
+ *   1. vinext emits two digest shapes — 3-part for `redirect()`
+ *      (`NEXT_REDIRECT;{type};{encoded-url}`) and 4-part for
+ *      `permanentRedirect()` (`NEXT_REDIRECT;{type};{encoded-url};308`).
+ *      Strict validation would have to special-case both, and Next.js's
+ *      validator (tuned to its 5-part canary digests) rejects them.
+ *   2. The `type` field is sometimes empty in vinext's redirect digests
+ *      (context-dependent resolution; see `redirect()` above), which the
+ *      strict check disallows.
+ *
+ * **Consequence:** A malformed digest such as `"NEXT_REDIRECT;garbage"`
+ * returns `true` here, whereas Next.js would return `false`. In practice,
+ * the only callers of this predicate are vinext-internal code paths
+ * (`unstable_rethrow`, `unstable_catchError`, the redirect error boundary)
+ * that see digests vinext itself emits — so the divergence does not surface
+ * in normal use. Maintainers extending the prefix logic should keep this
+ * predicate in lockstep with the corresponding `decode*` helpers in
+ * `shims/error-boundary.tsx`.
+ */
+export function isRedirectError(error: unknown): error is _RedirectErrorShape {
+  if (
+    !error ||
+    typeof error !== "object" ||
+    !("digest" in error) ||
+    typeof (error as { digest: unknown }).digest !== "string"
+  ) {
+    return false;
+  }
+  return (error as { digest: string }).digest.startsWith("NEXT_REDIRECT;");
+}
+
+/**
+ * Returns true if the error is a Next.js navigation signal — either a redirect
+ * or an HTTP access fallback (notFound / forbidden / unauthorized).
+ *
+ * **Note on vinext public surface:** Like `isRedirectError`, Next.js does NOT
+ * expose this from `next/navigation`. vinext exposes it for symmetry — treat
+ * it as a vinext-only extension.
+ *
+ * Ported from Next.js:
+ *   https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/is-next-router-error.ts
+ */
+export function isNextRouterError(error: unknown): boolean {
+  return isRedirectError(error) || isHTTPAccessFallbackError(error);
+}
+
+// ---------------------------------------------------------------------------
+// BailoutToCSRError — `next/dynamic` with `ssr: false` throws this during
+// server render to signal that the dynamic component must be rendered on
+// the client. Lives in shared (non-server) code so it can flow through both
+// the SSR pipeline and userland; third-party libraries that emulate
+// `next/dynamic` also construct it.
+//
+// Ported from Next.js:
+//   https://github.com/vercel/next.js/blob/canary/packages/next/src/shared/lib/lazy-dynamic/bailout-to-csr.ts
+// ---------------------------------------------------------------------------
+
+const _BAILOUT_TO_CSR_DIGEST = "BAILOUT_TO_CLIENT_SIDE_RENDERING";
+
+/**
+ * Error thrown to bail out of server rendering and fall back to client-side
+ * rendering. Used by `next/dynamic` with `ssr: false`.
+ *
+ * vinext does not yet emit this error itself — it's exposed so user code and
+ * third-party libraries that mimic `next/dynamic`'s bailout semantics can
+ * construct an error with the canonical digest that `unstable_rethrow`
+ * recognises.
+ *
+ * Ported 1:1 from Next.js:
+ *   https://github.com/vercel/next.js/blob/canary/packages/next/src/shared/lib/lazy-dynamic/bailout-to-csr.ts
+ */
+export class BailoutToCSRError extends Error {
+  public readonly digest: typeof _BAILOUT_TO_CSR_DIGEST = _BAILOUT_TO_CSR_DIGEST;
+  public readonly reason: string;
+
+  constructor(reason: string) {
+    super(`Bail out to client-side rendering: ${reason}`);
+    this.reason = reason;
+  }
+}
+
+/**
+ * Returns true if the error is a `BailoutToCSRError`. Matches Next.js's
+ * digest-based predicate, so any error from a foreign module instance of
+ * the class (or constructed manually with the canonical digest) is also
+ * detected.
+ *
+ * **Note on vinext public surface:** Next.js does NOT expose this from
+ * `next/navigation`. vinext exposes it for symmetry with `isRedirectError`
+ * — treat it as a vinext-only extension. The matching producer
+ * (`BailoutToCSRError`) is the public detection contract; Next.js exposes
+ * neither.
+ *
+ * Ported from Next.js:
+ *   https://github.com/vercel/next.js/blob/canary/packages/next/src/shared/lib/lazy-dynamic/bailout-to-csr.ts
+ */
+export function isBailoutToCSRError(error: unknown): error is BailoutToCSRError {
+  if (!error || typeof error !== "object" || !("digest" in error)) {
+    return false;
+  }
+  return (error as { digest: unknown }).digest === _BAILOUT_TO_CSR_DIGEST;
+}
+
+// ---------------------------------------------------------------------------
+// DynamicServerError — thrown by Next.js's internal `cookies()`/`headers()`
+// shims when called inside a static render context that cannot resolve
+// request-scoped data. vinext's own `next/headers` shim has its own throw
+// semantics, so vinext never constructs this error itself, but third-party
+// code or accidentally-bundled Next.js internals can.
+//
+// Ported from Next.js:
+//   https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/hooks-server-context.ts
+// ---------------------------------------------------------------------------
+
+const _DYNAMIC_SERVER_USAGE_DIGEST = "DYNAMIC_SERVER_USAGE";
+
+/**
+ * Error thrown when dynamic server APIs (`cookies()`, `headers()`, etc.) are
+ * used inside a static/prerender context. Carries the `DYNAMIC_SERVER_USAGE`
+ * digest so `unstable_rethrow` can recognise and propagate it.
+ *
+ * vinext does not construct this error itself — exposed for the same
+ * "stable detection contract" reason as `BailoutToCSRError` above.
+ *
+ * Ported 1:1 from Next.js:
+ *   https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/hooks-server-context.ts
+ */
+export class DynamicServerError extends Error {
+  public readonly digest: typeof _DYNAMIC_SERVER_USAGE_DIGEST = _DYNAMIC_SERVER_USAGE_DIGEST;
+  public readonly description: string;
+
+  constructor(description: string) {
+    super(`Dynamic server usage: ${description}`);
+    this.description = description;
+  }
+}
+
+/**
+ * Returns true if the error is a `DynamicServerError` (or any error with the
+ * canonical `DYNAMIC_SERVER_USAGE` digest).
+ *
+ * **Note on vinext public surface:** Next.js does NOT expose this from
+ * `next/navigation`. vinext exposes it for symmetry — treat it as a
+ * vinext-only extension.
+ *
+ * Ported from Next.js:
+ *   https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/hooks-server-context.ts
+ */
+export function isDynamicServerError(error: unknown): error is DynamicServerError {
+  if (!error || typeof error !== "object" || !("digest" in error)) {
+    return false;
+  }
+  // `===` against a string literal already requires the operand to be a
+  // string, so no separate `typeof digest === "string"` check is needed.
+  // Matches `isBailoutToCSRError` above for stylistic consistency.
+  return (error as { digest: unknown }).digest === _DYNAMIC_SERVER_USAGE_DIGEST;
+}
+
+/**
+ * Rethrow internal Next.js errors so they're handled by the framework.
+ *
+ * When wrapping an API that uses errors for control flow (redirect, notFound,
+ * cookies in static render, `next/dynamic` SSR bailout, etc.), call this
+ * inside `catch` blocks before doing your own error handling. If the error
+ * is a Next.js internal error, it's rethrown; otherwise this is a no-op
+ * (apart from recursing through `error.cause`).
+ *
+ * Recognises (matches Next.js's browser build + the subset of the server
+ * build that vinext can realistically encounter):
+ *   - `isNextRouterError`: redirect / notFound / forbidden / unauthorized
+ *   - `isBailoutToCSRError`: `next/dynamic` `ssr: false` bailout
+ *   - `isDynamicServerError`: dynamic API used in static render
+ *
+ * vinext does not yet recognise four additional server-only Next.js
+ * categories — `isDynamicPostpone`, `isPostpone`,
+ * `isHangingPromiseRejectionError`, `isPrerenderInterruptedError` — because
+ * they signal PPR / prerender-controller events that vinext's render
+ * pipeline does not generate. User code cannot construct these in normal
+ * use; they will be added if/when vinext grows PPR support.
+ *
+ * Ported from Next.js:
+ *   https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/unstable-rethrow.ts
+ *   https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/unstable-rethrow.server.ts
+ *   https://github.com/vercel/next.js/blob/canary/packages/next/src/client/components/unstable-rethrow.browser.ts
+ */
+export function unstable_rethrow(error: unknown): void {
+  if (isNextRouterError(error) || isBailoutToCSRError(error) || isDynamicServerError(error)) {
+    throw error;
+  }
+
+  if (error instanceof Error && "cause" in error) {
+    unstable_rethrow((error as Error & { cause: unknown }).cause);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Unrecognized server-action errors
+//
+// `UnrecognizedActionError` / `unstable_isUnrecognizedActionError` live in a
+// dedicated zero-dependency module so this `next/navigation` shim and vinext's
+// client server-action dispatcher (`server/server-action-not-found.ts`) share
+// one class. `instanceof` is identity-based per module instance, so the
+// dispatcher and user code must resolve the same class for the predicate to
+// work. Re-exported here to keep the public `next/navigation` surface intact.
+// ---------------------------------------------------------------------------
+
+export {
+  UnrecognizedActionError,
+  unstable_isUnrecognizedActionError,
+} from "./unrecognized-action-error.js";
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1570,12 +2067,12 @@ if (!isServer) {
     state.patchInstalled = true;
 
     // Listen for popstate on the client.
-    // Note: This handler runs for Pages Router only (when __VINEXT_RSC_NAVIGATE__
-    // is not available). It restores scroll position with microtask-based deferral.
+    // Note: This handler runs for Pages Router only (when App Router navigation
+    // runtime is not available). It restores scroll position with microtask-based deferral.
     // App Router scroll restoration is handled in server/app-browser-entry.ts:697
     // with RSC navigation coordination (waits for pending navigation to settle).
     window.addEventListener("popstate", (event) => {
-      if (typeof window.__VINEXT_RSC_NAVIGATE__ !== "function") {
+      if (!hasAppNavigationRuntime()) {
         commitClientNavigationState();
         restoreScrollPosition(event.state);
       }
@@ -1586,7 +2083,12 @@ if (!isServer) {
       unused: string,
       url?: string | URL | null,
     ): void {
-      state.originalPushState.call(window.history, data, unused, url);
+      state.originalPushState.call(
+        window.history,
+        createExternalHistoryStatePreservingMetadata(data, window.history.state),
+        unused,
+        url,
+      );
       if (state.suppressUrlNotifyCount === 0) {
         commitClientNavigationState();
       }
@@ -1597,7 +2099,12 @@ if (!isServer) {
       unused: string,
       url?: string | URL | null,
     ): void {
-      state.originalReplaceState.call(window.history, data, unused, url);
+      state.originalReplaceState.call(
+        window.history,
+        createExternalHistoryStatePreservingMetadata(data, window.history.state),
+        unused,
+        url,
+      );
       if (state.suppressUrlNotifyCount === 0) {
         commitClientNavigationState();
       }

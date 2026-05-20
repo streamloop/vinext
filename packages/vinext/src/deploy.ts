@@ -17,7 +17,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
-import { execFileSync, type ExecSyncOptions } from "node:child_process";
+import { execFileSync, type ExecFileSyncOptions } from "node:child_process";
 import { parseArgs as nodeParseArgs } from "node:util";
 import { pathToFileURL } from "node:url";
 import {
@@ -31,6 +31,7 @@ import { runTPR } from "./cloudflare/tpr.js";
 import { runPrerender } from "./build/run-prerender.js";
 import { loadDotenv } from "./config/dotenv.js";
 import { loadNextConfig, resolveNextConfig } from "./config/next-config.js";
+import { parsePositiveIntegerArg } from "./cli-args.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -49,6 +50,8 @@ type DeployOptions = {
   dryRun?: boolean;
   /** Pre-render all discovered routes into the dist output after building */
   prerenderAll?: boolean;
+  /** Maximum number of routes to prerender in parallel */
+  prerenderConcurrency?: number;
   /** Enable experimental TPR (Traffic-aware Pre-Rendering) */
   experimentalTPR?: boolean;
   /** TPR: traffic coverage percentage target (0–100, default: 90) */
@@ -70,6 +73,7 @@ const deployArgOptions = {
   "skip-build": { type: "boolean", default: false },
   "dry-run": { type: "boolean", default: false },
   "prerender-all": { type: "boolean", default: false },
+  "prerender-concurrency": { type: "string" },
   "experimental-tpr": { type: "boolean", default: false },
   "tpr-coverage": { type: "string" },
   "tpr-limit": { type: "string" },
@@ -97,6 +101,10 @@ export function parseDeployArgs(args: string[]) {
     skipBuild: values["skip-build"],
     dryRun: values["dry-run"],
     prerenderAll: values["prerender-all"],
+    prerenderConcurrency:
+      values["prerender-concurrency"] === undefined
+        ? undefined
+        : parsePositiveIntegerArg(values["prerender-concurrency"], "--prerender-concurrency"),
     experimentalTPR: values["experimental-tpr"],
     tprCoverage: parseIntArg("tpr-coverage", values["tpr-coverage"]),
     tprLimit: parseIntArg("tpr-limit", values["tpr-limit"]),
@@ -301,7 +309,17 @@ function scanDirForPattern(dir: string, pattern: RegExp): boolean {
  */
 function detectMDX(root: string, isAppRouter: boolean, hasPages: boolean): boolean {
   // Check next.config for pageExtensions with mdx
-  const configFiles = ["next.config.ts", "next.config.mjs", "next.config.js", "next.config.cjs"];
+  // Mirror the Next.js-compatible set in shims/constants.ts. We accept
+  // `.cjs` and `.cts` defensively in case a user has them — Next.js itself
+  // does not, but `findNextConfigPath` will only return the first match in
+  // the canonical order, so adding extra extensions here is harmless.
+  const configFiles = [
+    "next.config.ts",
+    "next.config.mts",
+    "next.config.mjs",
+    "next.config.js",
+    "next.config.cjs",
+  ];
   for (const f of configFiles) {
     const p = path.join(root, f);
     if (fs.existsSync(p)) {
@@ -521,10 +539,16 @@ import {
   proxyExternalRequest,
   sanitizeDestination,
 } from "vinext/config/config-matchers";
-import { applyConfigHeadersToHeaderRecord } from "vinext/server/request-pipeline";
+import {
+  applyConfigHeadersToHeaderRecord,
+  cloneRequestWithHeaders,
+  filterInternalHeaders,
+  isOpenRedirectShaped,
+  normalizeTrailingSlash,
+} from "vinext/server/request-pipeline";
 
 // @ts-expect-error -- virtual module resolved by vinext at build time
-import { renderPage, handleApiRoute, runMiddleware, vinextConfig } from "virtual:vinext-server-entry";
+import { renderPage, handleApiRoute, runMiddleware, vinextConfig, matchPageRoute } from "virtual:vinext-server-entry";
 
 interface Env {
   ASSETS: Fetcher;
@@ -550,6 +574,7 @@ const configRewrites = vinextConfig?.rewrites ?? { beforeFiles: [], afterFiles: 
 const configHeaders = vinextConfig?.headers ?? [];
 const imageConfig: ImageConfig | undefined = vinextConfig?.images ? {
   dangerouslyAllowSVG: vinextConfig.images.dangerouslyAllowSVG,
+  dangerouslyAllowLocalIP: vinextConfig.images.dangerouslyAllowLocalIP,
   contentDispositionType: vinextConfig.images.contentDispositionType,
   contentSecurityPolicy: vinextConfig.images.contentSecurityPolicy,
 } : undefined;
@@ -562,20 +587,6 @@ function hasBasePath(pathname: string, basePath: string): boolean {
 function stripBasePath(pathname: string, basePath: string): string {
   if (!hasBasePath(pathname, basePath)) return pathname;
   return pathname.slice(basePath.length) || "/";
-}
-
-// Mirror of isOpenRedirectShaped in server/request-pipeline.ts. Inlined here
-// because this worker runs in the Cloudflare Workers environment and can't
-// import from our local source at build time. Keep in sync.
-function isOpenRedirectShaped(rawPathname: string): boolean {
-  if (!rawPathname.startsWith("/")) return false;
-  const afterSlash = rawPathname.slice(1);
-  if (afterSlash.startsWith("/") || afterSlash.startsWith("\\")) return true;
-  if (afterSlash.length >= 3 && afterSlash[0] === "%") {
-    const encoded = afterSlash.slice(0, 3).toLowerCase();
-    if (encoded === "%5c" || encoded === "%2f") return true;
-  }
-  return false;
 }
 
 export default {
@@ -592,7 +603,15 @@ export default {
       // Location headers, so an encoded backslash in a downstream 308 redirect
       // would also navigate to the attacker's origin.
       if (isOpenRedirectShaped(pathname)) {
-        return new Response("404 Not Found", { status: 404 });
+        return new Response("This page could not be found", { status: 404 });
+      }
+
+      // Strip internal headers from inbound requests so they cannot be
+      // forged to influence routing or impersonate internal state.
+      // Request.headers is immutable in Workers, so build a clean copy.
+      {
+        const filteredHeaders = filterInternalHeaders(request.headers);
+        request = cloneRequestWithHeaders(request, filteredHeaders);
       }
 
       // ── 1. Strip basePath ─────────────────────────────────────────
@@ -618,18 +637,15 @@ export default {
       }
 
       // ── 2. Trailing slash normalization ────────────────────────────
-      if (pathname !== "/" && pathname !== "/api" && !pathname.startsWith("/api/")) {
-        const hasTrailing = pathname.endsWith("/");
-        if (trailingSlash && !hasTrailing) {
-          return new Response(null, {
-            status: 308,
-            headers: { Location: basePath + pathname + "/" + url.search },
-          });
-        } else if (!trailingSlash && hasTrailing) {
-          return new Response(null, {
-            status: 308,
-            headers: { Location: basePath + pathname.replace(/\\/+$/, "") + url.search },
-          });
+      {
+        const trailingSlashRedirect = normalizeTrailingSlash(
+          pathname,
+          basePath,
+          trailingSlash,
+          url.search,
+        );
+        if (trailingSlashRedirect) {
+          return trailingSlashRedirect;
         }
       }
 
@@ -781,8 +797,12 @@ export default {
         return mergeHeaders(response, middlewareHeaders, middlewareRewriteStatus);
       }
 
+      const pageMatch =
+        typeof matchPageRoute === "function" ? matchPageRoute(resolvedPathname, request) : null;
+
       // ── 8. Apply afterFiles rewrites from next.config.js ──────────
-      if (configRewrites.afterFiles?.length) {
+      // These run after non-dynamic page routes but before dynamic routes.
+      if ((!pageMatch || pageMatch.route.isDynamic) && configRewrites.afterFiles?.length) {
         const rewritten = matchRewrite(resolvedPathname, configRewrites.afterFiles, postMwReqCtx);
         if (rewritten) {
           if (isExternalUrl(rewritten)) {
@@ -811,7 +831,7 @@ export default {
       }
 
       if (!response) {
-        return new Response("404 - Not found", { status: 404 });
+        return new Response("This page could not be found", { status: 404 });
       }
 
       return mergeHeaders(response, middlewareHeaders, middlewareRewriteStatus);
@@ -1066,6 +1086,7 @@ function installDeps(root: string, deps: MissingDep[]): void {
   execFileSync(pm, [...pmArgs, ...depSpecs], {
     cwd: root,
     stdio: "inherit",
+    shell: process.platform === "win32",
   });
 }
 
@@ -1206,17 +1227,48 @@ export function buildWranglerDeployArgs(
   return { args, env };
 }
 
-function runWranglerDeploy(root: string, options: Pick<DeployOptions, "preview" | "env">): string {
-  // Walk up ancestor directories so the binary is found even when node_modules
-  // is hoisted to the workspace root in a monorepo.
-  const wranglerBin =
-    _findInNodeModules(root, ".bin/wrangler") ??
-    path.join(root, "node_modules", ".bin", "wrangler"); // fallback for error message clarity
+/**
+ * Resolve the wrangler executable in node_modules.
+ *
+ * Walks up ancestor directories so the binary is found even when node_modules
+ * is hoisted to the workspace root in a monorepo.
+ *
+ * On Windows, `node_modules/.bin/` contains both a Unix shebang script (no
+ * extension) and a `.CMD` shim. Node's `execFileSync` uses CreateProcess(),
+ * which only resolves PATHEXT extensions (`.cmd`, `.exe`, ...) — spawning the
+ * bare-name shebang file fails with ENOENT even though the file exists. So on
+ * Windows we prefer the `.CMD` shim and only fall back to the bare name for a
+ * clearer error message if neither is present.
+ */
+export function resolveWranglerBin(
+  root: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const candidates =
+    platform === "win32"
+      ? [".bin/wrangler.CMD", ".bin/wrangler.cmd", ".bin/wrangler"]
+      : [".bin/wrangler"];
 
-  const execOpts: ExecSyncOptions = {
+  for (const candidate of candidates) {
+    const found = _findInNodeModules(root, candidate);
+    if (found) return found;
+  }
+
+  // Not found — return platform-appropriate path under root for error clarity.
+  return path.join(root, "node_modules", ...candidates[0].split("/"));
+}
+
+function runWranglerDeploy(root: string, options: Pick<DeployOptions, "preview" | "env">): string {
+  const wranglerBin = resolveWranglerBin(root);
+
+  const execOpts: ExecFileSyncOptions = {
     cwd: root,
     stdio: "pipe",
     encoding: "utf-8",
+    // On Windows, .bin/wrangler is a .cmd wrapper; execFileSync can't run
+    // it without a shell.  Enabling shell only on win32 keeps the
+    // no-shell-injection guarantee on other platforms.
+    shell: process.platform === "win32",
   };
 
   const { args, env } = buildWranglerDeployArgs(options);
@@ -1227,8 +1279,9 @@ function runWranglerDeploy(root: string, options: Pick<DeployOptions, "preview" 
     console.log("\n  Deploying to production...");
   }
 
-  // Use execFileSync to avoid shell injection — args are passed as an array,
-  // never interpolated into a shell command string.
+  // execFileSync passes args as an array, avoiding shell injection on Unix.
+  // On Windows, shell: true is required for .cmd wrappers but the array form
+  // still prevents trivial injection.
   const output = execFileSync(wranglerBin, args, execOpts) as string;
 
   // Parse the deployed URL from wrangler output
@@ -1282,7 +1335,11 @@ export async function deploy(options: DeployOptions): Promise<void> {
       console.log(
         `  Upgrading ${reactUpgrade.map((d) => d.replace(/@latest$/, "")).join(", ")}...`,
       );
-      execFileSync(pm, [...pmArgs, ...reactUpgrade], { cwd: root, stdio: "inherit" });
+      execFileSync(pm, [...pmArgs, ...reactUpgrade], {
+        cwd: root,
+        stdio: "inherit",
+        shell: process.platform === "win32",
+      });
     }
   }
   const missingDeps = getMissingDeps(info);
@@ -1352,7 +1409,7 @@ export async function deploy(options: DeployOptions): Promise<void> {
         process.setSourceMapsEnabled(true);
         Error.stackTraceLimit = Math.max(Error.stackTraceLimit, 50);
       }
-      await runPrerender({ root: info.root });
+      await runPrerender({ root: info.root, concurrency: options.prerenderConcurrency });
     }
   }
 

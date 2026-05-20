@@ -23,7 +23,13 @@ import type { Server as HttpServer } from "node:http";
 import type { Route } from "../routing/pages-router.js";
 import type { AppRoute } from "../routing/app-router.js";
 import type { ResolvedNextConfig } from "../config/next-config.js";
-import { classifyPagesRoute, classifyAppRoute } from "./report.js";
+import { classifyPagesRoute, classifyAppRoute, getAppRouteRenderEntryPath } from "./report.js";
+import {
+  concatUint8Arrays,
+  decodeRscEmbeddedChunk,
+  RSC_EMBEDDED_BINARY_CHUNK,
+  type RscEmbeddedChunk,
+} from "../server/app-rsc-embedded-chunks.js";
 import {
   NoOpCacheHandler,
   setCacheHandler,
@@ -31,7 +37,10 @@ import {
   _consumeRequestScopedCacheLife,
 } from "vinext/shims/cache";
 import { runWithHeadersContext, headersContextFromRequest } from "vinext/shims/headers";
-import { createValidFileMatcher, type ValidFileMatcher } from "../routing/file-matcher.js";
+import { createValidFileMatcher, findFileWithExtensions } from "../routing/file-matcher.js";
+import { normalizeStaticPathsEntry, type StaticPathsEntry } from "../routing/route-pattern.js";
+import { navigationRuntimeRscBootstrapExpression } from "../server/app-ssr-stream.js";
+import { VINEXT_PRERENDER_SECRET_HEADER } from "../server/headers.js";
 import { startProdServer } from "../server/prod-server.js";
 import { readPrerenderSecret } from "./server-manifest.js";
 export { readPrerenderSecret } from "./server-manifest.js";
@@ -178,6 +187,107 @@ const NOT_FOUND_SENTINEL_PATH = "/__vinext_nonexistent_for_404__";
 
 const DEFAULT_CONCURRENCY = Math.min(os.availableParallelism(), 8);
 
+const RSC_LEGACY_CHUNK_SCRIPT_PREFIX = "self.__VINEXT_RSC_CHUNKS__=self.__VINEXT_RSC_CHUNKS__||[];";
+const RSC_LEGACY_DONE_SCRIPT = "self.__VINEXT_RSC_DONE__=true";
+// Full literals that createRscEmbedTransform concatenates before the chunk
+// argument in packages/vinext/src/server/app-ssr-stream.ts.
+const RSC_LEGACY_CHUNK_FULL_PREFIX = `${RSC_LEGACY_CHUNK_SCRIPT_PREFIX}self.__VINEXT_RSC_CHUNKS__.push(`;
+const RSC_RUNTIME_BOOTSTRAP_EXPRESSION = navigationRuntimeRscBootstrapExpression();
+const RSC_RUNTIME_CHUNK_FULL_PREFIX = `${RSC_RUNTIME_BOOTSTRAP_EXPRESSION}.rsc.push(`;
+const RSC_RUNTIME_DONE_SCRIPT = `${RSC_RUNTIME_BOOTSTRAP_EXPRESSION}.done=true`;
+
+/**
+ * Reconstruct the RSC payload from a prerender HTML response by parsing the
+ * inline bootstrap chunk scripts emitted by createRscEmbedTransform.
+ *
+ * Returns null when the HTML contains no chunk scripts at all — the caller
+ * should fall back to a second handler invocation. This is reachable when
+ * middleware short-circuits the App Router pipeline with a custom 200 HTML
+ * response that never went through createRscEmbedTransform.
+ *
+ * Throws on partial or malformed embeds (chunks present but no done marker,
+ * tampered chunk JSON, etc.) — those are real vinext-internal regressions.
+ *
+ * Safe regex usage: safeJsonStringify (used by createRscEmbedTransform) escapes
+ * all '<' and '>' in the embedded JSON, preventing false </script> matches.
+ */
+export function extractRscPayloadFromPrerenderedHtml(html: string): Uint8Array | null {
+  const scriptPattern = /<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi;
+  const chunks: Uint8Array[] = [];
+  let sawDone = false;
+  let match: RegExpExecArray | null;
+
+  while ((match = scriptPattern.exec(html)) !== null) {
+    const script = (match[1] ?? "").trim().replace(/;$/, "");
+
+    if (script === RSC_RUNTIME_DONE_SCRIPT || script === RSC_LEGACY_DONE_SCRIPT) {
+      sawDone = true;
+      continue;
+    }
+
+    if (script.startsWith(RSC_RUNTIME_CHUNK_FULL_PREFIX)) {
+      chunks.push(
+        decodeRscEmbeddedChunk(parseRscChunkPushArgument(script, RSC_RUNTIME_CHUNK_FULL_PREFIX)),
+      );
+      continue;
+    }
+
+    if (script.startsWith(RSC_LEGACY_CHUNK_SCRIPT_PREFIX)) {
+      chunks.push(
+        decodeRscEmbeddedChunk(parseRscChunkPushArgument(script, RSC_LEGACY_CHUNK_FULL_PREFIX)),
+      );
+    }
+  }
+
+  // No chunks AND no done marker → middleware/early-return path. Caller falls
+  // back to a second invocation with `RSC: 1`.
+  if (chunks.length === 0 && !sawDone) {
+    return null;
+  }
+  if (chunks.length === 0) {
+    throw new Error(
+      "[vinext] Malformed prerender RSC embed: done marker present without chunk scripts",
+    );
+  }
+  if (!sawDone) {
+    throw new Error("[vinext] Malformed prerender RSC embed: missing RSC done marker");
+  }
+
+  return concatUint8Arrays(chunks);
+}
+
+/**
+ * Parse the JSON argument of a single chunk-push script. The script
+ * shape is exactly `<prefix>(<safeJsonStringify(chunk)>)` because the writer
+ * concatenates those literals — so the body always starts with the full
+ * prefix and ends with `)`. JSON.parse on the slice catches any tampering or
+ * trailing code.
+ */
+function parseRscChunkPushArgument(script: string, chunkPrefix: string): RscEmbeddedChunk {
+  if (!script.startsWith(chunkPrefix) || !script.endsWith(")")) {
+    throw new Error("[vinext] Malformed prerender RSC embed: unexpected chunk script shape");
+  }
+  const jsonSource = script.slice(chunkPrefix.length, -1);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonSource);
+  } catch {
+    throw new Error("[vinext] Malformed prerender RSC embed: invalid chunk JSON");
+  }
+  if (typeof parsed === "string") {
+    return parsed;
+  }
+  if (
+    Array.isArray(parsed) &&
+    parsed.length === 2 &&
+    parsed[0] === RSC_EMBEDDED_BINARY_CHUNK &&
+    typeof parsed[1] === "string"
+  ) {
+    return [parsed[0], parsed[1]];
+  }
+  throw new Error("[vinext] Malformed prerender RSC embed: unsupported chunk payload");
+}
+
 /**
  * Run an array of async tasks with bounded concurrency.
  * Results are returned in the same order as `items`.
@@ -205,16 +315,28 @@ async function runWithConcurrency<T, R>(
 
 // ─── Helpers (shared with static-export.ts) ───────────────────────────────────
 
-function findFileWithExtensions(basePath: string, matcher: ValidFileMatcher): boolean {
-  return matcher.dottedExtensions.some((ext) => fs.existsSync(basePath + ext));
-}
-
 /**
  * Build a URL path from a route pattern and params.
  * "/posts/:id" + { id: "42" } → "/posts/42"
  * "/docs/:slug+" + { slug: ["a", "b"] } → "/docs/a/b"
+ *
+ * Throws a descriptive error rather than a cryptic `Cannot read properties of
+ * undefined` if `params` itself is missing or required keys are absent — the
+ * caller (prerenderPages / prerenderApp) catches this and surfaces it as a
+ * per-route error result.
  */
-function buildUrlFromParams(pattern: string, params: Record<string, string | string[]>): string {
+function buildUrlFromParams(
+  pattern: string,
+  params: Record<string, string | string[]> | undefined | null,
+): string {
+  if (params === undefined || params === null) {
+    throw new Error(
+      `[vinext] buildUrlFromParams: params is ${params === null ? "null" : "undefined"} for pattern "${pattern}". ` +
+        `Check that getStaticPaths / generateStaticParams returned an object with a "params" key, ` +
+        `or pass a string path (see https://nextjs.org/docs/pages/api-reference/functions/get-static-paths).`,
+    );
+  }
+
   const parts = pattern.split("/").filter(Boolean);
   const result: string[] = [];
 
@@ -259,11 +381,7 @@ export function getOutputPath(urlPath: string, trailingSlash: boolean): string {
 /** Map of route patterns to generateStaticParams functions (or null/undefined). */
 export type StaticParamsMap = Record<
   string,
-  | ((opts: {
-      params: Record<string, string | string[]>;
-    }) => Promise<Record<string, string | string[]>[]>)
-  | null
-  | undefined
+  ((opts: { params: Record<string, string | string[]> }) => Promise<unknown>) | null | undefined
 >;
 
 /**
@@ -275,7 +393,6 @@ export type StaticParamsMap = Record<
  */
 export async function resolveParentParams(
   childRoute: AppRoute,
-  routeIndex: ReadonlyMap<string, AppRoute>,
   staticParamsMap: StaticParamsMap,
 ): Promise<Record<string, string | string[]>[]> {
   const { patternParts } = childRoute;
@@ -293,7 +410,7 @@ export async function resolveParentParams(
 
   type GenerateStaticParamsFn = (opts: {
     params: Record<string, string | string[]>;
-  }) => Promise<Record<string, string | string[]>[]>;
+  }) => Promise<unknown>;
 
   const parentSegments: GenerateStaticParamsFn[] = [];
 
@@ -303,38 +420,41 @@ export async function resolveParentParams(
     prefixPattern += "/" + part;
     if (!part.startsWith(":")) continue;
 
-    const parentRoute = routeIndex.get(prefixPattern);
-    // TODO: layout-level generateStaticParams — a layout segment can define
-    // generateStaticParams without a corresponding page file, so parentRoute
-    // may be undefined here even though the layout exports generateStaticParams.
-    // resolveParentParams currently only looks up routes that have a pagePath
-    // (i.e. leaf pages), missing layout-level providers. Fix requires scanning
-    // layout files in addition to page files during route collection.
-    if (parentRoute?.pagePath) {
-      const fn = staticParamsMap[prefixPattern];
-      if (typeof fn === "function") {
-        parentSegments.push(fn);
-      }
+    const fn = staticParamsMap[prefixPattern];
+    if (typeof fn === "function") {
+      parentSegments.push(fn);
     }
   }
 
   if (parentSegments.length === 0) return [];
 
   let currentParams: Record<string, string | string[]>[] = [{}];
+  let resolvedAnyParent = false;
+
   for (const generateStaticParams of parentSegments) {
     const nextParams: Record<string, string | string[]>[] = [];
+    let resolvedThisParent = false;
+
     for (const parentParams of currentParams) {
       const results = await generateStaticParams({ params: parentParams });
-      if (Array.isArray(results)) {
-        for (const result of results) {
-          nextParams.push({ ...parentParams, ...result });
-        }
+      // `null` is the CF Workers Proxy sentinel: the proxy has no
+      // generateStaticParams for this pattern. Skip and let later providers run.
+      if (results === null) continue;
+      if (!Array.isArray(results)) return [];
+
+      resolvedThisParent = true;
+      resolvedAnyParent = true;
+      for (const result of results) {
+        nextParams.push({ ...parentParams, ...result });
       }
     }
-    currentParams = nextParams;
+
+    if (resolvedThisParent) {
+      currentParams = nextParams;
+    }
   }
 
-  return currentParams;
+  return resolvedAnyParent ? currentParams : [];
 }
 
 // ─── Pages Router Prerender ───────────────────────────────────────────────────
@@ -417,6 +537,7 @@ export async function prerenderPages({
             // either _prodServer or pagesBundlePath is provided.
             outDir: path.dirname(path.dirname(pagesBundlePath!)),
             noCompression: true,
+            purpose: "prerender",
           });
           ownedProdServerHandle = srv;
           return srv;
@@ -424,16 +545,20 @@ export async function prerenderPages({
 
     const baseUrl = `http://127.0.0.1:${prodServer.port}`;
     const secretHeaders: Record<string, string> = prerenderSecret
-      ? { "x-vinext-prerender-secret": prerenderSecret }
+      ? { [VINEXT_PRERENDER_SECRET_HEADER]: prerenderSecret }
       : {};
 
+    // Next.js allows `paths` to be either a list of strings or a list of
+    // { params, locale? } objects. The `StaticPathsEntry` type and the
+    // `normalizeStaticPathsEntry` helper live in `../routing/route-pattern.ts`
+    // — see that file's doc comments for the Next.js references.
     type BundleRoute = {
       pattern: string;
       isDynamic: boolean;
       params: Record<string, string>;
       module: {
         getStaticPaths?: (opts: { locales: string[]; defaultLocale: string }) => Promise<{
-          paths: Array<{ params: Record<string, string | string[]> }>;
+          paths: Array<StaticPathsEntry>;
           fallback: unknown;
         }>;
         getStaticProps?: unknown;
@@ -472,7 +597,7 @@ export async function prerenderPages({
               }
               if (text === "null") return { paths: [], fallback: false };
               return JSON.parse(text) as {
-                paths: Array<{ params: Record<string, string | string[]> }>;
+                paths: Array<StaticPathsEntry>;
                 fallback: unknown;
               };
             }
@@ -553,11 +678,30 @@ export async function prerenderPages({
           continue;
         }
 
-        const paths: Array<{ params: Record<string, string | string[]> }> =
-          pathsResult?.paths ?? [];
-        for (const { params } of paths) {
-          const urlPath = buildUrlFromParams(route.pattern, params);
-          pagesToRender.push({ route, urlPath, params, revalidate });
+        // `paths` may be `Array<string | { params, locale? }>` — normalize
+        // each entry into a params object via the shared helper, surfacing any
+        // per-entry problem as a per-route error result instead of crashing
+        // the whole prerender.
+        const paths: Array<StaticPathsEntry> = pathsResult?.paths ?? [];
+        let entryError: string | null = null;
+        for (const item of paths) {
+          const normalized = normalizeStaticPathsEntry(item, route.pattern);
+          if ("error" in normalized) {
+            entryError = normalized.error;
+            break;
+          }
+          const { params } = normalized;
+          try {
+            const urlPath = buildUrlFromParams(route.pattern, params);
+            pagesToRender.push({ route, urlPath, params, revalidate });
+          } catch (e) {
+            entryError = (e as Error).message;
+            break;
+          }
+        }
+        if (entryError) {
+          results.push({ route: route.pattern, status: "error", error: entryError });
+          continue;
         }
       } else {
         pagesToRender.push({ route, urlPath: route.pattern, params: {}, revalidate });
@@ -750,6 +894,7 @@ export async function prerenderApp({
             host: "127.0.0.1",
             outDir: path.dirname(serverDir),
             noCompression: true,
+            purpose: "prerender",
           });
           ownedProdServerHandle = srv;
           return srv;
@@ -757,7 +902,7 @@ export async function prerenderApp({
 
     const baseUrl = `http://127.0.0.1:${prodServer.port}`;
     const secretHeaders: Record<string, string> = prerenderSecret
-      ? { "x-vinext-prerender-secret": prerenderSecret }
+      ? { [VINEXT_PRERENDER_SECRET_HEADER]: prerenderSecret }
       : {};
 
     rscHandler = (req: Request) => {
@@ -827,8 +972,6 @@ export async function prerenderApp({
       },
     });
 
-    const routeIndex = new Map(routes.map((r) => [r.pattern, r]));
-
     // ── Collect URLs to render ────────────────────────────────────────────────
     type UrlToRender = {
       urlPath: string;
@@ -840,20 +983,21 @@ export async function prerenderApp({
     const urlsToRender: UrlToRender[] = [];
 
     for (const route of routes) {
-      // API-only route handler (no page component)
-      if (route.routePath && !route.pagePath) {
+      const renderEntryPath = getAppRouteRenderEntryPath(route);
+
+      if (!renderEntryPath && route.routePath) {
         results.push({ route: route.pattern, status: "skipped", reason: "api" });
         continue;
       }
 
-      if (!route.pagePath) continue;
+      if (!renderEntryPath) continue;
 
       // Use static analysis classification, but note its limitations for dynamic URLs:
       // classifyAppRoute() returns 'ssr' for dynamic URLs with no explicit config,
       // meaning "unknown — could have generateStaticParams". We must check
       // generateStaticParams first before applying the ssr skip/error logic.
       const { type, revalidate: classifiedRevalidate } = classifyAppRoute(
-        route.pagePath,
+        renderEntryPath,
         route.routePath,
         route.isDynamic,
       );
@@ -912,7 +1056,7 @@ export async function prerenderApp({
             continue;
           }
 
-          const parentParamSets = await resolveParentParams(route, routeIndex, staticParamsMap);
+          const parentParamSets = await resolveParentParams(route, staticParamsMap);
           let paramSets: Record<string, string | string[]>[] | null;
 
           if (parentParamSets.length > 0) {
@@ -931,10 +1075,14 @@ export async function prerenderApp({
                     ...childParams,
                   });
                 }
+              } else {
+                paramSets = [];
+                break;
               }
             }
           } else {
-            paramSets = await generateStaticParamsFn({ params: {} });
+            const results = await generateStaticParamsFn({ params: {} });
+            paramSets = Array.isArray(results) || results === null ? results : [];
           }
 
           // null: route has no generateStaticParams (CF Workers Proxy returned null)
@@ -958,6 +1106,17 @@ export async function prerenderApp({
           }
 
           for (const params of paramSets) {
+            // Defensively guard against a generateStaticParams() that returns
+            // entries with no params object. Next.js's app static-paths code
+            // validates each required key per repeat/optional (see
+            // .nextjs-ref/packages/next/src/build/static-paths/app.ts around
+            // line 383) and throws a clear error; mirror that here instead of
+            // bubbling up a TypeError from buildUrlFromParams.
+            if (params === null || params === undefined) {
+              throw new Error(
+                `generateStaticParams() for ${route.pattern} returned an entry with no params object.`,
+              );
+            }
             const urlPath = buildUrlFromParams(route.pattern, params);
             urlsToRender.push({
               urlPath,
@@ -1078,15 +1237,32 @@ export async function prerenderApp({
         }
         const html = htmlRender.html;
 
-        // Fetch RSC payload via a second invocation with RSC headers
-        // TODO: Extract RSC payload from the first response instead of invoking the handler twice.
-        const rscRequest = new Request(`http://localhost${urlPath}`, {
-          headers: { Accept: "text/x-component", RSC: "1" },
-        });
-        const rscRes = await runWithHeadersContext(headersContextFromRequest(rscRequest), () =>
-          rscHandler(rscRequest),
-        );
-        const rscData = rscRes.ok ? await rscRes.text() : null;
+        // Reconstruct the RSC payload from the inline bootstrap chunks already
+        // streamed into the HTML body. The chunks went through fixFlightHints
+        // (createRscEmbedTransform applies it before pushing each chunk into
+        // the embed scripts), so the resulting `.rsc` file contains the
+        // rewritten Flight form rather than raw Flight bytes.
+        //
+        // Falls back to a second invocation with `RSC: 1` when the HTML has
+        // no chunk scripts at all — covers cases where middleware
+        // short-circuits the App Router pipeline with a custom 200 HTML
+        // response that never went through createRscEmbedTransform.
+        let rscData = extractRscPayloadFromPrerenderedHtml(html);
+        if (rscData === null) {
+          const rscRequest = new Request(`http://localhost${urlPath}`, {
+            headers: { Accept: "text/x-component", RSC: "1" },
+          });
+          const rscRes = await runWithHeadersContext(headersContextFromRequest(rscRequest), () =>
+            rscHandler(rscRequest),
+          );
+          if (!rscRes.ok) {
+            await rscRes.body?.cancel();
+            throw new Error(
+              `[vinext] prerenderApp: RSC fallback returned ${rscRes.status} for ${urlPath}`,
+            );
+          }
+          rscData = new Uint8Array(await rscRes.arrayBuffer());
+        }
 
         const outputFiles: string[] = [];
 
@@ -1098,13 +1274,11 @@ export async function prerenderApp({
         outputFiles.push(htmlOutputPath);
 
         // Write RSC payload (.rsc file)
-        if (rscData !== null) {
-          const rscOutputPath = getRscOutputPath(urlPath);
-          const rscFullPath = path.join(outDir, rscOutputPath);
-          fs.mkdirSync(path.dirname(rscFullPath), { recursive: true });
-          fs.writeFileSync(rscFullPath, rscData, "utf-8");
-          outputFiles.push(rscOutputPath);
-        }
+        const rscOutputPath = getRscOutputPath(urlPath);
+        const rscFullPath = path.join(outDir, rscOutputPath);
+        fs.mkdirSync(path.dirname(rscFullPath), { recursive: true });
+        fs.writeFileSync(rscFullPath, rscData);
+        outputFiles.push(rscOutputPath);
 
         const renderedCacheControl = resolveRenderedCacheControl(
           htmlRender.requestCacheLife ?? {},

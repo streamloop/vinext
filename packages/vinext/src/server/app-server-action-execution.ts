@@ -1,13 +1,40 @@
+import { getAndClearActionRevalidationKind, type ActionRevalidationKind } from "vinext/shims/cache";
 import type { HeadersAccessPhase } from "vinext/shims/headers";
 import { type FetchCacheMode, setCurrentFetchCacheMode } from "vinext/shims/fetch-cache";
+import type { ReactFormState } from "react-dom/client";
+import { isExternalUrl } from "../config/config-matchers.js";
+import { addBasePathToPathname, hasBasePath } from "../utils/base-path.js";
+import {
+  ACTION_FORWARDED_HEADER,
+  ACTION_REDIRECT_HEADER,
+  ACTION_REDIRECT_STATUS_HEADER,
+  ACTION_REDIRECT_TYPE_HEADER,
+  ACTION_REVALIDATED_HEADER,
+} from "./headers.js";
+import {
+  VINEXT_RSC_CONTENT_TYPE,
+  VINEXT_RSC_VARY_HEADER,
+  applyRscCompatibilityIdHeader,
+} from "./app-rsc-cache-busting.js";
 import { resolveAppPageActionRerenderTarget } from "./app-page-request.js";
 import { mergeMiddlewareResponseHeaders } from "./middleware-response-headers.js";
+import {
+  APP_RSC_RENDER_MODE_ACTION_RERENDER_PRESERVE_UI,
+  type AppRscRenderMode,
+} from "./app-rsc-render-mode.js";
+import {
+  getNextErrorDigest,
+  parseNextHttpErrorDigest,
+  parseNextRedirectDigest,
+} from "./next-error-digest.js";
 import { validateCsrfOrigin, validateServerActionPayload } from "./request-pipeline.js";
+import { readStreamAsTextWithLimit } from "../utils/text-stream.js";
 import {
   createServerActionNotFoundResponse,
   getServerActionNotFoundMessage,
   isServerActionNotFoundError,
 } from "./server-action-not-found.js";
+import { internalServerErrorResponse, payloadTooLargeResponse } from "./http-error-responses.js";
 
 type AppPageParams = Record<string, string | string[]>;
 
@@ -18,6 +45,10 @@ type AppServerActionErrorReporter = (
 ) => void;
 
 type AppServerActionDecoder = (body: FormData) => Promise<unknown>;
+type AppServerActionFormStateDecoder = (
+  actionResult: unknown,
+  body: FormData,
+) => Promise<ReactFormState | undefined>;
 
 type ReadFormDataWithLimit = (request: Request, maxBytes: number) => Promise<FormData>;
 
@@ -45,6 +76,18 @@ type AppServerActionRoute = {
   pattern: string;
 };
 
+type ProgressiveServerActionResult =
+  | {
+      formState: ReactFormState | null;
+      kind: "form-state";
+    }
+  | {
+      actionError: unknown;
+      actionFailed: true;
+      formState: null;
+      kind: "form-state";
+    };
+
 type AppServerActionMatch<TRoute extends AppServerActionRoute> = {
   params: AppPageParams;
   route: TRoute;
@@ -53,6 +96,7 @@ type AppServerActionMatch<TRoute extends AppServerActionRoute> = {
 type AppServerActionIntercept<TPage = unknown> = {
   matchedParams: AppPageParams;
   page: TPage;
+  slotId?: string | null;
   slotKey: string;
   sourceRouteIndex: number;
 };
@@ -66,11 +110,17 @@ type BuildServerActionPageElementOptions<TRoute extends AppServerActionRoute, TI
   request: Request;
   route: TRoute;
   searchParams: URLSearchParams;
+  renderMode: AppRscRenderMode;
 };
 
 type AppServerActionRscModel<TElement> = {
+  /**
+   * Omitted when the action did not invalidate page data. This mirrors Next.js'
+   * empty Flight payload for non-revalidating fetch actions: the client resolves
+   * the action value without committing a visible router update.
+   */
+  root?: TElement;
   returnValue: AppServerActionReturnValue;
-  root: TElement;
 };
 
 type RenderServerActionRscStreamOptions<TTemporaryReferences> = {
@@ -85,10 +135,13 @@ type DecodeServerActionReplyOptions<TTemporaryReferences> = {
 export type HandleProgressiveServerActionRequestOptions = {
   actionId: string | null;
   allowedOrigins: string[];
+  /** Configured next.config `basePath`. Prefixed onto progressive Location targets. */
+  basePath?: string;
   cleanPathname: string;
   clearRequestContext: () => void;
   contentType: string;
   decodeAction: AppServerActionDecoder;
+  decodeFormState: AppServerActionFormStateDecoder;
   getAndClearPendingCookies: () => string[];
   getDraftModeCookieHeader: () => string | null | undefined;
   maxActionBodySize: number;
@@ -108,6 +161,8 @@ export type HandleServerActionRscRequestOptions<
 > = {
   actionId: string | null;
   allowedOrigins: string[];
+  /** Configured next.config `basePath`. Prefixed onto ACTION_REDIRECT_HEADER targets. */
+  basePath?: string;
   buildPageElement: (
     options: BuildServerActionPageElementOptions<TRoute, TInterceptOpts>,
   ) => TElement;
@@ -158,15 +213,29 @@ export type HandleServerActionRscRequestOptions<
   toInterceptOpts: (intercept: AppServerActionIntercept<TPage>) => TInterceptOpts;
 };
 
-type ActionControlResponse =
-  | {
-      kind: "redirect";
-      url: string;
-    }
-  | {
-      kind: "status";
-      statusCode: number;
-    };
+/**
+ * Matches Next.js' server action argument cap to prevent stack overflow in
+ * Function.prototype.apply when decoding hostile action payloads.
+ */
+const SERVER_ACTION_ARGS_LIMIT = 1000;
+const ACTION_DID_NOT_REVALIDATE = 0 satisfies ActionRevalidationKind;
+const ACTION_DID_REVALIDATE_STATIC_AND_DYNAMIC = 1 satisfies ActionRevalidationKind;
+
+function setActionRevalidatedHeader(headers: Headers, kind: ActionRevalidationKind): void {
+  if (kind === ACTION_DID_NOT_REVALIDATE) return;
+  headers.set(ACTION_REVALIDATED_HEADER, JSON.stringify(kind));
+}
+
+function resolveActionRevalidationKind(hasModifiedCookies: boolean): ActionRevalidationKind {
+  const revalidationKind = getAndClearActionRevalidationKind();
+  // Cookie mutations are a hard override to STATIC_AND_DYNAMIC: any cookie
+  // change can invalidate downstream cached payloads regardless of what
+  // (if anything) the action explicitly revalidated, so we always emit the
+  // strongest kind. STATIC_AND_DYNAMIC is also the lowest numeric value, so
+  // this matches the max-precedence semantics in markActionRevalidation.
+  if (hasModifiedCookies) return ACTION_DID_REVALIDATE_STATIC_AND_DYNAMIC;
+  return revalidationKind;
+}
 
 function isRequestBodyTooLarge(error: unknown): boolean {
   return error instanceof Error && error.message === "Request body too large";
@@ -184,28 +253,19 @@ function getServerActionFailureMessage(error: unknown): string {
   return error instanceof Error && error.message ? error.message : String(error);
 }
 
+function validateServerActionArgs(args: readonly unknown[]): void {
+  if (args.length > SERVER_ACTION_ARGS_LIMIT) {
+    throw new Error(
+      `Server Action arguments list is too long (${args.length}). Maximum allowed is ${SERVER_ACTION_ARGS_LIMIT}.`,
+    );
+  }
+}
+
 export async function readActionBodyWithLimit(request: Request, maxBytes: number): Promise<string> {
   if (!request.body) return "";
-
-  const reader = request.body.getReader();
-  const decoder = new TextDecoder();
-  const chunks: string[] = [];
-  let totalSize = 0;
-
-  for (;;) {
-    const result = await reader.read();
-    if (result.done) break;
-
-    totalSize += result.value.byteLength;
-    if (totalSize > maxBytes) {
-      await reader.cancel();
-      throw new Error("Request body too large");
-    }
-    chunks.push(decoder.decode(result.value, { stream: true }));
-  }
-
-  chunks.push(decoder.decode());
-  return chunks.join("");
+  return readStreamAsTextWithLimit(request.body, maxBytes, () => {
+    throw new Error("Request body too large");
+  });
 }
 
 export async function readActionFormDataWithLimit(
@@ -242,68 +302,71 @@ export async function readActionFormDataWithLimit(
   }).formData();
 }
 
-function getErrorDigest(error: unknown): string | null {
-  if (!error || typeof error !== "object" || !("digest" in error)) {
-    return null;
-  }
-
-  return String(error.digest);
-}
-
-function getActionControlResponse(error: unknown): ActionControlResponse | null {
-  const digest = getErrorDigest(error);
+function getActionRedirect(error: unknown): AppServerActionRedirect | null {
+  const digest = getNextErrorDigest(error);
   if (!digest) return null;
 
-  if (digest.startsWith("NEXT_REDIRECT;")) {
-    const parts = digest.split(";");
-    const encodedUrl = parts[2];
-    if (!encodedUrl) {
-      return null;
-    }
-
-    return {
-      kind: "redirect",
-      url: decodeURIComponent(encodedUrl),
-    };
-  }
-
-  if (digest === "NEXT_NOT_FOUND" || digest.startsWith("NEXT_HTTP_ERROR_FALLBACK;")) {
-    const statusCode = digest === "NEXT_NOT_FOUND" ? 404 : parseInt(digest.split(";")[1], 10);
-    if (!Number.isInteger(statusCode)) {
-      return null;
-    }
-
-    return {
-      kind: "status",
-      statusCode,
-    };
-  }
-
-  return null;
-}
-
-function getActionRedirect(error: unknown): AppServerActionRedirect | null {
-  const digest = getErrorDigest(error);
-  if (!digest?.startsWith("NEXT_REDIRECT;")) {
-    return null;
-  }
-
-  const parts = digest.split(";");
-  const encodedUrl = parts[2];
-  if (!encodedUrl) {
-    return null;
-  }
+  const redirect = parseNextRedirectDigest(digest);
+  if (!redirect) return null;
 
   return {
-    status: parts[3] ? parseInt(parts[3], 10) : 307,
-    type: parts[1] || "push",
-    url: decodeURIComponent(encodedUrl),
+    status: redirect.status,
+    type: redirect.type ?? "push",
+    url: redirect.url,
   };
 }
 
-function isActionHttpFallback(error: unknown): boolean {
-  const digest = getErrorDigest(error);
-  return digest === "NEXT_NOT_FOUND" || digest?.startsWith("NEXT_HTTP_ERROR_FALLBACK;") === true;
+/**
+ * Prepend the configured next.config `basePath` to a server-action redirect
+ * target before it goes on the wire.
+ *
+ * `redirect("/foo")` called from a server action mounted at `/base/...` must
+ * land the browser at `/base/foo`, mirroring how Next.js threads basePath
+ * through `addPathPrefix(getURLFromRedirectError(err), basePath)` in
+ * `app-render.tsx` for SSR redirects and in `action-handler.ts` for action
+ * redirects.
+ *
+ * Idempotent and external-aware:
+ *  - Empty basePath → returned unchanged.
+ *  - External URLs (`http://`, `https://`, `data:`, protocol-relative `//`)
+ *    are returned unchanged because the framework does not own those routes.
+ *  - Targets that already start with the configured basePath are returned
+ *    unchanged so this helper can be applied at any layer without risk of
+ *    double-prefixing (`/base/base/foo`).
+ *
+ * Exported for tests. Used by both the progressive (no-JS form POST) and
+ * RSC (`ACTION_REDIRECT_HEADER`) action redirect paths below.
+ *
+ * @see https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/action-handler.ts
+ */
+export function applyActionRedirectBasePath(url: string, basePath: string): string {
+  if (!basePath) return url;
+  if (isExternalUrl(url)) return url;
+  // Pathnames that already include basePath are returned as-is.
+  if (hasBasePath(url, basePath)) return url;
+  // Relative or hash/query-only targets cannot be prefixed safely without an
+  // origin; leave them to the caller's URL resolution.
+  if (!url.startsWith("/")) return url;
+  // Split off optional query+hash so addBasePathToPathname only operates on
+  // the path. We must accept hash too because Next.js redirect targets may
+  // contain "#anchor".
+  const queryIndex = url.indexOf("?");
+  const hashIndex = url.indexOf("#");
+  const splitAt =
+    queryIndex === -1 ? hashIndex : hashIndex === -1 ? queryIndex : Math.min(queryIndex, hashIndex);
+  const pathname = splitAt === -1 ? url : url.slice(0, splitAt);
+  const suffix = splitAt === -1 ? "" : url.slice(splitAt);
+  return `${addBasePathToPathname(pathname, basePath)}${suffix}`;
+}
+
+function getActionHttpFallbackStatus(error: unknown): number | null {
+  const digest = getNextErrorDigest(error);
+  if (!digest) return null;
+
+  const httpError = parseNextHttpErrorDigest(digest);
+  if (!httpError || !Number.isInteger(httpError.status)) return null;
+
+  return httpError.status;
 }
 
 function createServerActionErrorResponse(
@@ -328,11 +391,10 @@ function createServerActionErrorResponse(
     { routerKind: "App Router", routePath: options.cleanPathname, routeType: "action" },
   );
   options.clearRequestContext();
-  return new Response(
+  return internalServerErrorResponse(
     process.env.NODE_ENV === "production"
-      ? "Internal Server Error"
+      ? undefined
       : "Server action failed: " + getServerActionFailureMessage(error),
-    { status: 500 },
   );
 }
 
@@ -363,9 +425,17 @@ export function isProgressiveServerActionRequest(
 
 export async function handleProgressiveServerActionRequest(
   options: HandleProgressiveServerActionRequestOptions,
-): Promise<Response | null> {
+): Promise<Response | ProgressiveServerActionResult | null> {
   if (!isProgressiveServerActionRequest(options.request, options.contentType, options.actionId)) {
     return null;
+  }
+
+  // Defensive guard: prevent infinite forwarding loops. See handleServerActionRscRequest.
+  if (options.request.headers.get(ACTION_FORWARDED_HEADER)) {
+    return createActionNotFoundResponse(null, {
+      clearRequestContext: options.clearRequestContext,
+      getAndClearPendingCookies: options.getAndClearPendingCookies,
+    });
   }
 
   const csrfResponse = validateCsrfOrigin(options.request, options.allowedOrigins);
@@ -376,7 +446,7 @@ export async function handleProgressiveServerActionRequest(
   const contentLength = parseInt(options.request.headers.get("content-length") || "0", 10);
   if (contentLength > options.maxActionBodySize) {
     options.clearRequestContext();
-    return new Response("Payload Too Large", { status: 413 });
+    return payloadTooLargeResponse();
   }
 
   try {
@@ -392,7 +462,7 @@ export async function handleProgressiveServerActionRequest(
     } catch (error) {
       if (isRequestBodyTooLarge(error)) {
         options.clearRequestContext();
-        return new Response("Payload Too Large", { status: 413 });
+        return payloadTooLargeResponse();
       }
       throw error;
     }
@@ -404,38 +474,67 @@ export async function handleProgressiveServerActionRequest(
     }
 
     const action = await options.decodeAction(body);
-    if (typeof action !== "function") {
+    if (!isAppServerActionFunction(action)) {
       return null;
     }
 
-    let actionControlResponse: ActionControlResponse | null = null;
+    let actionRedirect: AppServerActionRedirect | null = null;
+    let actionError: unknown = undefined;
+    let actionFailed = false;
+    let actionResult: unknown;
     const previousHeadersPhase = options.setHeadersAccessPhase("action");
     try {
-      await action();
+      actionResult = await action();
     } catch (error) {
-      actionControlResponse = getActionControlResponse(error);
-      if (!actionControlResponse) {
-        throw error;
+      actionRedirect = getActionRedirect(error);
+      if (!actionRedirect) {
+        actionError = error;
+        actionFailed = true;
+        const isControlFlow =
+          getActionHttpFallbackStatus(error) !== null || isServerActionNotFoundError(error, null);
+        if (!isControlFlow) {
+          console.error("[vinext] Server action error:", error);
+          options.reportRequestError(
+            normalizeError(error),
+            {
+              path: options.cleanPathname,
+              method: options.request.method,
+              headers: Object.fromEntries(options.request.headers.entries()),
+            },
+            { routerKind: "App Router", routePath: options.cleanPathname, routeType: "action" },
+          );
+        }
       }
     } finally {
       options.setHeadersAccessPhase(previousHeadersPhase);
     }
 
-    if (!actionControlResponse) {
-      // Next.js decodes form state and re-renders after a successful MPA action.
-      // vinext currently supports the redirect/error status cases; successful
-      // non-redirect actions intentionally fall through to the page render.
-      return null;
+    if (!actionRedirect) {
+      getAndClearActionRevalidationKind();
+      if (actionFailed) {
+        return { kind: "form-state", formState: null, actionError, actionFailed };
+      }
+
+      const formState = await options.decodeFormState(actionResult, body);
+      return { kind: "form-state", formState: formState ?? null };
     }
 
     const actionPendingCookies = options.getAndClearPendingCookies();
     const actionDraftCookie = options.getDraftModeCookieHeader();
+    const actionRevalidationKind = resolveActionRevalidationKind(
+      actionPendingCookies.length > 0 || Boolean(actionDraftCookie),
+    );
     options.clearRequestContext();
 
     const headers = new Headers();
-    if (actionControlResponse.kind === "redirect") {
-      headers.set("Location", new URL(actionControlResponse.url, options.request.url).toString());
-    }
+    // Prefix the configured basePath onto the redirect target before it
+    // becomes an absolute Location URL. Mirrors Next.js, which threads
+    // basePath through `addPathPrefix(...)` for server-action redirects.
+    const prefixedRedirectUrl = applyActionRedirectBasePath(
+      actionRedirect.url,
+      options.basePath ?? "",
+    );
+    headers.set("Location", new URL(prefixedRedirectUrl, options.request.url).toString());
     mergeMiddlewareResponseHeaders(headers, options.middlewareHeaders);
     for (const cookie of actionPendingCookies) {
       headers.append("Set-Cookie", cookie);
@@ -443,9 +542,10 @@ export async function handleProgressiveServerActionRequest(
     if (actionDraftCookie) {
       headers.append("Set-Cookie", actionDraftCookie);
     }
+    setActionRevalidatedHeader(headers, actionRevalidationKind);
 
     return new Response(null, {
-      status: actionControlResponse.kind === "redirect" ? 303 : actionControlResponse.statusCode,
+      status: 303,
       headers,
     });
   } catch (error) {
@@ -456,11 +556,9 @@ export async function handleProgressiveServerActionRequest(
       });
     }
 
+    getAndClearActionRevalidationKind();
     options.getAndClearPendingCookies();
-    // Next.js rethrows generic MPA action errors into its page render path.
-    // vinext does not yet implement that form-state render path, so unexpected
-    // action failures remain request failures here.
-    console.error("[vinext] Server action error:", error);
+    console.error("[vinext] Server action payload parsing error:", error);
     options.reportRequestError(
       normalizeError(error),
       {
@@ -471,11 +569,10 @@ export async function handleProgressiveServerActionRequest(
       { routerKind: "App Router", routePath: options.cleanPathname, routeType: "action" },
     );
     options.clearRequestContext();
-    return new Response(
+    return internalServerErrorResponse(
       process.env.NODE_ENV === "production"
-        ? "Internal Server Error"
-        : "Server action failed: " + getServerActionFailureMessage(error),
-      { status: 500 },
+        ? undefined
+        : "Server action parsing failed: " + getServerActionFailureMessage(error),
     );
   }
 }
@@ -499,13 +596,24 @@ export async function handleServerActionRscRequest<
     return null;
   }
 
+  // Defensive guard: if this request has already been forwarded between workers,
+  // do not attempt to process it again. Prevents infinite forwarding loops when
+  // middleware rewrites action POSTs. Matches Next.js behavior:
+  // https://github.com/vercel/next.js/commit/20892dd44e1321c13f755f051e48c3cadd75204b
+  if (options.request.headers.get(ACTION_FORWARDED_HEADER)) {
+    return createActionNotFoundResponse(options.actionId, {
+      clearRequestContext: options.clearRequestContext,
+      getAndClearPendingCookies: options.getAndClearPendingCookies,
+    });
+  }
+
   const csrfResponse = validateCsrfOrigin(options.request, options.allowedOrigins);
   if (csrfResponse) return csrfResponse;
 
   const contentLength = parseInt(options.request.headers.get("content-length") || "0", 10);
   if (contentLength > options.maxActionBodySize) {
     options.clearRequestContext();
-    return new Response("Payload Too Large", { status: 413 });
+    return payloadTooLargeResponse();
   }
 
   try {
@@ -517,7 +625,7 @@ export async function handleServerActionRscRequest<
     } catch (error) {
       if (isRequestBodyTooLarge(error)) {
         options.clearRequestContext();
-        return new Response("Payload Too Large", { status: 413 });
+        return payloadTooLargeResponse();
       }
       throw error;
     }
@@ -553,20 +661,26 @@ export async function handleServerActionRscRequest<
     const args = await options.decodeReply(body, { temporaryReferences });
     let returnValue: AppServerActionReturnValue;
     let actionRedirect: AppServerActionRedirect | null = null;
+    let actionStatus = 200;
     const previousHeadersPhase = options.setHeadersAccessPhase("action");
     try {
       try {
+        validateServerActionArgs(args);
         const data = await action.apply(null, args);
         returnValue = { ok: true, data };
       } catch (error) {
         actionRedirect = getActionRedirect(error);
         if (actionRedirect) {
           returnValue = { ok: true, data: undefined };
-        } else if (isActionHttpFallback(error)) {
-          returnValue = { ok: false, data: error };
         } else {
-          console.error("[vinext] Server action error:", error);
-          returnValue = { ok: false, data: options.sanitizeErrorForClient(error) };
+          const httpFallbackStatus = getActionHttpFallbackStatus(error);
+          if (httpFallbackStatus !== null) {
+            actionStatus = httpFallbackStatus;
+            returnValue = { ok: false, data: error };
+          } else {
+            console.error("[vinext] Server action error:", error);
+            returnValue = { ok: false, data: options.sanitizeErrorForClient(error) };
+          }
         }
       }
     } finally {
@@ -576,20 +690,65 @@ export async function handleServerActionRscRequest<
     if (actionRedirect) {
       const actionPendingCookies = options.getAndClearPendingCookies();
       const actionDraftCookie = options.getDraftModeCookieHeader();
+      const actionRevalidationKind = resolveActionRevalidationKind(
+        actionPendingCookies.length > 0 || Boolean(actionDraftCookie),
+      );
       options.clearRequestContext();
       const redirectHeaders = new Headers({
-        "Content-Type": "text/x-component; charset=utf-8",
-        Vary: "RSC, Accept",
+        "Content-Type": VINEXT_RSC_CONTENT_TYPE,
+        Vary: VINEXT_RSC_VARY_HEADER,
       });
       mergeMiddlewareResponseHeaders(redirectHeaders, options.middlewareHeaders);
-      redirectHeaders.set("x-action-redirect", actionRedirect.url);
-      redirectHeaders.set("x-action-redirect-type", actionRedirect.type);
-      redirectHeaders.set("x-action-redirect-status", String(actionRedirect.status));
+      applyRscCompatibilityIdHeader(redirectHeaders);
+      // Prefix basePath onto the redirect target. The client-side handler in
+      // app-browser-entry reads ACTION_REDIRECT_HEADER and calls
+      // window.location.assign/replace verbatim, so the value must already
+      // be a basePath-prefixed URL.
+      redirectHeaders.set(
+        ACTION_REDIRECT_HEADER,
+        applyActionRedirectBasePath(actionRedirect.url, options.basePath ?? ""),
+      );
+      redirectHeaders.set(ACTION_REDIRECT_TYPE_HEADER, actionRedirect.type);
+      redirectHeaders.set(ACTION_REDIRECT_STATUS_HEADER, String(actionRedirect.status));
       for (const cookie of actionPendingCookies) {
         redirectHeaders.append("Set-Cookie", cookie);
       }
       if (actionDraftCookie) redirectHeaders.append("Set-Cookie", actionDraftCookie);
+      setActionRevalidatedHeader(redirectHeaders, actionRevalidationKind);
       return new Response("", { status: 200, headers: redirectHeaders });
+    }
+
+    const actionPendingCookies = options.getAndClearPendingCookies();
+    const actionDraftCookie = options.getDraftModeCookieHeader();
+    const actionRevalidationKind = resolveActionRevalidationKind(
+      actionPendingCookies.length > 0 || Boolean(actionDraftCookie),
+    );
+
+    const shouldSkipPageRendering = actionRevalidationKind === ACTION_DID_NOT_REVALIDATE;
+    if (shouldSkipPageRendering) {
+      const onRenderError = options.createRscOnErrorHandler(
+        options.request,
+        options.cleanPathname,
+        options.cleanPathname,
+      );
+      const rscStream = await options.renderToReadableStream(
+        { returnValue },
+        { temporaryReferences, onError: onRenderError },
+      );
+
+      options.clearRequestContext();
+
+      const actionHeaders = new Headers({
+        "Content-Type": VINEXT_RSC_CONTENT_TYPE,
+        Vary: VINEXT_RSC_VARY_HEADER,
+      });
+      mergeMiddlewareResponseHeaders(actionHeaders, options.middlewareHeaders);
+      applyRscCompatibilityIdHeader(actionHeaders);
+
+      return new Response(rscStream, {
+        status: options.middlewareStatus ?? actionStatus,
+        headers: actionHeaders,
+      });
     }
 
     const match = options.matchRoute(options.cleanPathname);
@@ -625,6 +784,7 @@ export async function handleServerActionRscRequest<
         request: options.request,
         route: actionRerenderTarget.route,
         searchParams: options.searchParams,
+        renderMode: APP_RSC_RENDER_MODE_ACTION_RERENDER_PRESERVE_UI,
       });
       errorPattern = actionRerenderTarget.route.pattern;
     } else {
@@ -642,16 +802,15 @@ export async function handleServerActionRscRequest<
       { temporaryReferences, onError: onRenderError },
     );
 
-    const actionPendingCookies = options.getAndClearPendingCookies();
-    const actionDraftCookie = options.getDraftModeCookieHeader();
-
     const actionHeaders = new Headers({
-      "Content-Type": "text/x-component; charset=utf-8",
-      Vary: "RSC, Accept",
+      "Content-Type": VINEXT_RSC_CONTENT_TYPE,
+      Vary: VINEXT_RSC_VARY_HEADER,
     });
     mergeMiddlewareResponseHeaders(actionHeaders, options.middlewareHeaders);
+    applyRscCompatibilityIdHeader(actionHeaders);
+    setActionRevalidatedHeader(actionHeaders, actionRevalidationKind);
     const actionResponse = new Response(rscStream, {
-      status: options.middlewareStatus ?? 200,
+      status: options.middlewareStatus ?? actionStatus,
       headers: actionHeaders,
     });
     if (actionPendingCookies.length > 0 || actionDraftCookie) {
@@ -662,6 +821,7 @@ export async function handleServerActionRscRequest<
     }
     return actionResponse;
   } catch (error) {
+    getAndClearActionRevalidationKind();
     return createServerActionErrorResponse(error, {
       cleanPathname: options.cleanPathname,
       clearRequestContext: options.clearRequestContext,

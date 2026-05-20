@@ -17,6 +17,7 @@ import {
 import { createValidFileMatcher } from "../routing/file-matcher.js";
 import { type ResolvedNextConfig } from "../config/next-config.js";
 import { findFileWithExts } from "./pages-entry-helpers.js";
+import { normalizePathSeparators } from "./runtime-entry-module.js";
 
 export async function generateClientEntry(
   pagesDir: string,
@@ -32,7 +33,7 @@ export async function generateClientEntry(
   // Keys must use Next.js bracket format (e.g. "/user/[id]") to match
   // __NEXT_DATA__.page which is set via patternToNextFormat() during SSR.
   const loaderEntries = pageRoutes.map((r: Route) => {
-    const absPath = r.filePath.replace(/\\/g, "/");
+    const absPath = normalizePathSeparators(r.filePath);
     const nextFormatPattern = pagesPatternToNextFormat(r.pattern);
     // JSON.stringify safely escapes quotes, backslashes, and special chars in
     // both the route pattern and the absolute file path.
@@ -40,16 +41,13 @@ export async function generateClientEntry(
     return `  ${JSON.stringify(nextFormatPattern)}: () => import(${JSON.stringify(absPath)})`;
   });
 
-  const appFileBase = appFilePath?.replace(/\\/g, "/");
+  const appFileBase = appFilePath ? normalizePathSeparators(appFilePath) : undefined;
 
   return `
 import "vinext/instrumentation-client";
 import React from "react";
 import { hydrateRoot } from "react-dom/client";
-// Eagerly import the router shim so its module-level popstate listener is
-// registered.  Without this, browser back/forward buttons do nothing because
-// navigateClient() is never invoked on history changes.
-import "next/router";
+import { installPagesRouterRuntime } from "vinext/pages-router-runtime";
 
 const pageLoaders = {
 ${loaderEntries.join(",\n")}
@@ -94,7 +92,7 @@ async function hydrate() {
   `
   }
 
-  // Wrap with RouterContext.Provider so next/compat/router works during hydration
+  // Wrap with RouterContext.Provider so next/router and next/compat/router work during hydration.
   const { wrapWithRouterContext } = await import("next/router");
   element = wrapWithRouterContext(element);
 
@@ -106,6 +104,7 @@ async function hydrate() {
 
   const root = hydrateRoot(container, element);
   window.__VINEXT_ROOT__ = root;
+  installPagesRouterRuntime();
   window.__VINEXT_HYDRATED_AT = performance.now();
 }
 

@@ -314,7 +314,7 @@ function setupFakeReact(dir: string, version: string): void {
 describe("getReactUpgradeDeps", () => {
   it("returns react@latest + react-dom@latest when React is below the RSDW security floor", () => {
     setupProject(tmpDir, { router: "app" });
-    setupFakeReact(tmpDir, "19.2.4");
+    setupFakeReact(tmpDir, "19.2.5");
 
     const deps = getReactUpgradeDeps(tmpDir);
     expect(deps).toEqual(["react@latest", "react-dom@latest"]);
@@ -322,7 +322,7 @@ describe("getReactUpgradeDeps", () => {
 
   it("returns empty array when React is new enough", () => {
     setupProject(tmpDir, { router: "app" });
-    setupFakeReact(tmpDir, "19.2.5");
+    setupFakeReact(tmpDir, "19.2.6");
 
     const deps = getReactUpgradeDeps(tmpDir);
     expect(deps).toEqual([]);
@@ -604,7 +604,7 @@ describe("init — dependency installation", () => {
 
   it("does not upgrade React when version is already compatible", async () => {
     setupProject(tmpDir, { router: "app" });
-    setupFakeReact(tmpDir, "19.2.5");
+    setupFakeReact(tmpDir, "19.2.6");
 
     const { execCalls } = await runInit(tmpDir);
 

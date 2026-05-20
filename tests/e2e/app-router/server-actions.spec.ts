@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { RSC_FORM_STATE_GLOBAL } from "../../../packages/vinext/src/server/app-browser-hydration";
 import { waitForAppRouterHydration } from "../helpers";
 
 const BASE = "http://localhost:4174";
@@ -149,6 +150,28 @@ test.describe("useActionState", () => {
     await expect(page.locator("#count")).toHaveText("Count: 0");
   });
 
+  // Ported from Next.js' progressive action form-state path:
+  // packages/next/src/server/app-render/action-handler.ts decodes form state
+  // and packages/next/src/server/app-render/use-flight-response.tsx serializes
+  // it for hydrateRoot().
+  test("useActionState preserves returned state for progressive form submissions", async ({
+    browser,
+  }) => {
+    const context = await browser.newContext({ javaScriptEnabled: false });
+    const page = await context.newPage();
+
+    try {
+      await page.goto(`${BASE}/action-state-test`);
+      await page.click('button:has-text("Increment")');
+
+      await expect(page.locator("#count")).toHaveText("Count: 1");
+      const html = await page.content();
+      expect(html).toContain(RSC_FORM_STATE_GLOBAL);
+    } finally {
+      await context.close();
+    }
+  });
+
   test("useActionState counter increments via server action", async ({ page }) => {
     await page.goto(`${BASE}/action-state-test`);
     await expect(page.locator("h1")).toHaveText("useActionState Test");
@@ -208,5 +231,51 @@ test.describe("useActionState", () => {
     // Should navigate to /action-state-test without crashing
     await expect(page).toHaveURL(/\/action-state-test$/);
     await expect(page.locator("h1")).toHaveText("useActionState Test");
+  });
+});
+
+test.describe("Server action forwarding loop guard", () => {
+  test("middleware rewrite of action POST does not hang (no forwarding loop)", async ({ page }) => {
+    await page.goto(`${BASE}/nextjs-compat/action-forward-loop`);
+    await expect(page.locator("h1")).toHaveText("Action Forward Loop Test");
+    await waitForAppRouterHydration(page);
+
+    // Click the action button. Middleware rewrites POST to rewrite-target page,
+    // but vinext's single-worker bundle still finds the action locally.
+    // The action should succeed without any infinite loop / timeout.
+    await page.click("#run-action");
+
+    // Wait for action result to appear (or the boundary text if the action fails)
+    await expect(async () => {
+      const text = await page.locator("#action-result").textContent();
+      expect(text).toContain("action-ok");
+    }).toPass({ timeout: 10_000 });
+  });
+
+  // This tests the pre-existing "unknown action ID" path, not the new
+  // x-action-forwarded guard. In vinext's single-worker model the action is
+  // found locally, so the guard cannot be triggered organically via E2E.
+  test("stale action ID returns 404 with x-nextjs-action-not-found header", async ({ page }) => {
+    await page.goto(`${BASE}/nextjs-compat/action-forward-loop`);
+    await waitForAppRouterHydration(page);
+
+    const response = await page.evaluate(async (base) => {
+      const res = await fetch(`${base}/nextjs-compat/action-forward-loop`, {
+        method: "POST",
+        headers: {
+          "x-rsc-action": "stale-action-id",
+          "content-type": "text/plain;charset=UTF-8",
+          origin: base,
+        },
+        body: "encoded-flight-body",
+      });
+      return {
+        status: res.status,
+        hasNotFoundHeader: res.headers.get("x-nextjs-action-not-found") === "1",
+      };
+    }, BASE);
+
+    expect(response.status).toBe(404);
+    expect(response.hasNotFoundHeader).toBe(true);
   });
 });

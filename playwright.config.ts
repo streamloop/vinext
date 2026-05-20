@@ -1,7 +1,20 @@
 import { defineConfig } from "@playwright/test";
 
+const appRouterBrowserSpecificTests = "**/app-router/**/*.browser.spec.ts";
+const appRouterServer = {
+  command: "npx vp dev --port 4174",
+  cwd: "./tests/fixtures/app-basic",
+  port: 4174,
+  reuseExistingServer: !process.env.CI,
+  timeout: 30_000,
+};
+
 /**
- * Each project maps to a single webServer. When PLAYWRIGHT_PROJECT is set
+ * Each project maps to a single webServer. Some browser-specific projects share
+ * a server with the base project, and shared servers are de-duped by port.
+ * Browser-specific production tests may opt out with server: null when they own
+ * their build/server lifecycle inside the test fixture.
+ * When PLAYWRIGHT_PROJECT is set
  * (e.g. in CI matrix jobs), only that project and its server are configured,
  * so each CI runner only starts the one server it needs.
  */
@@ -20,14 +33,24 @@ const projectServers = {
   "app-router": {
     testDir: "./tests/e2e",
     testMatch: ["**/app-router/**/*.spec.ts", "**/og-image.spec.ts"],
+    testIgnore: appRouterBrowserSpecificTests,
     use: { baseURL: "http://localhost:4174" },
-    server: {
-      command: "npx vp dev --port 4174",
-      cwd: "./tests/fixtures/app-basic",
-      port: 4174,
-      reuseExistingServer: !process.env.CI,
-      timeout: 30_000,
+    server: appRouterServer,
+  },
+  "app-router-chrome-browser-specific": {
+    testDir: "./tests/e2e",
+    testMatch: [appRouterBrowserSpecificTests],
+    use: {
+      browserName: "chromium" as const,
+      channel: "chrome" as const,
     },
+    server: null,
+  },
+  "app-router-webkit-browser-specific": {
+    testDir: "./tests/e2e",
+    testMatch: [appRouterBrowserSpecificTests],
+    use: { browserName: "webkit" as const },
+    server: null,
   },
   "cloudflare-pages-router": {
     testDir: "./tests/e2e",
@@ -172,7 +195,7 @@ export default defineConfig({
   reporter: process.env.CI ? [["list"], ["github"]] : [["list"]],
   use: {
     headless: true,
-    // Use chromium only — fast and sufficient for our tests
+    // Most projects use Chromium by default. Browser-specific projects override this.
     browserName: "chromium",
   },
   projects: activeProjects.map((name) => {
@@ -181,8 +204,19 @@ export default defineConfig({
       name,
       testDir: p.testDir,
       ...("testMatch" in p ? { testMatch: p.testMatch } : {}),
+      ...("testIgnore" in p ? { testIgnore: p.testIgnore } : {}),
       ...("use" in p ? { use: p.use } : {}),
     };
   }),
-  webServer: activeProjects.map((name) => projectServers[name].server),
+  webServer: [
+    ...new Map(
+      activeProjects
+        .map((name) => projectServers[name].server)
+        .filter(
+          (server): server is NonNullable<(typeof projectServers)[ProjectName]["server"]> =>
+            server !== null,
+        )
+        .map((server) => [server.port, server]),
+    ).values(),
+  ],
 });

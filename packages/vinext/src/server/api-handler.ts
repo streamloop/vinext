@@ -7,12 +7,15 @@
  * The req/res objects are Node.js IncomingMessage/ServerResponse with
  * Next.js extensions: req.query, req.body, res.json(), res.status(), etc.
  */
+import "./server-globals.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { decode as decodeQueryString } from "node:querystring";
+import { Buffer } from "node:buffer";
 import { type Route, matchRoute } from "../routing/pages-router.js";
 import { reportRequestError, importModule, type ModuleImporter } from "./instrumentation.js";
-import { addQueryParam } from "../utils/query.js";
+import { mergeRouteParamsIntoQuery, parseQueryString } from "../utils/query.js";
 import { PagesBodyParseError, getMediaType, isJsonMediaType } from "./pages-media-type.js";
+import { isEdgeApiRuntime } from "./edge-api-runtime.js";
 
 /**
  * Extend the Node.js request with Next.js-style helpers.
@@ -32,6 +35,13 @@ type NextApiResponse = {
   send(data: unknown): void;
   redirect(statusOrUrl: number | string, url?: string): void;
 } & ServerResponse;
+
+type EdgeApiRouteModule = {
+  config?: {
+    runtime?: string;
+  };
+  default: (request: Request) => Response | Promise<Response>;
+};
 
 /**
  * Maximum request body size (1 MB). Matches Next.js default bodyParser sizeLimit.
@@ -110,6 +120,110 @@ function parseCookies(req: IncomingMessage): Record<string, string> {
   return cookies;
 }
 
+function isEdgeApiRouteModule(module: Record<string, unknown>): module is EdgeApiRouteModule {
+  const config = module.config;
+  if (!config || typeof config !== "object") return false;
+  const runtime = "runtime" in config ? config.runtime : undefined;
+  return (
+    typeof module.default === "function" && typeof runtime === "string" && isEdgeApiRuntime(runtime)
+  );
+}
+
+function readEdgeRequestBody(req: IncomingMessage): ReadableStream<Uint8Array> | undefined {
+  if (req.method === "GET" || req.method === "HEAD") return undefined;
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      req.on("data", (chunk: Buffer | string) => {
+        controller.enqueue(typeof chunk === "string" ? Buffer.from(chunk) : new Uint8Array(chunk));
+      });
+      req.on("end", () => controller.close());
+      req.on("error", (error) => controller.error(error));
+    },
+  });
+}
+
+function createEdgeApiRequest(req: IncomingMessage, url: string): Request {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (Array.isArray(value)) {
+      for (const item of value) headers.append(name, item);
+    } else if (value !== undefined) {
+      headers.set(name, value);
+    }
+  }
+
+  const rawProto = headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
+  const forwardedProto = rawProto === "https" || rawProto === "http" ? rawProto : "http";
+  const host = headers.get("host") ?? "localhost";
+  const requestUrl = new URL(url, `${forwardedProto}://${host}`);
+  const body = readEdgeRequestBody(req);
+
+  const init: RequestInit & { duplex?: "half" } = {
+    headers,
+    method: req.method,
+  };
+
+  if (body) {
+    init.body = body;
+    init.duplex = "half";
+  }
+
+  return new Request(requestUrl, init);
+}
+
+function waitForWritableDrain(res: ServerResponse): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      res.off("drain", onDrain);
+      res.off("error", onError);
+      res.off("close", onClose);
+    };
+    const onDrain = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new Error("Response closed before writable drain"));
+    };
+    res.once("drain", onDrain);
+    res.once("error", onError);
+    res.once("close", onClose);
+  });
+}
+
+async function writeEdgeApiResponseBody(
+  res: ServerResponse,
+  body: ReadableStream<Uint8Array> | null,
+): Promise<void> {
+  if (!body) {
+    res.end();
+    return;
+  }
+
+  const reader = body.getReader();
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      if (result.value.byteLength === 0) continue;
+      if (!res.write(Buffer.from(result.value))) {
+        await waitForWritableDrain(res);
+      }
+    }
+    res.end();
+  } catch (error) {
+    res.destroy(error instanceof Error ? error : new Error(String(error)));
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 /**
  * Enhance a Node.js req/res pair with Next.js API route helpers.
  */
@@ -119,52 +233,53 @@ function enhanceApiObjects(
   query: Record<string, string | string[]>,
   body: unknown,
 ): { apiReq: NextApiRequest; apiRes: NextApiResponse } {
-  const apiReq = req as NextApiRequest;
-  apiReq.query = query;
-  apiReq.body = body;
-  apiReq.cookies = parseCookies(req);
+  const apiReq: NextApiRequest = Object.assign(req, {
+    body,
+    cookies: parseCookies(req),
+    query,
+  });
 
-  const apiRes = res as NextApiResponse;
+  const apiRes: NextApiResponse = Object.assign(res, {
+    status(this: NextApiResponse, code: number) {
+      this.statusCode = code;
+      return this;
+    },
 
-  apiRes.status = function (code: number) {
-    this.statusCode = code;
-    return this;
-  };
-
-  apiRes.json = function (data: unknown) {
-    this.setHeader("Content-Type", "application/json");
-    this.end(JSON.stringify(data));
-  };
-
-  apiRes.send = function (data: unknown) {
-    if (Buffer.isBuffer(data)) {
-      if (!this.getHeader("Content-Type")) {
-        this.setHeader("Content-Type", "application/octet-stream");
-      }
-      this.setHeader("Content-Length", String(data.length));
-      this.end(data);
-      return;
-    }
-
-    if (typeof data === "object" && data !== null) {
+    json(this: NextApiResponse, data: unknown) {
       this.setHeader("Content-Type", "application/json");
       this.end(JSON.stringify(data));
-    } else {
-      if (!this.getHeader("Content-Type")) {
-        this.setHeader("Content-Type", "text/plain");
-      }
-      this.end(String(data));
-    }
-  };
+    },
 
-  apiRes.redirect = function (statusOrUrl: number | string, url?: string) {
-    if (typeof statusOrUrl === "string") {
-      this.writeHead(307, { Location: statusOrUrl });
-    } else {
-      this.writeHead(statusOrUrl, { Location: url! });
-    }
-    this.end();
-  };
+    send(this: NextApiResponse, data: unknown) {
+      if (Buffer.isBuffer(data)) {
+        if (!this.getHeader("Content-Type")) {
+          this.setHeader("Content-Type", "application/octet-stream");
+        }
+        this.setHeader("Content-Length", String(data.length));
+        this.end(data);
+        return;
+      }
+
+      if (typeof data === "object" && data !== null) {
+        this.setHeader("Content-Type", "application/json");
+        this.end(JSON.stringify(data));
+      } else {
+        if (!this.getHeader("Content-Type")) {
+          this.setHeader("Content-Type", "text/plain");
+        }
+        this.end(String(data));
+      }
+    },
+
+    redirect(this: NextApiResponse, statusOrUrl: number | string, url?: string) {
+      if (typeof statusOrUrl === "string") {
+        this.writeHead(307, { Location: statusOrUrl });
+      } else {
+        this.writeHead(statusOrUrl, { Location: url ?? "" });
+      }
+      this.end();
+    },
+  });
 
   return { apiReq, apiRes };
 }
@@ -188,8 +303,26 @@ export async function handleApiRoute(
   try {
     // Load the API route module through the ModuleRunner
     const apiModule = await importModule(runner, route.filePath);
-    const handler = apiModule.default;
+    if (isEdgeApiRouteModule(apiModule)) {
+      const response = await apiModule.default(createEdgeApiRequest(req, url));
+      if (!(response instanceof Response)) {
+        throw new Error("Edge API route did not return a Response");
+      }
 
+      res.statusCode = response.status;
+      res.statusMessage = response.statusText;
+      const setCookieHeaders = response.headers.getSetCookie();
+      response.headers.forEach((value, name) => {
+        if (name !== "set-cookie") res.setHeader(name, value);
+      });
+      if (setCookieHeaders.length) {
+        res.setHeader("set-cookie", setCookieHeaders);
+      }
+      await writeEdgeApiResponseBody(res, response.body);
+      return true;
+    }
+
+    const handler = apiModule.default;
     if (typeof handler !== "function") {
       console.error(`[vinext] API route ${route.filePath} does not export a default function`);
       res.statusCode = 500;
@@ -197,15 +330,9 @@ export async function handleApiRoute(
       return true;
     }
 
-    // Parse query from URL + route params
-    const query: Record<string, string | string[]> = { ...params };
-    const queryString = url.split("?")[1];
-    if (queryString) {
-      const searchParams = new URLSearchParams(queryString);
-      for (const [key, value] of searchParams) {
-        addQueryParam(query, key, value);
-      }
-    }
+    // Parse query from URL + route params. Path params win over same-key search
+    // params so a query string cannot change the dynamic route value.
+    const query = mergeRouteParamsIntoQuery(parseQueryString(url), params);
 
     // Parse body
     const body = await parseBody(req);

@@ -11,8 +11,10 @@
  * ViteDevServer.
  */
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { PassThrough } from "node:stream";
 import http from "node:http";
+import type { AddressInfo } from "node:net";
 import { handleApiRoute } from "../packages/vinext/src/server/api-handler.js";
 import {
   reportRequestError,
@@ -80,18 +82,20 @@ function mockReq(
  */
 function mockRes(): http.ServerResponse & {
   _body: string | Buffer;
-  _headers: Record<string, string>;
+  _headers: Record<string, string | string[]>;
   _statusCode: number;
   _ended: boolean;
+  _writes: Buffer[];
 } {
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string | string[]> = {};
   const res = {
     statusCode: 200,
     _body: "",
     _headers: headers,
     _statusCode: 200,
     _ended: false,
-    setHeader(name: string, value: string) {
+    _writes: [] as Buffer[],
+    setHeader(name: string, value: string | string[]) {
       headers[name.toLowerCase()] = value;
     },
     getHeader(name: string) {
@@ -106,18 +110,38 @@ function mockRes(): http.ServerResponse & {
         }
       }
     },
+    write(data: string | Buffer | Uint8Array) {
+      const chunk =
+        typeof data === "string"
+          ? Buffer.from(data)
+          : Buffer.isBuffer(data)
+            ? data
+            : Buffer.from(data);
+      res._writes.push(chunk);
+      res._body = Buffer.isBuffer(res._body)
+        ? Buffer.concat([res._body, chunk])
+        : res._body
+          ? Buffer.concat([Buffer.from(res._body), chunk])
+          : chunk;
+      return true;
+    },
     end(data?: string | Buffer) {
       if (data !== undefined) {
-        res._body = data;
+        if (res._writes.length) {
+          res.write(data);
+        } else {
+          res._body = data;
+        }
       }
       res._ended = true;
       res._statusCode = res.statusCode;
     },
   } as unknown as http.ServerResponse & {
     _body: string | Buffer;
-    _headers: Record<string, string>;
+    _headers: Record<string, string | string[]>;
     _statusCode: number;
     _ended: boolean;
+    _writes: Buffer[];
   };
   return res;
 }
@@ -764,6 +788,231 @@ describe("handleApiRoute", () => {
       await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
 
       expect(capturedQuery).toEqual({});
+    });
+  });
+
+  // ── Edge runtime ───────────────────────────────────────────────────
+
+  describe("edge runtime", () => {
+    it("calls edge API route handlers with a Fetch Request and writes their Response", async () => {
+      // Ported from Next.js: test/e2e/edge-async-local-storage/index.test.ts
+      // https://github.com/vercel/next.js/blob/canary/test/e2e/edge-async-local-storage/index.test.ts
+      const storage = new AsyncLocalStorage<{ id: string }>();
+      const handler = vi.fn((request: Request) => {
+        const id = request.headers.get("req-id") ?? "";
+        return storage.run({ id }, async () => {
+          await Promise.resolve();
+          return Response.json(storage.getStore());
+        });
+      });
+      const server = mockServer({
+        config: { runtime: "edge" },
+        default: handler,
+      });
+      const req = mockReq("GET", "/api/users", undefined, {
+        host: "example.com",
+        "req-id": "req-42",
+      });
+      const res = mockRes();
+
+      const handled = await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
+
+      expect(handled).toBe(true);
+      expect(handler).toHaveBeenCalledOnce();
+      expect(res._statusCode).toBe(200);
+      expect(res._headers["content-type"]).toBe("application/json");
+      expect(res._body.toString()).toBe(JSON.stringify({ id: "req-42" }));
+    });
+
+    it("uses the first x-forwarded-proto value for edge API request URLs", async () => {
+      let capturedUrl = "";
+      const handler = vi.fn((request: Request) => {
+        capturedUrl = request.url;
+        return Response.json({ ok: true });
+      });
+      const server = mockServer({
+        config: { runtime: "edge" },
+        default: handler,
+      });
+      const req = mockReq("GET", "/api/users", undefined, {
+        host: "example.com",
+        "x-forwarded-proto": "https, http",
+      });
+      const res = mockRes();
+
+      await handleApiRoute(server, req, res, "/api/users?name=alice", [route("/api/users")]);
+
+      expect(capturedUrl).toBe("https://example.com/api/users?name=alice");
+    });
+
+    it("falls back to http for unsupported x-forwarded-proto values", async () => {
+      let capturedUrl = "";
+      const handler = vi.fn((request: Request) => {
+        capturedUrl = request.url;
+        return Response.json({ ok: true });
+      });
+      const server = mockServer({
+        config: { runtime: "edge" },
+        default: handler,
+      });
+      const req = mockReq("GET", "/api/users", undefined, {
+        host: "example.com",
+        "x-forwarded-proto": "ftp, https",
+      });
+      const res = mockRes();
+
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
+
+      expect(capturedUrl).toBe("http://example.com/api/users");
+    });
+
+    it("preserves multiple Set-Cookie headers from edge API responses", async () => {
+      const handler = vi.fn(() => {
+        const headers = new Headers();
+        headers.append("set-cookie", "one=1; Path=/");
+        headers.append("set-cookie", "two=2; Path=/");
+        return new Response("ok", { headers });
+      });
+      const server = mockServer({
+        config: { runtime: "edge" },
+        default: handler,
+      });
+      const req = mockReq("GET", "/api/users", undefined, {
+        host: "example.com",
+      });
+      const res = mockRes();
+
+      await handleApiRoute(server, req, res, "/api/users", [route("/api/users")]);
+
+      expect(res._statusCode).toBe(200);
+      expect(res._headers["set-cookie"]).toEqual(["one=1; Path=/", "two=2; Path=/"]);
+      expect(res._body.toString()).toBe("ok");
+    });
+
+    it("streams edge API response bodies through the dev bridge", async () => {
+      let releaseSecondChunk!: () => void;
+      const secondChunkReady = new Promise<void>((resolve) => {
+        releaseSecondChunk = resolve;
+      });
+      const encoder = new TextEncoder();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode("first"));
+          void secondChunkReady.then(() => {
+            controller.enqueue(encoder.encode("-second"));
+            controller.close();
+          });
+        },
+      });
+      const handler = vi.fn(() => new Response(body));
+      const server = mockServer({
+        config: { runtime: "edge" },
+        default: handler,
+      });
+      const nodeServer = http.createServer((req, res) => {
+        handleApiRoute(server, req, res, req.url ?? "/", [route("/api/users")]).catch((error) => {
+          if (!res.headersSent) {
+            res.writeHead(500);
+            res.end(error instanceof Error ? error.message : String(error));
+            return;
+          }
+          res.destroy(error instanceof Error ? error : new Error(String(error)));
+        });
+      });
+
+      try {
+        await new Promise<void>((resolve) => nodeServer.listen(0, resolve));
+        const address = nodeServer.address() as AddressInfo;
+        const response = await fetch(`http://127.0.0.1:${address.port}/api/users`);
+        const reader = response.body?.getReader();
+        expect(reader).toBeDefined();
+        if (!reader) return;
+
+        const first = await reader.read();
+        expect(first.done).toBe(false);
+        expect(new TextDecoder().decode(first.value)).toBe("first");
+
+        releaseSecondChunk();
+        const second = await reader.read();
+        const done = await reader.read();
+
+        expect(second.done).toBe(false);
+        expect(new TextDecoder().decode(second.value)).toBe("-second");
+        expect(done.done).toBe(true);
+      } finally {
+        nodeServer.closeAllConnections();
+        await new Promise<void>((resolve, reject) => {
+          nodeServer.close((error) => (error ? reject(error) : resolve()));
+        });
+      }
+    });
+
+    it("streams edge API request bodies into the handler before the client finishes sending", async () => {
+      const decoder = new TextDecoder();
+      const handler = vi.fn(async (request: Request) => {
+        const reader = request.body?.getReader();
+        if (!reader) return new Response("missing body", { status: 400 });
+        const first = await reader.read();
+        return new Response(first.done ? "done" : decoder.decode(first.value));
+      });
+      const server = mockServer({
+        config: { runtime: "edge" },
+        default: handler,
+      });
+      const nodeServer = http.createServer((req, res) => {
+        handleApiRoute(server, req, res, req.url ?? "/", [route("/api/users")]).catch((error) => {
+          if (!res.headersSent) {
+            res.writeHead(500);
+            res.end(error instanceof Error ? error.message : String(error));
+            return;
+          }
+          res.destroy(error instanceof Error ? error : new Error(String(error)));
+        });
+      });
+
+      try {
+        await new Promise<void>((resolve) => nodeServer.listen(0, resolve));
+        const address = nodeServer.address() as AddressInfo;
+        const req = http.request({
+          headers: { "content-type": "text/plain", "transfer-encoding": "chunked" },
+          host: "127.0.0.1",
+          method: "POST",
+          path: "/api/users",
+          port: address.port,
+        });
+
+        const responseBody = await new Promise<string>((resolve, reject) => {
+          const timeout = setTimeout(
+            () => reject(new Error("Timed out waiting for streamed request body response")),
+            1000,
+          );
+          req.on("error", (error) => {
+            clearTimeout(timeout);
+            reject(error);
+          });
+          req.on("response", (response) => {
+            const chunks: Buffer[] = [];
+            response.on("data", (chunk: Buffer) => chunks.push(chunk));
+            response.on("error", (error) => {
+              clearTimeout(timeout);
+              reject(error);
+            });
+            response.on("end", () => {
+              clearTimeout(timeout);
+              resolve(Buffer.concat(chunks).toString("utf-8"));
+            });
+          });
+          req.write("first");
+        });
+
+        req.end("-second");
+        expect(responseBody).toBe("first");
+      } finally {
+        nodeServer.closeAllConnections();
+        await new Promise<void>((resolve, reject) => {
+          nodeServer.close((error) => (error ? reject(error) : resolve()));
+        });
+      }
     });
   });
 

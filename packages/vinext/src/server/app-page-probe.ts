@@ -1,3 +1,5 @@
+import { makeThenableParams } from "vinext/shims/thenable-params";
+import { collectAppPageSearchParams } from "./app-page-head.js";
 import {
   probeAppPageComponent,
   probeAppPageLayouts,
@@ -5,6 +7,40 @@ import {
   type LayoutClassificationOptions,
   type LayoutFlags,
 } from "./app-page-execution.js";
+
+/**
+ * Build a probePage() invocation for the App Router request lifecycle.
+ *
+ * The generated RSC entry calls this once per request after route matching to
+ * eagerly invoke the page component. Surfacing redirect()/notFound() throws
+ * here lets the probe lifecycle turn them into proper HTTP responses before
+ * RSC streaming begins (see `probeAppPageBeforeRender`).
+ *
+ * The helper exists to keep the generated entry thin (a single delegation
+ * call) and to make the search-params wiring directly unit-testable. A bug
+ * here previously slipped through because the entry hand-rolled the call and
+ * read a non-existent key off `collectAppPageSearchParams`'s return value
+ * (see https://github.com/cloudflare/vinext/issues/1235).
+ *
+ * Returns `null` when the route has no page component (eg. interception-only
+ * routes), matching the caller contract on `probePage`.
+ */
+export function probeAppPage(options: {
+  pageComponent: unknown;
+  asyncRouteParams: unknown;
+  searchParams: URLSearchParams | null | undefined;
+}): unknown {
+  const { pageComponent, asyncRouteParams, searchParams } = options;
+  if (typeof pageComponent !== "function") {
+    return null;
+  }
+  const { pageSearchParams } = collectAppPageSearchParams(searchParams);
+  const asyncSearchParams = makeThenableParams(pageSearchParams);
+  return (pageComponent as (props: Record<string, unknown>) => unknown)({
+    params: asyncRouteParams,
+    searchParams: asyncSearchParams,
+  });
+}
 
 type ProbeAppPageBeforeRenderResult = {
   response: Response | null;
@@ -59,10 +95,25 @@ export async function probeAppPageBeforeRender(
     }
   }
 
+  // When a route-level loading.tsx is present, the page renders inside a
+  // route-level Suspense boundary, so a thrown redirect()/notFound() during
+  // page render becomes an error inside that boundary. We can't catch it
+  // here without serializing on the page promise — which would defeat the
+  // streaming benefit of loading.tsx for slow non-redirecting pages.
+  //
+  // Recovery for the redirect/notFound case happens later in
+  // renderAppPageLifecycle: rscErrorTracker captures the digest from React's
+  // onError callback, and a short race window after shell-ready lets the
+  // lifecycle swap the response to a 307/404 before bytes are flushed.
+  // This mirrors Next.js's "until-first-byte-is-flushed" swap behavior.
+  if (options.hasLoadingBoundary) {
+    return { response: null, layoutFlags };
+  }
+
   // Server Components are functions, so we can probe the page ahead of stream
   // creation and only turn special throws into immediate responses.
   const pageResponse = await probeAppPageComponent({
-    awaitAsyncResult: !options.hasLoadingBoundary,
+    awaitAsyncResult: true,
     async onError(pageError) {
       const specialError = options.resolveSpecialError(pageError);
       if (specialError) {

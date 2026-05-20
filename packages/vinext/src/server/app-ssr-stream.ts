@@ -1,4 +1,11 @@
 import { createInlineScriptTag, safeJsonStringify } from "./html.js";
+import {
+  bytesToBase64,
+  concatUint8Arrays,
+  RSC_EMBEDDED_BINARY_CHUNK,
+  type RscEmbeddedChunk,
+} from "./app-rsc-embedded-chunks.js";
+import { NAVIGATION_RUNTIME_SYMBOL_DESCRIPTION } from "../client/navigation-runtime.js";
 
 type RscEmbedTransform = {
   flush(): string;
@@ -8,6 +15,37 @@ type RscEmbedTransform = {
 };
 
 type HtmlInsertion = string | (() => string);
+
+const NAVIGATION_RUNTIME_REFERENCE = `self[Symbol.for(${safeJsonStringify(
+  NAVIGATION_RUNTIME_SYMBOL_DESCRIPTION,
+)})]`;
+
+export function navigationRuntimeRscBootstrapExpression(): string {
+  return `((${NAVIGATION_RUNTIME_REFERENCE}??={bootstrap:{routeManifest:null},functions:{}}).bootstrap.rsc??={rsc:[]})`;
+}
+
+export function createNavigationRuntimeRscMetadataScript(
+  params: Record<string, string | string[]>,
+  nav: { pathname: string; searchParams: [string, string][] },
+): string {
+  return (
+    "Object.assign(" +
+    navigationRuntimeRscBootstrapExpression() +
+    ",{params:" +
+    safeJsonStringify(params) +
+    ",nav:" +
+    safeJsonStringify(nav) +
+    "})"
+  );
+}
+
+function createNavigationRuntimeRscChunkScript(chunk: RscEmbeddedChunk): string {
+  return navigationRuntimeRscBootstrapExpression() + ".rsc.push(" + safeJsonStringify(chunk) + ")";
+}
+
+function createNavigationRuntimeRscDoneScript(): string {
+  return navigationRuntimeRscBootstrapExpression() + ".done=true";
+}
 
 /**
  * Fix invalid preload "as" values in RSC Flight hint lines before they reach
@@ -20,15 +58,14 @@ export function fixFlightHints(text: string): string {
 
 /**
  * Create a helper that progressively embeds RSC chunks as inline <script> tags.
- * The browser entry turns the embedded text chunks back into Uint8Array data.
+ * The browser entry turns the embedded chunks back into Uint8Array data.
  */
 export function createRscEmbedTransform(
   embedStream: ReadableStream<Uint8Array>,
   scriptNonce?: string,
 ): RscEmbedTransform {
   const reader = embedStream.getReader();
-  const decoder = new TextDecoder();
-  let pendingChunks: string[] = [];
+  let pendingChunks: RscEmbeddedChunk[] = [];
   const rawChunks: Uint8Array[] = [];
   let reading = false;
 
@@ -42,11 +79,16 @@ export function createRscEmbedTransform(
         // Accumulate raw bytes BEFORE fixFlightHints so the cache stores
         // unmodified RSC data. The embed script path below applies fixes.
         rawChunks.push(result.value);
-        const text = decoder.decode(result.value, { stream: true });
-        // The RSC entry already fixes HL hints at the source. Keep this second
-        // pass as defense in depth for any embed stream that bypasses that
-        // wrapper; the rewrite is idempotent, so double-application is safe.
-        pendingChunks.push(fixFlightHints(text));
+        try {
+          const decoder = new TextDecoder("utf-8", { fatal: true });
+          const text = decoder.decode(result.value);
+          // The RSC entry already fixes HL hints at the source. Keep this second
+          // pass as defense in depth for any embed stream that bypasses that
+          // wrapper; the rewrite is idempotent, so double-application is safe.
+          pendingChunks.push(fixFlightHints(text));
+        } catch {
+          pendingChunks.push([RSC_EMBEDDED_BINARY_CHUNK, bytesToBase64(result.value)]);
+        }
       }
     } catch (error) {
       if (process.env.NODE_ENV !== "production") {
@@ -69,12 +111,7 @@ export function createRscEmbedTransform(
 
       let scripts = "";
       for (const chunk of chunks) {
-        scripts += createInlineScriptTag(
-          "self.__VINEXT_RSC_CHUNKS__=self.__VINEXT_RSC_CHUNKS__||[];self.__VINEXT_RSC_CHUNKS__.push(" +
-            safeJsonStringify(chunk) +
-            ")",
-          scriptNonce,
-        );
+        scripts += createInlineScriptTag(createNavigationRuntimeRscChunkScript(chunk), scriptNonce);
       }
       return scripts;
     },
@@ -82,22 +119,13 @@ export function createRscEmbedTransform(
     async finalize(): Promise<string> {
       await pumpPromise;
       let scripts = this.flush();
-      scripts += createInlineScriptTag("self.__VINEXT_RSC_DONE__=true", scriptNonce);
+      scripts += createInlineScriptTag(createNavigationRuntimeRscDoneScript(), scriptNonce);
       return scripts;
     },
 
     async getRawBuffer(): Promise<ArrayBuffer> {
       await pumpPromise;
-      let totalLength = 0;
-      for (const chunk of rawChunks) {
-        totalLength += chunk.byteLength;
-      }
-      const buffer = new Uint8Array(totalLength);
-      let offset = 0;
-      for (const chunk of rawChunks) {
-        buffer.set(chunk, offset);
-        offset += chunk.byteLength;
-      }
+      const buffer = concatUint8Arrays(rawChunks);
       rawChunks.length = 0;
       return buffer.buffer;
     },

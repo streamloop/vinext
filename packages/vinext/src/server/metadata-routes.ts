@@ -61,6 +61,7 @@ export type RobotsRule = {
   allow?: string | string[];
   disallow?: string | string[];
   crawlDelay?: number;
+  other?: Record<string, string | number | Array<string | number>>;
 };
 
 export type RobotsConfig = {
@@ -113,7 +114,7 @@ export const METADATA_FILE_MAP: Record<
     contentType: "application/xml",
     canBeDynamic: true,
     staticExtensions: [".xml"],
-    dynamicExtensions: [".ts", ".js"],
+    dynamicExtensions: [".tsx", ".ts", ".jsx", ".js"],
     nestable: true,
   },
   robots: {
@@ -121,7 +122,7 @@ export const METADATA_FILE_MAP: Record<
     contentType: "text/plain",
     canBeDynamic: true,
     staticExtensions: [".txt"],
-    dynamicExtensions: [".ts", ".js"],
+    dynamicExtensions: [".tsx", ".ts", ".jsx", ".js"],
     nestable: false,
   },
   manifest: {
@@ -129,7 +130,7 @@ export const METADATA_FILE_MAP: Record<
     contentType: "application/manifest+json",
     canBeDynamic: true,
     staticExtensions: [".json", ".webmanifest"],
-    dynamicExtensions: [".ts", ".js"],
+    dynamicExtensions: [".tsx", ".ts", ".jsx", ".js"],
     nestable: false,
   },
   favicon: {
@@ -145,7 +146,7 @@ export const METADATA_FILE_MAP: Record<
     contentType: "image/png",
     canBeDynamic: true,
     staticExtensions: [".ico", ".jpg", ".jpeg", ".png", ".svg"],
-    dynamicExtensions: [".ts", ".tsx", ".js"],
+    dynamicExtensions: [".tsx", ".ts", ".jsx", ".js"],
     nestable: true,
   },
   "opengraph-image": {
@@ -153,7 +154,7 @@ export const METADATA_FILE_MAP: Record<
     contentType: "image/png",
     canBeDynamic: true,
     staticExtensions: [".jpg", ".jpeg", ".png", ".gif"],
-    dynamicExtensions: [".ts", ".tsx", ".js"],
+    dynamicExtensions: [".tsx", ".ts", ".jsx", ".js"],
     nestable: true,
   },
   "twitter-image": {
@@ -161,7 +162,7 @@ export const METADATA_FILE_MAP: Record<
     contentType: "image/png",
     canBeDynamic: true,
     staticExtensions: [".jpg", ".jpeg", ".png", ".gif"],
-    dynamicExtensions: [".ts", ".tsx", ".js"],
+    dynamicExtensions: [".tsx", ".ts", ".jsx", ".js"],
     nestable: true,
   },
   "apple-icon": {
@@ -169,7 +170,7 @@ export const METADATA_FILE_MAP: Record<
     contentType: "image/png",
     canBeDynamic: true,
     staticExtensions: [".jpg", ".jpeg", ".png"],
-    dynamicExtensions: [".ts", ".tsx", ".js"],
+    dynamicExtensions: [".tsx", ".ts", ".jsx", ".js"],
     nestable: true,
   },
 };
@@ -312,7 +313,22 @@ export function robotsToText(config: RobotsConfig): string {
       lines.push(`Crawl-delay: ${rule.crawlDelay}`);
     }
 
+    if (rule.other) {
+      for (const key of Object.keys(rule.other)) {
+        const value = rule.other[key];
+        if (value == null) continue;
+        const values = Array.isArray(value) ? value : [value];
+        for (const v of values) {
+          lines.push(`${key}: ${v}`);
+        }
+      }
+    }
+
     lines.push("");
+  }
+
+  if (config.host) {
+    lines.push(`Host: ${config.host}`);
   }
 
   if (config.sitemap) {
@@ -320,10 +336,6 @@ export function robotsToText(config: RobotsConfig): string {
     for (const sitemap of sitemaps) {
       lines.push(`Sitemap: ${sitemap}`);
     }
-  }
-
-  if (config.host) {
-    lines.push(`Host: ${config.host}`);
   }
 
   return lines.join("\n").trim() + "\n";

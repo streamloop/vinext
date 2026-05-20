@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 import { handleAppPrerenderEndpoint } from "../packages/vinext/src/server/app-prerender-endpoints.js";
+import { createAppPrerenderStaticParamsResolver } from "../packages/vinext/src/server/app-prerender-static-params.js";
 import { getRootParam } from "../packages/vinext/src/shims/root-params.js";
 
 type TestPageRoute = {
@@ -10,6 +11,80 @@ type TestPageRoute = {
 };
 
 describe("App prerender endpoint helpers", () => {
+  it("composes layout and page generateStaticParams sources top-down", async () => {
+    // Ported from Next.js: test/e2e/app-dir/app-root-params-getters/generate-static-params.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/app-root-params-getters/generate-static-params.test.ts
+    const layoutGenerateStaticParams = vi.fn(() => [
+      { lang: "en", locale: "us" },
+      { lang: "es", locale: "es" },
+    ]);
+    const pageGenerateStaticParams = vi.fn(({ params }) => [{ slug: `${params.lang}-post` }]);
+    const resolveStaticParams = createAppPrerenderStaticParamsResolver([
+      layoutGenerateStaticParams,
+      pageGenerateStaticParams,
+    ]);
+
+    await expect(resolveStaticParams?.({ params: {} })).resolves.toEqual([
+      { lang: "en", locale: "us", slug: "en-post" },
+      { lang: "es", locale: "es", slug: "es-post" },
+    ]);
+    expect(pageGenerateStaticParams).toHaveBeenCalledWith({
+      params: { lang: "en", locale: "us" },
+    });
+    expect(pageGenerateStaticParams).toHaveBeenCalledWith({
+      params: { lang: "es", locale: "es" },
+    });
+  });
+
+  it("filters non-root params from root param scope in resolver while preserving them in params argument", async () => {
+    const layoutGenerateStaticParams = vi.fn(() => [{ lang: "en", locale: "us" }]);
+    const pageGenerateStaticParams = vi.fn(async ({ params }) => {
+      const rootLang = await getRootParam("lang");
+      const rootLocale = await getRootParam("locale");
+      return [{ rootLang, rootLocale, slug: `${params.lang}-post` }];
+    });
+    const resolveStaticParams = createAppPrerenderStaticParamsResolver(
+      [layoutGenerateStaticParams, pageGenerateStaticParams],
+      ["lang"],
+    );
+
+    await expect(resolveStaticParams?.({ params: {} })).resolves.toEqual([
+      { lang: "en", locale: "us", rootLang: "en", rootLocale: undefined, slug: "en-post" },
+    ]);
+    expect(pageGenerateStaticParams).toHaveBeenCalledWith({
+      params: { lang: "en", locale: "us" },
+    });
+  });
+
+  it("preserves incoming non-root parent params in the resolver", async () => {
+    const first = vi.fn(async ({ params }) => {
+      expect(params).toEqual({ lang: "en", category: "docs" });
+      expect(await getRootParam("lang")).toBe("en");
+      expect(await getRootParam("category")).toBeUndefined();
+      return [{ slug: `${params.category}-post` }];
+    });
+
+    const second = vi.fn(({ params }) => [{ final: params.slug }]);
+
+    const resolve = createAppPrerenderStaticParamsResolver([first, second], ["lang"]);
+
+    await expect(resolve?.({ params: { lang: "en", category: "docs" } })).resolves.toEqual([
+      { lang: "en", category: "docs", slug: "docs-post", final: "docs-post" },
+    ]);
+  });
+
+  it("bails out of composed generateStaticParams when a source returns a non-array", async () => {
+    const malformedLayoutGenerateStaticParams = vi.fn(() => undefined);
+    const pageGenerateStaticParams = vi.fn(() => [{ slug: "unused" }]);
+    const resolveStaticParams = createAppPrerenderStaticParamsResolver([
+      malformedLayoutGenerateStaticParams,
+      pageGenerateStaticParams,
+    ]);
+
+    await expect(resolveStaticParams?.({ params: {} })).resolves.toEqual([]);
+    expect(pageGenerateStaticParams).not.toHaveBeenCalled();
+  });
+
   it("falls through for non-prerender requests", async () => {
     const response = await handleAppPrerenderEndpoint(new Request("http://localhost/blog/post"), {
       isPrerenderEnabled: () => true,
@@ -33,7 +108,7 @@ describe("App prerender endpoint helpers", () => {
     );
 
     expect(response?.status).toBe(404);
-    await expect(response?.text()).resolves.toBe("Not Found");
+    await expect(response?.text()).resolves.toBe("This page could not be found");
   });
 
   it("calls generateStaticParams with object parent params and serializes the result", async () => {

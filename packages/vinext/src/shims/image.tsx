@@ -12,9 +12,10 @@
  * `images.domains` from next.config.js. Unmatched URLs are blocked
  * in production and warn in development, matching Next.js behavior.
  */
-import React, { forwardRef, useEffect, useLayoutEffect, useRef } from "react";
+import React, { forwardRef, useEffect, useLayoutEffect, useRef, useState } from "react";
+import * as ReactDOM from "react-dom";
 import { Image as UnpicImage } from "@unpic/react";
-import { hasRemoteMatch, type RemotePattern } from "./image-config.js";
+import { hasRemoteMatch, isPrivateIp, type RemotePattern } from "./image-config.js";
 import { useMergedRef } from "./use-merged-ref.js";
 
 export type StaticImageData = {
@@ -62,6 +63,13 @@ const __imageDeviceSizes: number[] = (() => {
  */
 const __dangerouslyAllowSVG = process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_SVG === "true";
 /**
+ * Whether dangerouslyAllowLocalIP is enabled in next.config.js.
+ * When false (default), remote image URLs with literal private-IP hostnames
+ * are blocked to mitigate SSRF risk.
+ */
+const __dangerouslyAllowLocalIP = process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_LOCAL_IP === "true";
+
+/**
  * Validate that a remote URL is allowed by the configured remote patterns.
  * Returns true if the URL is allowed, false otherwise.
  *
@@ -71,18 +79,31 @@ const __dangerouslyAllowSVG = process.env.__VINEXT_IMAGE_DANGEROUSLY_ALLOW_SVG =
  * When patterns ARE configured, only matching URLs are allowed.
  * In development, non-matching URLs produce a console warning.
  * In production, non-matching URLs are blocked (src replaced with empty string).
+ *
+ * Private-IP hostnames are additionally rejected unless dangerouslyAllowLocalIP
+ * is set, mirroring Next.js's fetchExternalImage guard.
  */
 function validateRemoteUrl(src: string): { allowed: boolean; reason?: string } {
-  if (!__hasImageConfig) {
-    // No image config — allow everything (backwards-compatible)
-    return { allowed: true };
-  }
-
   let url: URL;
   try {
     url = new URL(src, "http://n");
   } catch {
     return { allowed: false, reason: `Invalid URL: ${src}` };
+  }
+
+  if (!__dangerouslyAllowLocalIP && isPrivateIp(url.hostname)) {
+    // Best-effort guard for literal-IP hostnames only. Domain names resolving
+    // to private IPs cannot be caught without server-side DNS resolution.
+    // See: Next.js fetchExternalImage in packages/next/src/server/image-optimizer.ts
+    return {
+      allowed: false,
+      reason: `Image URL "${src}" resolved to private IP. If this is expected and you understand SSRF risk, use images.dangerouslyAllowLocalIP = true to continue.`,
+    };
+  }
+
+  if (!__hasImageConfig) {
+    // No image config — allow everything (backwards-compatible)
+    return { allowed: true };
   }
 
   if (hasRemoteMatch(__imageDomains, __imageRemotePatterns, url)) {
@@ -147,6 +168,7 @@ type ImageProps = {
   width?: number;
   height?: number;
   fill?: boolean;
+  preload?: boolean;
   priority?: boolean;
   quality?: number;
   placeholder?: "blur" | "empty";
@@ -201,6 +223,21 @@ function isRemoteUrl(src: string): boolean {
   return src.startsWith("http://") || src.startsWith("https://") || src.startsWith("//");
 }
 
+function getFillStyle(
+  style?: React.CSSProperties,
+  backgroundStyle?: React.CSSProperties,
+): React.CSSProperties {
+  return {
+    position: "absolute",
+    inset: 0,
+    width: "100%",
+    height: "100%",
+    objectFit: "cover",
+    ...backgroundStyle,
+    ...style,
+  };
+}
+
 /**
  * Resolve src, width, height, blurDataURL from Image props (string or StaticImageData).
  * Shared by the Image component and getImageProps to keep behavior in sync.
@@ -237,6 +274,23 @@ export function imageOptimizationUrl(src: string, width: number, quality: number
   return `/_vinext/image?url=${encodeURIComponent(src)}&w=${width}&q=${quality}`;
 }
 
+function preloadImageResource(input: {
+  shouldPreload: boolean;
+  src: string;
+  srcSet?: string;
+  sizes?: string;
+  fetchPriority?: ReactDOM.PreloadOptions["fetchPriority"];
+}): void {
+  if (!input.shouldPreload) return;
+  if (typeof ReactDOM.preload !== "function") return;
+  ReactDOM.preload(input.src, {
+    as: "image",
+    imageSrcSet: input.srcSet,
+    imageSizes: input.sizes,
+    fetchPriority: input.fetchPriority,
+  });
+}
+
 /**
  * Generate a srcSet string for responsive images.
  *
@@ -258,6 +312,7 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
     width,
     height,
     fill,
+    preload,
     priority,
     quality,
     placeholder,
@@ -323,6 +378,17 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
     height: imgHeight,
     blurDataURL: imgBlurDataURL,
   } = resolveImageSource({ src: srcProp, width, height, blurDataURL });
+  const shouldPreload = preload === true || priority === true;
+  const priorityFetchPriority = priority ? "high" : undefined;
+  const imageLoading = priority ? "eager" : shouldPreload ? loading : (loading ?? "lazy");
+
+  const [completedBlurSrc, setCompletedBlurSrc] = useState<string | undefined>(undefined);
+  const blurComplete = completedBlurSrc === src;
+
+  const markBlurComplete = () => {
+    if (placeholder !== "blur") return;
+    setCompletedBlurSrc((current) => (current === src ? current : src));
+  };
 
   useNonWarningLayoutEffect(() => {
     if (!didInsertRef.current && imgElementRef.current !== null) {
@@ -342,6 +408,7 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
       // distinguish success from error — a failed image has naturalWidth === 0.
       // Ported from Next.js: https://github.com/vercel/next.js/pull/93209
       if (img.complete && img.naturalWidth > 0) {
+        markBlurComplete();
         const currentOnLoad = onLoadRef.current;
         const currentOnLoadingComplete = onLoadingCompleteRef.current;
         if (currentOnLoad || currentOnLoadingComplete) {
@@ -366,6 +433,7 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
     ? (e: React.SyntheticEvent<HTMLImageElement>) => {
         if (lastLoadedSrcRef.current === src) return;
         lastLoadedSrcRef.current = src;
+        markBlurComplete();
         onLoad?.(e);
         onLoadingComplete(e.currentTarget);
       }
@@ -373,21 +441,41 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
       ? (e: React.SyntheticEvent<HTMLImageElement>) => {
           if (lastLoadedSrcRef.current === src) return;
           lastLoadedSrcRef.current = src;
+          markBlurComplete();
           onLoad(e);
         }
-      : undefined;
+      : placeholder === "blur"
+        ? () => {
+            if (lastLoadedSrcRef.current === src) return;
+            lastLoadedSrcRef.current = src;
+            markBlurComplete();
+          }
+        : undefined;
 
   const handleError = onError
     ? (e: React.SyntheticEvent<HTMLImageElement>) => {
         if (lastErrorSrcRef.current === src) return;
         lastErrorSrcRef.current = src;
+        markBlurComplete();
         onError(e);
       }
-    : undefined;
+    : placeholder === "blur"
+      ? () => {
+          if (lastErrorSrcRef.current === src) return;
+          lastErrorSrcRef.current = src;
+          markBlurComplete();
+        }
+      : undefined;
 
   // If a custom loader is provided, use basic img with loader URL
   if (loader) {
     const resolvedSrc = loader({ src, width: imgWidth ?? 0, quality: quality ?? 75 });
+    preloadImageResource({
+      shouldPreload,
+      src: resolvedSrc,
+      sizes,
+      fetchPriority: priorityFetchPriority,
+    });
     return (
       <img
         ref={mergedRef}
@@ -395,30 +483,21 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
         alt={alt}
         width={fill ? undefined : imgWidth}
         height={fill ? undefined : imgHeight}
-        loading={priority ? "eager" : (loading ?? "lazy")}
+        loading={imageLoading}
         decoding="async"
         sizes={sizes}
         className={className}
         onLoad={handleLoad}
         onError={handleError}
-        style={
-          fill
-            ? {
-                position: "absolute",
-                inset: 0,
-                width: "100%",
-                height: "100%",
-                objectFit: "cover",
-                ...style,
-              }
-            : style
-        }
+        style={fill ? getFillStyle(style) : style}
         {...rest}
       />
     );
   }
 
-  // For remote URLs, validate against remotePatterns then use @unpic/react
+  // For remote URLs, validate against remotePatterns. Non-fill images use
+  // @unpic/react for CDN URL transforms; fill uses a plain img so the DOM
+  // element keeps Next.js's absolute-positioned fill contract.
   if (isRemoteUrl(src)) {
     const validation = validateRemoteUrl(src);
     if (!validation.allowed) {
@@ -433,31 +512,59 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
     }
 
     const sanitizedBlur = imgBlurDataURL ? sanitizeBlurDataURL(imgBlurDataURL) : undefined;
-    const bg = placeholder === "blur" && sanitizedBlur ? `url(${sanitizedBlur})` : undefined;
+    const showBlur = !blurComplete && placeholder === "blur" && sanitizedBlur;
+    const blurStyle = showBlur
+      ? {
+          backgroundImage: `url(${sanitizedBlur})`,
+          backgroundSize: "cover",
+          backgroundRepeat: "no-repeat",
+          backgroundPosition: "center",
+        }
+      : undefined;
+    const bg = showBlur ? `url(${sanitizedBlur})` : undefined;
 
     if (fill) {
+      const fillSizes = sizes ?? "100vw";
+      preloadImageResource({
+        shouldPreload,
+        src,
+        sizes: fillSizes,
+        fetchPriority: priorityFetchPriority,
+      });
       return (
-        <UnpicImage
+        <img
+          ref={mergedRef}
           src={src}
           alt={alt}
-          layout="fullWidth"
           // `priority` is a Next.js concept — translate it to HTML attributes so
           // it is never forwarded to the DOM as a non-boolean attribute, which
           // would trigger React's "Received `true` for a non-boolean attribute"
           // warning.
-          loading={priority ? "eager" : (loading ?? "lazy")}
-          fetchPriority={priority ? "high" : undefined}
-          sizes={sizes}
+          loading={imageLoading}
+          fetchPriority={priorityFetchPriority}
+          decoding="async"
+          sizes={fillSizes}
           className={className}
-          background={bg}
+          data-nimg="fill"
           onLoad={handleLoad}
           onError={handleError}
-          ref={mergedRef}
+          style={getFillStyle(style, blurStyle)}
+          {...rest}
         />
       );
     }
     // constrained layout requires width+height or aspectRatio
     if (imgWidth && imgHeight) {
+      // @unpic/react forwards additional image props through transformProps and
+      // merges `style` with generated layout styles at runtime, but its public
+      // React type omits `style`.
+      const unpicRuntimeStyleProps: { style?: React.CSSProperties } = { style };
+      preloadImageResource({
+        shouldPreload,
+        src,
+        sizes,
+        fetchPriority: priorityFetchPriority,
+      });
       return (
         <UnpicImage
           src={src}
@@ -466,10 +573,11 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
           height={imgHeight}
           layout="constrained"
           // Same translation as above — never pass `priority` to the DOM.
-          loading={priority ? "eager" : (loading ?? "lazy")}
-          fetchPriority={priority ? "high" : undefined}
+          loading={imageLoading}
+          fetchPriority={priorityFetchPriority}
           sizes={sizes}
           className={className}
+          {...unpicRuntimeStyleProps}
           background={bg}
           onLoad={handleLoad}
           onError={handleError}
@@ -514,7 +622,7 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
   // Sanitize blurDataURL to prevent CSS injection via crafted data URLs.
   const sanitizedLocalBlur = imgBlurDataURL ? sanitizeBlurDataURL(imgBlurDataURL) : undefined;
   const blurStyle =
-    placeholder === "blur" && sanitizedLocalBlur
+    !blurComplete && placeholder === "blur" && sanitizedLocalBlur
       ? {
           backgroundImage: `url(${sanitizedLocalBlur})`,
           backgroundSize: "cover",
@@ -522,6 +630,15 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
           backgroundPosition: "center",
         }
       : undefined;
+
+  const imageSizes = sizes ?? (fill ? "100vw" : undefined);
+  preloadImageResource({
+    shouldPreload,
+    src: optimizedSrc,
+    srcSet,
+    sizes: imageSizes,
+    fetchPriority: priorityFetchPriority,
+  });
 
   // For local images, render a standard <img> tag with srcSet and blur support.
   // The src and srcSet point to the /_vinext/image optimization endpoint.
@@ -532,28 +649,16 @@ const Image = forwardRef<HTMLImageElement, ImageProps>(function Image(
       alt={alt}
       width={fill ? undefined : imgWidth}
       height={fill ? undefined : imgHeight}
-      loading={priority ? "eager" : (loading ?? "lazy")}
-      fetchPriority={priority ? "high" : undefined}
+      loading={imageLoading}
+      fetchPriority={priorityFetchPriority}
       decoding="async"
       srcSet={srcSet}
-      sizes={sizes ?? (fill ? "100vw" : undefined)}
+      sizes={imageSizes}
       className={className}
       data-nimg={fill ? "fill" : "1"}
       onLoad={handleLoad}
       onError={handleError}
-      style={
-        fill
-          ? {
-              position: "absolute",
-              inset: 0,
-              width: "100%",
-              height: "100%",
-              objectFit: "cover",
-              ...blurStyle,
-              ...style,
-            }
-          : { ...blurStyle, ...style }
-      }
+      style={fill ? getFillStyle(style, blurStyle) : { ...blurStyle, ...style }}
       {...rest}
     />
   );
@@ -572,6 +677,7 @@ export function getImageProps(props: ImageProps): {
     width,
     height,
     fill,
+    preload: _preload,
     priority,
     quality: _quality,
     placeholder,
@@ -594,6 +700,7 @@ export function getImageProps(props: ImageProps): {
     height: imgHeight,
     blurDataURL: imgBlurDataURL,
   } = resolveImageSource({ src: srcProp, width, height, blurDataURL: blurDataURLProp });
+  const shouldPreload = _preload === true || priority === true;
 
   // Validate remote URLs against configured patterns
   let blockedInProd = false;
@@ -657,24 +764,14 @@ export function getImageProps(props: ImageProps): {
       alt,
       width: fill ? undefined : imgWidth,
       height: fill ? undefined : imgHeight,
-      loading: priority ? "eager" : (loading ?? "lazy"),
+      loading: priority ? "eager" : shouldPreload ? loading : (loading ?? "lazy"),
       fetchPriority: priority ? ("high" as const) : undefined,
       decoding: "async" as const,
       srcSet,
       sizes: sizes ?? (fill ? "100vw" : undefined),
       className,
       "data-nimg": fill ? "fill" : "1",
-      style: fill
-        ? {
-            position: "absolute" as const,
-            inset: 0,
-            width: "100%",
-            height: "100%",
-            objectFit: "cover" as const,
-            ...blurStyle,
-            ...style,
-          }
-        : { ...blurStyle, ...style },
+      style: fill ? getFillStyle(style, blurStyle) : { ...blurStyle, ...style },
       ...rest,
     } as React.ImgHTMLAttributes<HTMLImageElement>,
   };

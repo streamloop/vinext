@@ -1,4 +1,10 @@
+import { runWithFetchDedupe } from "vinext/shims/fetch-cache";
 import { mergeMiddlewareResponseHeaders } from "./middleware-response-headers.js";
+import {
+  VINEXT_RSC_CONTENT_TYPE,
+  VINEXT_RSC_VARY_HEADER,
+  applyRscCompatibilityIdHeader,
+} from "./app-rsc-cache-busting.js";
 import { resolveAppPageSegmentParams } from "./app-page-params.js";
 
 export type AppPageParams = Record<string, string | string[]>;
@@ -28,6 +34,7 @@ type ResolveAppPageParentHttpAccessBoundaryModuleOptions<TModule> = {
 type ResolveAppPageErrorBoundaryOptions<TModule, TComponent> = {
   getDefaultExport: (module: TModule | null | undefined) => TComponent | null | undefined;
   globalErrorModule?: TModule | null;
+  errorModules?: readonly (TModule | null | undefined)[] | null;
   layoutErrorModules?: readonly (TModule | null | undefined)[] | null;
   pageErrorModule?: TModule | null;
 };
@@ -142,12 +149,13 @@ export function resolveAppPageErrorBoundary<TModule, TComponent>(
     };
   }
 
-  if (options.layoutErrorModules) {
-    for (let index = options.layoutErrorModules.length - 1; index >= 0; index--) {
-      const layoutErrorComponent = options.getDefaultExport(options.layoutErrorModules[index]);
-      if (layoutErrorComponent) {
+  const segmentErrorModules = options.errorModules ?? options.layoutErrorModules;
+  if (segmentErrorModules) {
+    for (let index = segmentErrorModules.length - 1; index >= 0; index--) {
+      const segmentErrorComponent = options.getDefaultExport(segmentErrorModules[index]);
+      if (segmentErrorComponent) {
         return {
-          component: layoutErrorComponent,
+          component: segmentErrorComponent,
           isGlobalError: false,
         };
       }
@@ -216,19 +224,26 @@ export function wrapAppPageBoundaryElement<
 export async function renderAppPageBoundaryResponse<TElement>(
   options: RenderAppPageBoundaryResponseOptions<TElement>,
 ): Promise<Response> {
-  const rscStream = options.renderToReadableStream(options.element, {
-    onError: options.createRscOnErrorHandler(),
-  });
+  // Defensive wrap for standalone callers; idempotent under dispatchAppPage.
+  // The async stream consumption that follows relies on the surrounding
+  // runWithRequestContext to keep ALS state alive after this synchronous call
+  // returns. See app-page-render.ts for the same pattern.
+  const rscStream = runWithFetchDedupe(() =>
+    options.renderToReadableStream(options.element, {
+      onError: options.createRscOnErrorHandler(),
+    }),
+  );
 
   if (options.isRscRequest) {
     // Do NOT clear request-scoped context here. RSC responses are consumed lazily
     // by the client, so headers()/cookies() and async server components still need
     // their ALS-backed state while the stream is being read.
     const headers = new Headers({
-      "Content-Type": "text/x-component; charset=utf-8",
-      Vary: "RSC, Accept",
+      "Content-Type": VINEXT_RSC_CONTENT_TYPE,
+      Vary: VINEXT_RSC_VARY_HEADER,
     });
     mergeMiddlewareResponseHeaders(headers, options.middlewareHeaders ?? null);
+    applyRscCompatibilityIdHeader(headers);
 
     return new Response(rscStream, {
       status: options.status,

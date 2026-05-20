@@ -7,6 +7,7 @@ import {
 } from "../packages/vinext/src/server/app-page-boundary-render.js";
 import type { AppElements } from "../packages/vinext/src/server/app-elements.js";
 import type { MetadataFileRoute } from "../packages/vinext/src/server/metadata-routes.js";
+import { VINEXT_RSC_VARY_HEADER } from "../packages/vinext/src/server/app-rsc-cache-busting.js";
 
 function createStreamFromMarkup(markup: string): ReadableStream<Uint8Array> {
   return new ReadableStream({
@@ -280,7 +281,7 @@ describe("app page boundary render helpers", () => {
 
     expect(response?.status).toBe(404);
     expect(response?.headers.get("x-middleware-security")).toBe("present");
-    expect(response?.headers.get("vary")).toBe("RSC, Accept, x-auth-state");
+    expect(response?.headers.get("vary")).toBe(`${VINEXT_RSC_VARY_HEADER}, x-auth-state`);
     expect(response?.headers.getSetCookie()).toContain("session=rotated; Path=/; HttpOnly");
   });
 
@@ -305,11 +306,68 @@ describe("app page boundary render helpers", () => {
     });
 
     expect(response?.status).toBe(404);
-    expect(response?.headers.get("Content-Type")).toBe("text/x-component; charset=utf-8");
+    expect(response?.headers.get("Content-Type")).toBe("text/x-component");
 
     const payload = JSON.parse((await response?.text()) ?? "{}") as Record<string, unknown>;
     expect(payload.__route).toBe("route:/posts/missing");
+    expect(payload.__layoutIds).toEqual(["layout:/", "layout:/posts"]);
     expect(payload.__rootLayout).toBe("/");
+    expect(payload["route:/posts/missing"]).toBeTruthy();
+  });
+
+  it("derives HTTP access fallback layout metadata from the rendered layout subset", async () => {
+    const common = createCommonOptions();
+
+    const response = await renderAppPageHttpAccessFallback<TestModule>({
+      ...common,
+      isRscRequest: true,
+      layoutModules: [rootLayoutModule],
+      matchedParams: { slug: "missing" },
+      renderToReadableStream: renderWirePayloadToStream,
+      route: {
+        layoutTreePositions: [0, 1],
+        layouts: [rootLayoutModule, leafLayoutModule],
+        notFound: notFoundModule,
+        params: { slug: "missing" },
+        pattern: "/posts/[slug]",
+        routeSegments: ["posts", "[slug]"],
+      },
+      statusCode: 404,
+    });
+
+    expect(response?.status).toBe(404);
+
+    const payload = JSON.parse((await response?.text()) ?? "{}") as Record<string, unknown>;
+    expect(payload.__layoutIds).toEqual(["layout:/"]);
+    expect(payload.__rootLayout).toBe("/");
+    expect(payload["route:/posts/missing"]).toBeTruthy();
+  });
+
+  it("uses unknown root metadata when no route layout is rendered for an HTTP access fallback", async () => {
+    const common = createCommonOptions();
+
+    const response = await renderAppPageHttpAccessFallback<TestModule>({
+      ...common,
+      isRscRequest: true,
+      layoutModules: [],
+      matchedParams: { slug: "missing" },
+      renderToReadableStream: renderWirePayloadToStream,
+      route: {
+        layoutTreePositions: [0, 1],
+        layouts: [rootLayoutModule, leafLayoutModule],
+        notFound: notFoundModule,
+        params: { slug: "missing" },
+        pattern: "/posts/[slug]",
+        routeSegments: ["posts", "[slug]"],
+      },
+      statusCode: 404,
+    });
+
+    expect(response?.status).toBe(404);
+
+    const payload = JSON.parse((await response?.text()) ?? "{}") as Record<string, unknown>;
+    expect(payload.__layoutIds).toEqual([]);
+    expect(payload.__rootLayout).toBeNull();
     expect(payload["route:/posts/missing"]).toBeTruthy();
   });
 
@@ -332,7 +390,7 @@ describe("app page boundary render helpers", () => {
 
     expect(response?.status).toBe(404);
     expect(response?.headers.get("x-middleware-security")).toBe("present");
-    expect(response?.headers.get("vary")).toBe("RSC, Accept, x-auth-state");
+    expect(response?.headers.get("vary")).toBe(`${VINEXT_RSC_VARY_HEADER}, x-auth-state`);
     expect(response?.headers.getSetCookie()).toContain("session=rotated; Path=/; HttpOnly");
   });
 
@@ -354,6 +412,7 @@ describe("app page boundary render helpers", () => {
 
     const payload = JSON.parse((await response?.text()) ?? "{}") as Record<string, unknown>;
     expect(payload.__route).toBe("route:/posts/missing");
+    expect(payload.__layoutIds).toEqual([]);
     expect(payload.__rootLayout).toBeNull();
     expect(payload["route:/posts/missing"]).toBeTruthy();
   });
@@ -405,7 +464,7 @@ describe("app page boundary render helpers", () => {
 
     expect(response?.status).toBe(200);
     expect(response?.headers.get("x-middleware-security")).toBe("present");
-    expect(response?.headers.get("vary")).toBe("RSC, Accept, x-auth-state");
+    expect(response?.headers.get("vary")).toBe(`${VINEXT_RSC_VARY_HEADER}, x-auth-state`);
     expect(response?.headers.getSetCookie()).toContain("session=rotated; Path=/; HttpOnly");
   });
 
@@ -489,10 +548,11 @@ describe("app page boundary render helpers", () => {
     });
 
     expect(response?.status).toBe(200);
-    expect(response?.headers.get("Content-Type")).toBe("text/x-component; charset=utf-8");
+    expect(response?.headers.get("Content-Type")).toBe("text/x-component");
 
     const payload = JSON.parse((await response?.text()) ?? "{}") as Record<string, unknown>;
     expect(payload.__route).toBe("route:/posts/missing");
+    expect(payload.__layoutIds).toEqual(["layout:/"]);
     expect(payload.__rootLayout).toBe("/");
     expect(payload["route:/posts/missing"]).toBeTruthy();
   });

@@ -1,12 +1,12 @@
 import path from "node:path";
-import { compareRoutes, decodeRouteSegment, normalizePathnameForRouteMatch } from "./utils.js";
+import { compareRoutes, decodeRouteSegment } from "./utils.js";
 import {
   createValidFileMatcher,
   scanWithExtensions,
   type ValidFileMatcher,
 } from "./file-matcher.js";
-import { patternToNextFormat, validateRoutePatterns } from "./route-validation.js";
-import { buildRouteTrie, trieMatch, type TrieNode } from "./route-trie.js";
+import { validateRoutePatterns } from "./route-validation.js";
+import { createRouteTrieCache, matchRouteWithTrie } from "./route-matching.js";
 
 export type Route = {
   /** URL pattern, e.g. "/" or "/about" or "/posts/:id" */
@@ -113,29 +113,35 @@ function fileToRoute(file: string, pagesDir: string, matcher: ValidFileMatcher):
   for (let i = 0; i < segments.length; i++) {
     const segment = segments[i];
 
-    // Catch-all: [...slug] -> :slug+ (param names may contain hyphens)
-    const catchAllMatch = segment.match(/^\[\.\.\.([\w-]+)\]$/);
+    // Catch-all: [...slug] -> :slug+ (param names may contain any non-] chars)
+    // Matches Next.js PARAMETER_PATTERN.
+    const catchAllMatch = segment.match(/^\[\.\.\.([^\]]+)\]$/);
     if (catchAllMatch) {
       if (i !== segments.length - 1) return null;
+      // Guard: names ending in + or * would collide with internal pattern modifiers.
+      if (catchAllMatch[1].endsWith("+") || catchAllMatch[1].endsWith("*")) return null;
       isDynamic = true;
       params.push(catchAllMatch[1]);
       urlSegments.push(`:${catchAllMatch[1]}+`);
       continue;
     }
 
-    // Optional catch-all: [[...slug]] -> :slug* (param names may contain hyphens)
-    const optionalCatchAllMatch = segment.match(/^\[\[\.\.\.([\w-]+)\]\]$/);
+    // Optional catch-all: [[...slug]] -> :slug* (param names may contain any non-] chars)
+    const optionalCatchAllMatch = segment.match(/^\[\[\.\.\.([^\]]+)\]\]$/);
     if (optionalCatchAllMatch) {
       if (i !== segments.length - 1) return null;
+      if (optionalCatchAllMatch[1].endsWith("+") || optionalCatchAllMatch[1].endsWith("*"))
+        return null;
       isDynamic = true;
       params.push(optionalCatchAllMatch[1]);
       urlSegments.push(`:${optionalCatchAllMatch[1]}*`);
       continue;
     }
 
-    // Dynamic segment: [id] -> :id (param names may contain hyphens)
-    const dynamicMatch = segment.match(/^\[([\w-]+)\]$/);
+    // Dynamic segment: [id] -> :id (param names may contain any non-] chars)
+    const dynamicMatch = segment.match(/^\[([^\]]+)\]$/);
     if (dynamicMatch) {
+      if (dynamicMatch[1].endsWith("+") || dynamicMatch[1].endsWith("*")) return null;
       isDynamic = true;
       params.push(dynamicMatch[1]);
       urlSegments.push(`:${dynamicMatch[1]}`);
@@ -157,16 +163,7 @@ function fileToRoute(file: string, pagesDir: string, matcher: ValidFileMatcher):
 }
 
 // Trie cache — keyed by route array identity (same array = same trie)
-const trieCache = new WeakMap<Route[], TrieNode<Route>>();
-
-function getOrBuildTrie(routes: Route[]): TrieNode<Route> {
-  let trie = trieCache.get(routes);
-  if (!trie) {
-    trie = buildRouteTrie(routes);
-    trieCache.set(routes, trie);
-  }
-  return trie;
-}
+const trieCache = createRouteTrieCache<Route>();
 
 /**
  * Match a URL path against a route pattern.
@@ -176,15 +173,7 @@ export function matchRoute(
   url: string,
   routes: Route[],
 ): { route: Route; params: Record<string, string | string[]> } | null {
-  // Normalize: strip query string and trailing slash
-  const pathname = url.split("?")[0];
-  let normalizedUrl = pathname === "/" ? "/" : pathname.replace(/\/$/, "");
-  normalizedUrl = normalizePathnameForRouteMatch(normalizedUrl);
-
-  // Split URL once, look up via trie
-  const urlParts = normalizedUrl.split("/").filter(Boolean);
-  const trie = getOrBuildTrie(routes);
-  return trieMatch(trie, urlParts);
+  return matchRouteWithTrie(url, routes, trieCache);
 }
 
 /**

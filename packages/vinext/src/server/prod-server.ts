@@ -45,13 +45,25 @@ import {
   type ImageConfig,
 } from "./image-optimization.js";
 import { normalizePath } from "./normalize-path.js";
-import { applyConfigHeadersToHeaderRecord, isOpenRedirectShaped } from "./request-pipeline.js";
+import {
+  applyConfigHeadersToHeaderRecord,
+  filterInternalHeaders,
+  isOpenRedirectShaped,
+  normalizeTrailingSlash,
+} from "./request-pipeline.js";
+import { notFoundResponse } from "./http-error-responses.js";
 import { hasBasePath, stripBasePath } from "../utils/base-path.js";
+import {
+  ASSET_PREFIX_URL_DIR,
+  assetPrefixPathname,
+  isAbsoluteAssetPrefix,
+} from "../utils/asset-prefix.js";
 import { computeLazyChunks } from "../utils/lazy-chunks.js";
 import { manifestFileWithBase } from "../utils/manifest-paths.js";
 import { normalizePathnameForRouteMatchStrict } from "../routing/utils.js";
 import type { ExecutionContextLike } from "vinext/shims/request-context";
 import { readPrerenderSecret } from "../build/server-manifest.js";
+import { VINEXT_PRERENDER_SECRET_HEADER, VINEXT_STATIC_FILE_HEADER } from "./headers.js";
 import { seedMemoryCacheFromPrerender } from "./seed-cache.js";
 import { installSocketErrorBackstop } from "./socket-error-backstop.js";
 
@@ -75,6 +87,12 @@ export type ProdServerOptions = {
   outDir?: string;
   /** Disable compression (default: false) */
   noCompression?: boolean;
+  /**
+   * Narrow startup context for callers that need a more precise log line.
+   * Omitted for normal `vinext start` so the existing production-server output
+   * remains stable.
+   */
+  purpose?: "prerender";
 };
 
 /** Content types that benefit from compression. */
@@ -250,6 +268,16 @@ type ResponseWithVinextStreamingMetadata = Response & {
 
 function isVinextStreamedHtmlResponse(response: Response): boolean {
   return (response as ResponseWithVinextStreamingMetadata).__vinextStreamedHtmlResponse === true;
+}
+
+function logProdServerStarted(host: string, port: number, purpose: ProdServerOptions["purpose"]) {
+  const url = `http://${host}:${port}`;
+  if (purpose === "prerender") {
+    console.log(`[vinext] Production server for prerendering running at ${url}`);
+    return;
+  }
+
+  console.log(`[vinext] Production server running at ${url}`);
 }
 
 /**
@@ -503,7 +531,14 @@ async function tryServeStatic(
 
   const ext = path.extname(resolved.path);
   const ct = CONTENT_TYPES[ext] ?? "application/octet-stream";
-  const isHashed = pathname.startsWith("/assets/");
+  // Mirror the StaticFileCache's `isHashed` rule: assets under Vite's
+  // `assetsDir` carry a content hash regardless of whether they sit under
+  // `/assets/` (historical default) or `/<prefix>?/_next/static/`
+  // (assetPrefix-enabled builds). Both forms get immutable cache headers.
+  // `pathname` always has a leading `/`, so a single `includes` covers both
+  // the root-level `/_next/static/...` case and any `/<prefix>/_next/static/...`
+  // assetPrefix layout.
+  const isHashed = pathname.startsWith("/assets/") || pathname.includes("/_next/static/");
   const cacheControl = isHashed ? "public, max-age=31536000, immutable" : "public, max-age=3600";
   // Use a filename-hash ETag for hashed assets (matches the fast-path cache
   // behaviour and survives deploys). Use resolved.path (not pathname) so that
@@ -687,15 +722,17 @@ function nodeToWebRequest(req: IncomingMessage, urlOverride?: string): Request {
   const origin = `${proto}://${host}`;
   const url = new URL(urlOverride ?? req.url ?? "/", origin);
 
-  const headers = new Headers();
+  const rawHeaders = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {
     if (value === undefined) continue;
     if (Array.isArray(value)) {
-      for (const v of value) headers.append(key, v);
+      for (const v of value) rawHeaders.append(key, v);
     } else {
-      headers.set(key, value);
+      rawHeaders.set(key, value);
     }
   }
+  // Strip internal headers that should not be honored from external requests.
+  const headers = filterInternalHeaders(rawHeaders);
 
   const method = req.method ?? "GET";
   const hasBody = method !== "GET" && method !== "HEAD";
@@ -826,6 +863,7 @@ export async function startProdServer(options: ProdServerOptions = {}) {
     host = "0.0.0.0",
     outDir = path.resolve("dist"),
     noCompression = false,
+    purpose,
   } = options;
 
   const compress = !noCompression;
@@ -845,10 +883,10 @@ export async function startProdServer(options: ProdServerOptions = {}) {
   }
 
   if (isAppRouter) {
-    return startAppRouterServer({ port, host, clientDir, rscEntryPath, compress });
+    return startAppRouterServer({ port, host, clientDir, rscEntryPath, compress, purpose });
   }
 
-  return startPagesRouterServer({ port, host, clientDir, serverEntryPath, compress });
+  return startPagesRouterServer({ port, host, clientDir, serverEntryPath, compress, purpose });
 }
 
 // ─── App Router Production Server ─────────────────────────────────────────────
@@ -859,6 +897,7 @@ type AppRouterServerOptions = {
   clientDir: string;
   rscEntryPath: string;
   compress: boolean;
+  purpose?: ProdServerOptions["purpose"];
 };
 
 type WorkerAppRouterEntry = {
@@ -897,6 +936,70 @@ function resolveAppRouterHandler(entry: unknown): (request: Request) => Promise<
 }
 
 /**
+ * Resolve a request pathname to a static-asset lookup path inside `clientDir`.
+ *
+ * Returns `null` when the request is not for a built asset, in which case
+ * the caller should let the request fall through to the RSC handler.
+ *
+ * Three URL shapes are recognised:
+ *
+ *  - `/assets/...` — the historical Vite default, used when `assetPrefix` is
+ *    unset. Returns the pathname verbatim.
+ *  - `<assetPathPrefix>/_next/static/...` — when `assetPrefix` is a path
+ *    prefix (e.g. `/custom-asset-prefix`). The on-disk layout is
+ *    `dist/client/<prefix>/_next/static/...`, so the pathname maps 1:1.
+ *  - `/_next/static/...` — when `assetPrefix` is an absolute URL with no
+ *    path component (e.g. `https://cdn.example.com`). Files land on disk
+ *    at `dist/client/_next/static/...`. This branch is mostly a fallback
+ *    for setups that don't actually route asset requests to the CDN.
+ *
+ * When `assetPrefix` is an absolute URL with a non-empty pathname
+ * (e.g. `https://cdn.example.com/sub`), files are written to
+ * `dist/client/_next/static/...` but emitted URLs prepend the full URL
+ * (`https://cdn.example.com/sub/_next/static/...`). Requests for those
+ * URLs do not normally arrive at this server — they go to the CDN. We
+ * still accept `<pathname>/_next/static/...` so a same-origin reverse
+ * proxy can route through.
+ */
+export function resolveAppRouterAssetPath(
+  pathname: string,
+  assetPathPrefix: string,
+  assetPrefix: string,
+): string | null {
+  // Historical layout — always supported for projects without assetPrefix.
+  if (pathname.startsWith("/assets/")) return pathname;
+
+  if (!assetPrefix) return null;
+
+  const nextStaticDir = `/${ASSET_PREFIX_URL_DIR}/`;
+
+  if (assetPathPrefix) {
+    // Path prefix (or absolute URL with a path component). Strip the prefix
+    // and verify the rest lives under `_next/static/`.
+    if (pathname === assetPathPrefix || pathname.startsWith(assetPathPrefix + "/")) {
+      const rest = pathname.slice(assetPathPrefix.length) || "/";
+      if (rest.startsWith(nextStaticDir)) {
+        // For path-prefix assetPrefix: on-disk path mirrors the URL, so the
+        // request path is already the lookup path.
+        if (!isAbsoluteAssetPrefix(assetPrefix)) {
+          return pathname;
+        }
+        // For absolute-URL assetPrefix with a path component: on-disk path
+        // is just `_next/static/...` (no extra prefix dir on disk).
+        return rest;
+      }
+    }
+    return null;
+  }
+
+  // Absolute-URL assetPrefix with no path component — files on disk at
+  // `dist/client/_next/static/...`. Accept incoming `/_next/static/...`.
+  if (pathname.startsWith(nextStaticDir)) return pathname;
+
+  return null;
+}
+
+/**
  * Start the App Router production server.
  *
  * The App Router entry (dist/server/index.js) can export either:
@@ -914,7 +1017,7 @@ function resolveAppRouterHandler(entry: unknown): (request: Request) => Promise<
  * 4. Stream the Web Response back (with optional compression)
  */
 async function startAppRouterServer(options: AppRouterServerOptions) {
-  const { port, host, clientDir, rscEntryPath, compress } = options;
+  const { port, host, clientDir, rscEntryPath, compress, purpose } = options;
 
   // Load image config written at build time by vinext:image-config plugin.
   // This provides SVG/security header settings for the image optimization endpoint.
@@ -940,6 +1043,20 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
   const rscModule = await import(`${pathToFileURL(rscEntryPath).href}?t=${rscMtime}`);
   const rscHandler = resolveAppRouterHandler(rscModule.default);
 
+  // `assetPrefix` is embedded as a compile-time constant in the generated
+  // RSC entry (see `entries/app-rsc-entry.ts`'s `export const __assetPrefix`),
+  // mirroring how `__basePath` is inlined there and how the Pages Router
+  // entry exposes `vinextConfig.assetPrefix`. Default to "" so older builds
+  // (and the rare case where the entry doesn't re-export this constant)
+  // continue to work with the historical asset layout.
+  const appRouterAssetPrefix: string =
+    typeof rscModule.__assetPrefix === "string" ? rscModule.__assetPrefix : "";
+  // Path portion of the assetPrefix to match incoming asset requests against
+  // (empty when the prefix is an absolute URL with no path component, or when
+  // no prefix is configured). The URL prefix the prod-server needs to strip
+  // before locating files on disk includes this path plus `_next/static/`.
+  const appAssetPathPrefix = assetPrefixPathname(appRouterAssetPrefix);
+
   // Seed the memory cache with pre-rendered routes so the first request to
   // any pre-rendered page is a cache HIT instead of a full re-render.
   const seededRoutes = await seedMemoryCacheFromPrerender(path.dirname(rscEntryPath));
@@ -954,7 +1071,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
   // .br/.gz/.zst variants (generated at build time) are detected automatically.
   const staticCache = await StaticFileCache.create(clientDir);
 
-  const server = createServer(async (req, res) => {
+  const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const rawUrl = req.url ?? "/";
     const rawPathname = rawUrl.split("?")[0];
 
@@ -964,7 +1081,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
     // below and would otherwise reach the trailing-slash redirect emitter.
     if (isOpenRedirectShaped(rawPathname)) {
       res.writeHead(404);
-      res.end("404 Not Found");
+      res.end("This page could not be found");
       return;
     }
 
@@ -990,7 +1107,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
       pathname === "/__vinext/prerender/static-params" ||
       pathname === "/__vinext/prerender/pages-static-paths"
     ) {
-      const secret = req.headers["x-vinext-prerender-secret"];
+      const secret = req.headers[VINEXT_PRERENDER_SECRET_HEADER];
       if (!prerenderSecret || secret !== prerenderSecret) {
         res.writeHead(403);
         res.end("Forbidden");
@@ -1005,11 +1122,27 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
     // Serve hashed build assets (Vite output in /assets/) directly.
     // Public directory files fall through to the RSC handler, which runs
     // middleware before serving them.
-    if (
-      pathname.startsWith("/assets/") &&
-      (await tryServeStatic(req, res, clientDir, pathname, compress, staticCache))
-    ) {
-      return;
+    //
+    // When `assetPrefix` is configured the on-disk layout under
+    // `dist/client` mirrors `<prefix>/_next/static/...` (path-prefix form)
+    // or `_next/static/...` (absolute-URL form). Either way, requests for
+    // `<prefix>/_next/static/...` arrive at this server in production
+    // (Cloudflare's ASSETS binding serves these directly in Workers; this
+    // branch is the Node fallback) and we look them up on disk. The base
+    // `/assets/` prefix continues to work too — projects without
+    // `assetPrefix` keep the historical layout.
+    {
+      const assetLookupPath = resolveAppRouterAssetPath(
+        pathname,
+        appAssetPathPrefix,
+        appRouterAssetPrefix,
+      );
+      if (
+        assetLookupPath &&
+        (await tryServeStatic(req, res, clientDir, assetLookupPath, compress, staticCache))
+      ) {
+        return;
+      }
     }
 
     // Image optimization passthrough (Node.js prod server has no Images binding;
@@ -1069,7 +1202,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
       const request = nodeToWebRequest(req, normalizedUrl);
       const response = await rscHandler(request);
 
-      const staticFileSignal = response.headers.get("x-vinext-static-file");
+      const staticFileSignal = response.headers.get(VINEXT_STATIC_FILE_HEADER);
       if (staticFileSignal) {
         let staticFilePath = "/";
         try {
@@ -1080,7 +1213,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
 
         const staticResponseHeaders = omitHeadersCaseInsensitive(
           mergeResponseHeaders({}, response),
-          ["x-vinext-static-file", "content-encoding", "content-length", "content-type"],
+          [VINEXT_STATIC_FILE_HEADER, "content-encoding", "content-length", "content-type"],
         );
 
         const served = await tryServeStatic(
@@ -1098,10 +1231,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
           return;
         }
         await sendWebResponse(
-          new Response("Not Found", {
-            status: 404,
-            headers: toWebHeaders(staticResponseHeaders),
-          }),
+          notFoundResponse({ headers: toWebHeaders(staticResponseHeaders) }),
           req,
           res,
           compress,
@@ -1118,13 +1248,17 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
         res.end("Internal Server Error");
       }
     }
+  };
+
+  const server = createServer((req, res) => {
+    void handleRequest(req, res);
   });
 
   await new Promise<void>((resolve) => {
     server.listen(port, host, () => {
       const addr = server.address();
       const actualPort = typeof addr === "object" && addr ? addr.port : port;
-      console.log(`[vinext] Production server running at http://${host}:${actualPort}`);
+      logProdServerStarted(host, actualPort, purpose);
       resolve();
     });
   });
@@ -1142,7 +1276,30 @@ type PagesRouterServerOptions = {
   clientDir: string;
   serverEntryPath: string;
   compress: boolean;
+  purpose?: ProdServerOptions["purpose"];
 };
+
+type PagesServerEntryPageRoute = {
+  pattern: string;
+  module?: {
+    getStaticPaths?: (opts: { locales: string[]; defaultLocale: string }) => Promise<unknown>;
+  };
+};
+
+function isPagesServerEntryPageRoute(value: unknown): value is PagesServerEntryPageRoute {
+  if (!value || typeof value !== "object" || !("pattern" in value)) return false;
+  if (typeof value.pattern !== "string") return false;
+
+  if (!("module" in value) || value.module === undefined) return true;
+  const pageModule = value.module;
+  if (!pageModule || typeof pageModule !== "object") return false;
+
+  return !("getStaticPaths" in pageModule) || typeof pageModule.getStaticPaths === "function";
+}
+
+function readPagesServerEntryPageRoutes(value: unknown): PagesServerEntryPageRoute[] | undefined {
+  return Array.isArray(value) && value.every(isPagesServerEntryPageRoute) ? value : undefined;
+}
 
 /**
  * Start the Pages Router production server.
@@ -1154,7 +1311,7 @@ type PagesRouterServerOptions = {
  * - vinextConfig — embedded next.config.js settings
  */
 async function startPagesRouterServer(options: PagesRouterServerOptions) {
-  const { port, host, clientDir, serverEntryPath, compress } = options;
+  const { port, host, clientDir, serverEntryPath, compress, purpose } = options;
 
   // Import the server entry module (use file:// URL for reliable dynamic import).
   // Cache-bust with mtime so that rebuilds to the same output path always load
@@ -1162,6 +1319,9 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
   const serverMtime = fs.statSync(serverEntryPath).mtimeMs;
   const serverEntry = await import(`${pathToFileURL(serverEntryPath).href}?t=${serverMtime}`);
   const { renderPage, handleApiRoute: handleApi, runMiddleware, vinextConfig } = serverEntry;
+  const matchPageRoute =
+    typeof serverEntry.matchPageRoute === "function" ? serverEntry.matchPageRoute : undefined;
+  const pageRoutes = readPagesServerEntryPageRoutes(serverEntry.pageRoutes);
 
   // Load prerender secret written at build time by vinext:server-manifest plugin.
   // Used to authenticate internal /__vinext/prerender/* HTTP endpoints.
@@ -1169,6 +1329,11 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
 
   // Extract config values (embedded at build time in the server entry)
   const basePath: string = vinextConfig?.basePath ?? "";
+  const assetPrefix: string = vinextConfig?.assetPrefix ?? "";
+  // Path component of `assetPrefix` against which incoming requests are
+  // matched (empty when absent or when the prefix is an absolute URL with
+  // no path component).
+  const pagesAssetPathPrefix = assetPrefixPathname(assetPrefix);
   const assetBase = basePath ? `${basePath}/` : "/";
   const trailingSlash: boolean = vinextConfig?.trailingSlash ?? false;
   const configRedirects = vinextConfig?.redirects ?? [];
@@ -1187,6 +1352,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
   const pagesImageConfig: ImageConfig | undefined = vinextConfig?.images
     ? {
         dangerouslyAllowSVG: vinextConfig.images.dangerouslyAllowSVG,
+        dangerouslyAllowLocalIP: vinextConfig.images.dangerouslyAllowLocalIP,
         contentDispositionType: vinextConfig.images.contentDispositionType,
         contentSecurityPolicy: vinextConfig.images.contentSecurityPolicy,
       }
@@ -1220,7 +1386,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
   // Build the static file metadata cache at startup (same as App Router).
   const staticCache = await StaticFileCache.create(clientDir);
 
-  const server = createServer(async (req, res) => {
+  const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const rawUrl = req.url ?? "/";
     const rawPagesPathnameBeforeNormalize = rawUrl.split("?")[0];
 
@@ -1230,7 +1396,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
     // below and would otherwise reach the trailing-slash redirect emitter.
     if (isOpenRedirectShaped(rawPagesPathnameBeforeNormalize)) {
       res.writeHead(404);
-      res.end("404 Not Found");
+      res.end("This page could not be found");
       return;
     }
 
@@ -1254,7 +1420,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
     // Internal prerender endpoint — only reachable with the correct build-time secret.
     // Used by the prerender phase to fetch getStaticPaths results via HTTP.
     if (pathname === "/__vinext/prerender/pages-static-paths") {
-      const secret = req.headers["x-vinext-prerender-secret"];
+      const secret = req.headers[VINEXT_PRERENDER_SECRET_HEADER];
       if (!prerenderSecret || secret !== prerenderSecret) {
         res.writeHead(403);
         res.end("Forbidden");
@@ -1265,17 +1431,6 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
       const localesRaw = parsedUrl.searchParams.get("locales");
       const locales: string[] = localesRaw ? JSON.parse(localesRaw) : [];
       const defaultLocale = parsedUrl.searchParams.get("defaultLocale") ?? "";
-      const pageRoutes = serverEntry.pageRoutes as
-        | Array<{
-            pattern: string;
-            module?: {
-              getStaticPaths?: (opts: {
-                locales: string[];
-                defaultLocale: string;
-              }) => Promise<unknown>;
-            };
-          }>
-        | undefined;
       const route = pageRoutes?.find((r) => r.pattern === pattern);
       const fn = route?.module?.getStaticPaths;
       if (typeof fn !== "function") {
@@ -1299,10 +1454,26 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
     // middleware. These are always public and don't need protection.
     // Public directory files (e.g. /favicon.ico, /robots.txt) are served
     // after middleware (step 5b) so middleware can intercept them.
+    //
+    // When `assetPrefix` is configured, also accept asset requests under
+    // `<prefix>/_next/static/...` (or `/_next/static/...` for an absolute
+    // URL prefix). On disk the layout under `dist/client` mirrors the URL
+    // (see `resolveAppRouterAssetPath` for the full table), so the same
+    // helper handles both routers.
+    //
+    // Match the App Router's behaviour (above) and use the UN-stripped
+    // `pathname` here, not `staticLookupPath`. Emitted asset URLs already
+    // carry the assetPrefix verbatim (which equals `basePath` when the
+    // Next.js parity fallback fires — packages/next/src/server/config.ts:528-531),
+    // so stripping `basePath` first would make `resolveAppRouterAssetPath`'s
+    // path-prefix branch miss the match and return null → 404.
+    // `staticLookupPath` is still computed because non-asset paths below
+    // (image-optimization, SSR routing) match against the basePath-stripped form.
     const staticLookupPath = stripBasePath(pathname, basePath);
+    const pagesAssetLookup = resolveAppRouterAssetPath(pathname, pagesAssetPathPrefix, assetPrefix);
     if (
-      staticLookupPath.startsWith("/assets/") &&
-      (await tryServeStatic(req, res, clientDir, staticLookupPath, compress, staticCache))
+      pagesAssetLookup &&
+      (await tryServeStatic(req, res, clientDir, pagesAssetLookup, compress, staticCache))
     ) {
       return;
     }
@@ -1362,16 +1533,15 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
       }
 
       // ── 3. Trailing slash normalization ───────────────────────────
-      if (pathname !== "/" && pathname !== "/api" && !pathname.startsWith("/api/")) {
-        const hasTrailing = pathname.endsWith("/");
-        if (trailingSlash && !hasTrailing) {
-          const qs = url.includes("?") ? url.slice(url.indexOf("?")) : "";
-          res.writeHead(308, { Location: basePath + pathname + "/" + qs });
-          res.end();
-          return;
-        } else if (!trailingSlash && hasTrailing) {
-          const qs = url.includes("?") ? url.slice(url.indexOf("?")) : "";
-          res.writeHead(308, { Location: basePath + pathname.replace(/\/+$/, "") + qs });
+      {
+        const qs = url.includes("?") ? url.slice(url.indexOf("?")) : "";
+        const trailingSlashRedirect = normalizeTrailingSlash(pathname, basePath, trailingSlash, qs);
+        if (trailingSlashRedirect) {
+          const location = trailingSlashRedirect.headers.get("Location");
+          res.writeHead(
+            trailingSlashRedirect.status,
+            location ? { Location: location } : undefined,
+          );
           res.end();
           return;
         }
@@ -1383,10 +1553,13 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
         : undefined;
       const protocol = rawProtocol === "https" || rawProtocol === "http" ? rawProtocol : "http";
       const hostHeader = resolveHost(req, `${host}:${port}`);
-      const reqHeaders = Object.entries(req.headers).reduce((h, [k, v]) => {
+      const rawReqHeaders = Object.entries(req.headers).reduce((h, [k, v]) => {
         if (v) h.set(k, Array.isArray(v) ? v.join(", ") : v);
         return h;
       }, new Headers());
+      // Strip internal headers from inbound requests before any handler or
+      // middleware sees them.
+      const reqHeaders = filterInternalHeaders(rawReqHeaders);
       const method = req.method ?? "GET";
       const hasBody = method !== "GET" && method !== "HEAD";
       let webRequest = new Request(`${protocol}://${hostHeader}${url}`, {
@@ -1428,7 +1601,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
       // ── 5. Run middleware ─────────────────────────────────────────
       let resolvedUrl = url;
       const middlewareHeaders: Record<string, string | string[]> = {};
-      let middlewareRewriteStatus: number | undefined;
+      let middlewareStatus: number | undefined;
       if (typeof runMiddleware === "function") {
         const result = await runMiddleware(webRequest, undefined);
 
@@ -1506,9 +1679,10 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
           resolvedUrl = result.rewriteUrl;
         }
 
-        // Apply custom status code from middleware rewrite
-        // (e.g. NextResponse.rewrite(url, { status: 403 }))
-        middlewareRewriteStatus = result.rewriteStatus;
+        // Apply custom status code from middleware continue/rewrite responses.
+        // Examples: NextResponse.next({ status: 404 }) and
+        // NextResponse.rewrite(url, { status: 403 }).
+        middlewareStatus = result.status ?? result.rewriteStatus;
       }
 
       // Unpack x-middleware-request-* headers into the actual request and strip
@@ -1518,6 +1692,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
       const { postMwReqCtx, request: postMwReq } = applyMiddlewareRequestHeaders(
         middlewareHeaders,
         webRequest,
+        { preserveCredentialHeaders: isExternalUrl(resolvedUrl) },
       );
       webRequest = postMwReq;
 
@@ -1595,11 +1770,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
           response = new Response("404 - API route not found", { status: 404 });
         }
 
-        const mergedResponse = mergeWebResponse(
-          middlewareHeaders,
-          response,
-          middlewareRewriteStatus,
-        );
+        const mergedResponse = mergeWebResponse(middlewareHeaders, response, middlewareStatus);
 
         if (!mergedResponse.body) {
           await sendWebResponse(mergedResponse, req, res, compress);
@@ -1627,8 +1798,11 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
         return;
       }
 
+      const pageMatch = matchPageRoute ? matchPageRoute(resolvedPathname, webRequest) : null;
+
       // ── 9. Apply afterFiles rewrites from next.config.js ──────────
-      if (configRewrites.afterFiles?.length) {
+      // These run after non-dynamic page routes but before dynamic routes.
+      if ((!pageMatch || pageMatch.route.isDynamic) && configRewrites.afterFiles?.length) {
         const rewritten = matchRewrite(resolvedPathname, configRewrites.afterFiles, postMwReqCtx);
         if (rewritten) {
           if (isExternalUrl(rewritten)) {
@@ -1679,13 +1853,13 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
 
       if (!response) {
         res.writeHead(404);
-        res.end("404 - Not found");
+        res.end("This page could not be found");
         return;
       }
 
       // Capture the streaming marker before mergeWebResponse rebuilds the Response.
       const shouldStreamPagesResponse = isVinextStreamedHtmlResponse(response);
-      const mergedResponse = mergeWebResponse(middlewareHeaders, response, middlewareRewriteStatus);
+      const mergedResponse = mergeWebResponse(middlewareHeaders, response, middlewareStatus);
 
       if (shouldStreamPagesResponse || !mergedResponse.body) {
         await sendWebResponse(mergedResponse, req, res, compress);
@@ -1714,13 +1888,17 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
         res.end("Internal Server Error");
       }
     }
+  };
+
+  const server = createServer((req, res) => {
+    void handleRequest(req, res);
   });
 
   await new Promise<void>((resolve) => {
     server.listen(port, host, () => {
       const addr = server.address();
       const actualPort = typeof addr === "object" && addr ? addr.port : port;
-      console.log(`[vinext] Production server running at http://${host}:${actualPort}`);
+      logProdServerStarted(host, actualPort, purpose);
       resolve();
     });
   });

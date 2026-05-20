@@ -17,6 +17,11 @@ import {
   normalizeMountedSlotsHeader,
   type NormalizedRscRequest,
 } from "../packages/vinext/src/server/app-rsc-request-normalization.js";
+import { VINEXT_RSC_RENDER_MODE_HEADER } from "../packages/vinext/src/server/app-rsc-cache-busting.js";
+import {
+  APP_RSC_RENDER_MODE_NAVIGATION,
+  APP_RSC_RENDER_MODE_REFRESH_PRESERVE_UI,
+} from "../packages/vinext/src/server/app-rsc-render-mode.js";
 
 function req(path: string, headers: Record<string, string> = {}): Request {
   return new Request(`http://localhost${path}`, { headers });
@@ -190,19 +195,18 @@ describe("normalizeRscRequest — RSC detection and cleanPathname", () => {
     expect(result.cleanPathname).toBe("/about");
   });
 
-  it("detects RSC request by Accept: text/x-component header", () => {
+  it("does not select RSC rendering by Accept: text/x-component header alone", () => {
     const result = normalized(
       normalizeRscRequest(req("/about", { accept: "text/x-component" }), ""),
     );
-    expect(result.isRscRequest).toBe(true);
+    expect(result.isRscRequest).toBe(false);
   });
 
-  it("cleanPathname equals pathname when no .rsc suffix (Accept-header RSC)", () => {
-    // Route matching must use cleanPathname. With Accept-header RSC and no suffix,
-    // cleanPathname should equal pathname so the correct route is matched.
+  it("cleanPathname equals pathname when RSC headers appear on an HTML URL", () => {
     const result = normalized(
       normalizeRscRequest(req("/about", { accept: "text/x-component" }), ""),
     );
+    expect(result.isRscRequest).toBe(false);
     expect(result.cleanPathname).toBe("/about");
   });
 
@@ -212,7 +216,7 @@ describe("normalizeRscRequest — RSC detection and cleanPathname", () => {
     expect(result.cleanPathname).toBe("/about");
   });
 
-  it("strips .rsc suffix from cleanPathname even when isRscRequest is also set by Accept header", () => {
+  it("strips .rsc suffix from cleanPathname when RSC headers are also present", () => {
     const result = normalized(
       normalizeRscRequest(req("/about.rsc", { accept: "text/x-component" }), ""),
     );
@@ -304,6 +308,30 @@ describe("normalizeRscRequest — mounted slots normalization", () => {
       normalizeRscRequest(req("/page", { "x-vinext-mounted-slots": "   \t  " }), ""),
     );
     expect(result.mountedSlotsHeader).toBeNull();
+  });
+
+  it("normalizes the semantic render mode marker", () => {
+    const refresh = normalized(
+      normalizeRscRequest(
+        req("/page.rsc", {
+          [VINEXT_RSC_RENDER_MODE_HEADER]: APP_RSC_RENDER_MODE_REFRESH_PRESERVE_UI,
+        }),
+        "",
+      ),
+    );
+    const normal = normalized(
+      normalizeRscRequest(req("/page.rsc", { [VINEXT_RSC_RENDER_MODE_HEADER]: "true" }), ""),
+    );
+    const html = normalized(
+      normalizeRscRequest(
+        req("/page", { [VINEXT_RSC_RENDER_MODE_HEADER]: APP_RSC_RENDER_MODE_REFRESH_PRESERVE_UI }),
+        "",
+      ),
+    );
+
+    expect(refresh.renderMode).toBe(APP_RSC_RENDER_MODE_REFRESH_PRESERVE_UI);
+    expect(normal.renderMode).toBe(APP_RSC_RENDER_MODE_NAVIGATION);
+    expect(html.renderMode).toBe(APP_RSC_RENDER_MODE_NAVIGATION);
   });
 });
 

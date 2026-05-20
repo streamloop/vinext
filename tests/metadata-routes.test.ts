@@ -10,7 +10,10 @@ import { describe, it, expect, beforeEach, afterEach } from "vite-plus/test";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { resolveSitemap as nextResolveSitemap } from "next/dist/build/webpack/loaders/metadata/resolve-route-data.js";
+import {
+  resolveRobots as nextResolveRobots,
+  resolveSitemap as nextResolveSitemap,
+} from "next/dist/build/webpack/loaders/metadata/resolve-route-data.js";
 import {
   sitemapToXml,
   robotsToText,
@@ -29,6 +32,12 @@ import {
 // several edge cases are surprising but observable in Next itself.
 function expectSitemapToMatchNext(entries: SitemapEntry[]): void {
   expect(sitemapToXml(entries)).toBe(nextResolveSitemap(entries));
+}
+
+type NextRobotsConfig = Parameters<typeof nextResolveRobots>[0];
+
+function expectRobotsToMatchNext(config: RobotsConfig & NextRobotsConfig): void {
+  expect(robotsToText(config)).toBe(nextResolveRobots(config));
 }
 
 describe("matchMetadataRoutePattern", () => {
@@ -526,6 +535,87 @@ describe("robotsToText", () => {
     expect(txt).toContain("Crawl-delay: 10");
   });
 
+  // Ported from Next.js: test/unit/webpack/loaders/metadata/resolve-route-data.test.ts
+  // https://github.com/vercel/next.js/pull/93206
+  it("emits non-standard other directives after crawl delay and before blank line", () => {
+    const config: RobotsConfig = {
+      rules: [
+        { userAgent: "*", allow: "/" },
+        {
+          userAgent: "SeznamBot",
+          allow: "/",
+          other: { "Request-Rate": "10/1m" },
+        },
+        {
+          userAgent: "Googlebot",
+          disallow: "/admin",
+          crawlDelay: 30,
+          other: { "Some-Directive": "value" },
+        },
+      ],
+    };
+    const txt = robotsToText(config);
+
+    // "other" directives appear after Crawl-delay and before the blank line ending the block
+    expect(txt).toBe(
+      "User-Agent: *\nAllow: /\n\n" +
+        "User-Agent: SeznamBot\nAllow: /\nRequest-Rate: 10/1m\n\n" +
+        "User-Agent: Googlebot\nDisallow: /admin\nCrawl-delay: 30\nSome-Directive: value\n",
+    );
+  });
+
+  it("expands array-valued other directives into repeated lines", () => {
+    const config: RobotsConfig = {
+      rules: {
+        userAgent: "Yandex",
+        allow: "/catalog",
+        other: { "Clean-param": ["utm_source", "utm_medium"] },
+      },
+    };
+    const txt = robotsToText(config);
+    expect(txt).toBe(
+      "User-Agent: Yandex\nAllow: /catalog\nClean-param: utm_source\nClean-param: utm_medium\n",
+    );
+  });
+
+  it("skips null and undefined entries in other map", () => {
+    const config: RobotsConfig = {
+      rules: {
+        userAgent: "*",
+        allow: "/",
+        other: {
+          Valid: "yes",
+          SkipNull: null,
+          SkipUndefined: undefined,
+        } as unknown as Record<string, string | number | Array<string | number>>,
+      },
+    };
+    const txt = robotsToText(config);
+    expect(txt).toBe("User-Agent: *\nAllow: /\nValid: yes\n");
+  });
+
+  it("handles multiple other directives per rule", () => {
+    const config: RobotsConfig = {
+      rules: {
+        userAgent: "SpecialBot",
+        other: { "Request-Rate": "5/1s", "Visit-Time": "0600-0845" },
+      },
+    };
+    const txt = robotsToText(config);
+    expect(txt).toBe("User-Agent: SpecialBot\nRequest-Rate: 5/1s\nVisit-Time: 0600-0845\n");
+  });
+
+  it("handles numeric other directive values", () => {
+    const config: RobotsConfig = {
+      rules: {
+        userAgent: "*",
+        other: { "Some-Number": 42 },
+      },
+    };
+    const txt = robotsToText(config);
+    expect(txt).toBe("User-Agent: *\nSome-Number: 42\n");
+  });
+
   it("includes sitemap directive", () => {
     const config: RobotsConfig = {
       rules: { allow: "/" },
@@ -552,6 +642,33 @@ describe("robotsToText", () => {
     };
     const txt = robotsToText(config);
     expect(txt).toContain("Host: example.com");
+  });
+
+  it("emits Host before Sitemap like Next.js dynamic robots routes", () => {
+    // Ported from Next.js: test/e2e/app-dir/metadata-dynamic-routes/index.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/metadata-dynamic-routes/index.test.ts
+    const config = {
+      rules: [
+        { userAgent: "Googlebot", allow: "/" },
+        { userAgent: ["Applebot", "Bingbot"], disallow: "/", crawlDelay: 2 },
+      ],
+      host: "https://example.com",
+      sitemap: "https://example.com/sitemap.xml",
+    } satisfies RobotsConfig;
+
+    expectRobotsToMatchNext(config);
+    expect(robotsToText(config)).toBe(
+      "User-Agent: Googlebot\n" +
+        "Allow: /\n" +
+        "\n" +
+        "User-Agent: Applebot\n" +
+        "User-Agent: Bingbot\n" +
+        "Disallow: /\n" +
+        "Crawl-delay: 2\n" +
+        "\n" +
+        "Host: https://example.com\n" +
+        "Sitemap: https://example.com/sitemap.xml\n",
+    );
   });
 
   it("defaults user agent to *", () => {
@@ -772,6 +889,15 @@ describe("scanMetadataFiles", () => {
     expect(icon).toBeDefined();
     expect(icon!.isDynamic).toBe(true);
     expect(icon!.servedUrl).toBe("/icon");
+  });
+
+  it("discovers dynamic sitemap.tsx routes", () => {
+    createFile("blog/sitemap.tsx");
+    const routes = scanMetadataFiles(tmpDir);
+    const sitemap = routes.find((r) => r.type === "sitemap");
+    expect(sitemap).toBeDefined();
+    expect(sitemap!.isDynamic).toBe(true);
+    expect(sitemap!.servedUrl).toBe("/blog/sitemap.xml");
   });
 
   it("discovers static icon.png at root", () => {

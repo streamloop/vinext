@@ -13,6 +13,7 @@
  *   - "worker": sets type="text/partytown" (requires Partytown setup)
  */
 import React, { useEffect, useRef } from "react";
+import * as ReactDOM from "react-dom";
 import { escapeInlineContent } from "./head.js";
 import { useScriptNonce } from "./script-nonce-context.js";
 
@@ -49,8 +50,11 @@ export type ScriptProps = {
   [key: string]: unknown;
 };
 
-// Track scripts that have already been loaded to avoid duplicates
+// Track scripts that have already been loaded, plus remote scripts currently
+// loading, to avoid duplicate DOM insertion when same-src components mount
+// before the first load event fires.
 const loadedScripts = new Set<string>();
+const loadingScripts = new Map<string, Promise<Event>>();
 
 function getClientAutoNonce(): string | undefined {
   if (typeof document === "undefined") return undefined;
@@ -96,51 +100,148 @@ function buildBeforeInteractiveScriptProps(options: {
   return scriptProps;
 }
 
-/**
- * Load a script imperatively (outside of React).
- */
-export function handleClientScriptLoad(props: ScriptProps): void {
-  const {
-    src,
-    id,
-    onLoad,
-    onError,
-    strategy: _strategy,
-    onReady: _onReady,
-    children,
-    ...rest
-  } = props;
-  if (typeof window === "undefined") return;
+function setBooleanScriptAttribute(el: HTMLScriptElement, attr: string, value: unknown): boolean {
+  const enabled = value !== false && value !== "false" && Boolean(value);
 
-  const key = id ?? src ?? "";
-  if (key && loadedScripts.has(key)) return;
+  switch (attr) {
+    case "async":
+      el.async = enabled;
+      break;
+    case "defer":
+      el.defer = enabled;
+      break;
+    case "noModule":
+    case "nomodule":
+      el.noModule = enabled;
+      break;
+    default:
+      return false;
+  }
 
-  const el = document.createElement("script");
-  if (src) el.src = src;
-  if (id) el.id = id;
-  const resolvedNonce = resolveScriptNonce(rest.nonce);
+  if (!enabled) {
+    // Dynamic script elements start in the browser's force-async state.
+    // Setting and removing the attribute mirrors Next.js and clears that state.
+    el.setAttribute(attr, "");
+    el.removeAttribute(attr);
+  }
 
+  return true;
+}
+
+function setScriptAttributes(el: HTMLScriptElement, rest: Record<string, unknown>): void {
   for (const [attr, value] of Object.entries(rest)) {
-    if (attr === "dangerouslySetInnerHTML" || attr === "className") continue;
-    if (typeof value === "string") {
+    if (attr === "dangerouslySetInnerHTML") continue;
+    if (value === undefined) continue;
+    if (setBooleanScriptAttribute(el, attr, value)) continue;
+    if (attr === "className" && typeof value === "string") {
+      el.setAttribute("class", value);
+    } else if (typeof value === "string") {
       el.setAttribute(attr, value);
     } else if (typeof value === "boolean" && value) {
       el.setAttribute(attr, "");
     }
   }
-  if (resolvedNonce && !el.getAttribute("nonce")) {
-    el.setAttribute("nonce", resolvedNonce);
+}
+
+function loadClientScript(
+  props: ScriptProps,
+  options: {
+    resolvedNonce?: string;
+    fireReadyWhenAlreadyLoaded: boolean;
+  },
+): void {
+  const {
+    src,
+    id,
+    onLoad,
+    onReady,
+    onError,
+    strategy = "afterInteractive",
+    children,
+    dangerouslySetInnerHTML,
+    ...rest
+  } = props;
+  if (typeof window === "undefined") return;
+
+  const key = id ?? src ?? "";
+  if (key && loadedScripts.has(key)) {
+    if (options.fireReadyWhenAlreadyLoaded) {
+      onReady?.();
+    }
+    return;
   }
 
-  if (children && typeof children === "string") {
+  if (src) {
+    const existingLoad = loadingScripts.get(src);
+    if (existingLoad) {
+      void existingLoad.then(
+        (event) => {
+          if (key) loadedScripts.add(key);
+          onLoad?.(event);
+          onReady?.();
+        },
+        (event) => onError?.(event),
+      );
+      return;
+    }
+  }
+
+  const el = document.createElement("script");
+  if (src) el.src = src;
+  if (id) el.id = id;
+
+  setScriptAttributes(el, rest);
+  if (options.resolvedNonce && !el.getAttribute("nonce")) {
+    el.setAttribute("nonce", options.resolvedNonce);
+  }
+
+  if (strategy === "worker") {
+    el.setAttribute("type", "text/partytown");
+  }
+
+  const markLoaded = () => {
+    if (key) loadedScripts.add(key);
+    onReady?.();
+  };
+
+  if (dangerouslySetInnerHTML?.__html) {
+    // Intentional: mirrors the Next.js <Script> API where dangerouslySetInnerHTML
+    // is developer-supplied inline script content (not user input). The prop name
+    // itself signals developer awareness of the XSS risk, consistent with React's
+    // design. User-supplied data must never flow into this prop.
+    el.innerHTML = dangerouslySetInnerHTML.__html;
+    markLoaded();
+  } else if (children && typeof children === "string") {
     el.textContent = children;
+    markLoaded();
+  } else if (src) {
+    const loadPromise = new Promise<Event>((resolve, reject) => {
+      el.addEventListener("load", (event) => {
+        resolve(event);
+        if (key) loadedScripts.add(key);
+        onLoad?.(event);
+        onReady?.();
+      });
+      el.addEventListener("error", (event) => {
+        reject(event);
+        onError?.(event);
+      });
+    });
+    loadPromise.catch(() => undefined).finally(() => loadingScripts.delete(src));
+    loadingScripts.set(src, loadPromise);
   }
-
-  if (onLoad) el.addEventListener("load", onLoad);
-  if (onError) el.addEventListener("error", onError);
 
   document.body.appendChild(el);
-  if (key) loadedScripts.add(key);
+}
+
+/**
+ * Load a script imperatively (outside of React).
+ */
+export function handleClientScriptLoad(props: ScriptProps): void {
+  loadClientScript(props, {
+    resolvedNonce: resolveScriptNonce(props.nonce),
+    fireReadyWhenAlreadyLoaded: false,
+  });
 }
 
 /**
@@ -192,48 +293,20 @@ function Script(props: ScriptProps): React.ReactElement | null {
         return;
       }
 
-      const el = document.createElement("script");
-      if (src) el.src = src;
-      if (id) el.id = id;
-
-      for (const [attr, value] of Object.entries(rest)) {
-        if (attr === "className") {
-          el.setAttribute("class", String(value));
-        } else if (typeof value === "string") {
-          el.setAttribute(attr, value);
-        } else if (typeof value === "boolean" && value) {
-          el.setAttribute(attr, "");
-        }
-      }
-      if (resolvedNonce && !el.getAttribute("nonce")) {
-        el.setAttribute("nonce", resolvedNonce);
-      }
-
-      if (strategy === "worker") {
-        el.setAttribute("type", "text/partytown");
-      }
-
-      if (dangerouslySetInnerHTML?.__html) {
-        // Intentional: mirrors the Next.js <Script> API where dangerouslySetInnerHTML
-        // is developer-supplied inline script content (not user input). The prop name
-        // itself signals developer awareness of the XSS risk, consistent with React's
-        // design. User-supplied data must never flow into this prop.
-        el.innerHTML = dangerouslySetInnerHTML.__html as string;
-      } else if (children && typeof children === "string") {
-        el.textContent = children;
-      }
-
-      el.addEventListener("load", (e) => {
-        if (key) loadedScripts.add(key);
-        onLoad?.(e);
-        onReady?.();
-      });
-
-      if (onError) {
-        el.addEventListener("error", onError);
-      }
-
-      document.body.appendChild(el);
+      loadClientScript(
+        {
+          src,
+          id,
+          strategy,
+          onLoad,
+          onReady,
+          onError,
+          children,
+          dangerouslySetInnerHTML,
+          ...rest,
+        },
+        { resolvedNonce, fireReadyWhenAlreadyLoaded: true },
+      );
     };
 
     if (strategy === "lazyOnload") {
@@ -273,6 +346,37 @@ function Script(props: ScriptProps): React.ReactElement | null {
 
   // SSR path: only "beforeInteractive" renders a <script> tag server-side
   if (typeof window === "undefined") {
+    // React Float preload — emits <link rel="preload" as="script" /> in <head>
+    // so the script is fetched while HTML streams. Mirrors Next.js's App Router
+    // behavior at .nextjs-ref/packages/next/src/client/script.tsx:298-376:
+    //   - afterInteractive with src: preload only (no <script> tag in SSR)
+    //   - beforeInteractive with src: preload + <script> tag
+    //   - inline scripts (no src): no preload
+    // Calling ReactDOM.preload during SSR is safe in both routers; React only
+    // hoists the link when it has a real <head> to hoist into.
+    if (
+      src &&
+      typeof ReactDOM.preload === "function" &&
+      (strategy === "afterInteractive" || strategy === "beforeInteractive")
+    ) {
+      const integrity = typeof rest.integrity === "string" ? rest.integrity : undefined;
+      const crossOrigin =
+        rest.crossOrigin === "anonymous" || rest.crossOrigin === "use-credentials"
+          ? rest.crossOrigin
+          : undefined;
+      const preloadOptions: ReactDOM.PreloadOptions = {
+        as: "script",
+        crossOrigin,
+      };
+      if (resolvedNonce !== undefined) {
+        preloadOptions.nonce = resolvedNonce;
+      }
+      if (integrity !== undefined) {
+        preloadOptions.integrity = integrity;
+      }
+      ReactDOM.preload(src, preloadOptions);
+    }
+
     if (strategy === "beforeInteractive") {
       return React.createElement(
         "script",

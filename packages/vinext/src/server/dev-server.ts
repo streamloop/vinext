@@ -2,9 +2,11 @@ import type { ViteDevServer } from "vite";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Route } from "../routing/pages-router.js";
 import { matchRoute, patternToNextFormat } from "../routing/pages-router.js";
+import { normalizeStaticPathname, type StaticPathsEntry } from "../routing/route-pattern.js";
 import type { ModuleImporter } from "./instrumentation.js";
 import { importModule, reportRequestError } from "./instrumentation.js";
 import type { NextI18nConfig } from "../config/next-config.js";
+import { VINEXT_CACHE_HEADER } from "./headers.js";
 import {
   isrGet,
   isrSet,
@@ -27,13 +29,16 @@ import { runWithServerInsertedHTMLState } from "vinext/shims/navigation-state";
 import { withScriptNonce } from "vinext/shims/script-nonce-context";
 import { createInlineScriptTag, createNonceAttribute, safeJsonStringify } from "./html.js";
 import { getScriptNonceFromNodeHeaderSources } from "./csp.js";
-import { parseQueryString as parseQuery } from "../utils/query.js";
+import { mergeRouteParamsIntoQuery, parseQueryString as parseQuery } from "../utils/query.js";
 import path from "node:path";
-import fs from "node:fs";
 import React from "react";
 import { renderToReadableStream } from "react-dom/server.edge";
 import { logRequest, now } from "./request-log.js";
-import { createValidFileMatcher, type ValidFileMatcher } from "../routing/file-matcher.js";
+import {
+  createValidFileMatcher,
+  findFileWithExtensions,
+  type ValidFileMatcher,
+} from "../routing/file-matcher.js";
 import {
   extractLocaleFromUrl as extractLocaleFromUrlShared,
   detectLocaleFromAcceptLanguage,
@@ -197,11 +202,6 @@ async function streamPageToResponse(
   res.end(suffix);
 }
 
-/** Check if a file exists with any configured page extension. */
-function findFileWithExtensions(basePath: string, matcher: ValidFileMatcher): boolean {
-  return matcher.dottedExtensions.some((ext) => fs.existsSync(basePath + ext));
-}
-
 /**
  * Extract locale prefix from a URL path.
  * e.g. /fr/about -> { locale: "fr", url: "/about", hadPrefix: true }
@@ -332,6 +332,7 @@ export function createSSRHandler(
     }
 
     const { route, params } = match;
+    const query = mergeRouteParamsIntoQuery(parseQuery(url), params);
 
     // Wrap the entire request in a single unified AsyncLocalStorage scope.
     const requestContext = createRequestContext();
@@ -340,13 +341,13 @@ export function createSSRHandler(
       try {
         await _alsRegistration;
 
-        // Set SSR context for the router shim so useRouter() returns
+        // Set SSR context for the Pages Router provider so useRouter() returns
         // the correct URL and params during server-side rendering.
         const routerShim = await importModule(runner, "next/router");
         if (typeof routerShim.setSSRContext === "function") {
           routerShim.setSSRContext({
             pathname: patternToNextFormat(route.pattern),
-            query: { ...params, ...parseQuery(url) },
+            query,
             asPath: url,
             locale: locale ?? currentDefaultLocale,
             locales: i18nConfig?.locales,
@@ -404,18 +405,30 @@ export function createSSRHandler(
           const fallback = pathsResult?.fallback ?? false;
 
           if (fallback === false) {
-            // Only allow paths explicitly listed in getStaticPaths
-            const paths: Array<{ params: Record<string, string | string[]> }> =
-              pathsResult?.paths ?? [];
-            const isValidPath = paths.some((p: { params: Record<string, string | string[]> }) =>
-              Object.entries(p.params).every(([key, val]) => {
+            // Only allow paths explicitly listed in getStaticPaths. Next.js
+            // accepts `paths` as Array<string | { params, locale? }>; the
+            // shared `StaticPathsEntry` type and `normalizeStaticPathname`
+            // helper in `../routing/route-pattern.ts` reference the upstream
+            // implementation.
+            type DevStaticPathsEntry = Exclude<StaticPathsEntry, null | undefined>;
+            const paths: Array<DevStaticPathsEntry> = pathsResult?.paths ?? [];
+            const currentPathname = normalizeStaticPathname(url);
+            const isValidPath = paths.some((p) => {
+              if (typeof p === "string") {
+                return normalizeStaticPathname(p) === currentPathname;
+              }
+              const entryParams = p.params;
+              if (entryParams === undefined || entryParams === null) {
+                return false;
+              }
+              return Object.entries(entryParams).every(([key, val]) => {
                 const actual = params[key];
                 if (Array.isArray(val)) {
                   return Array.isArray(actual) && val.join("/") === actual.join("/");
                 }
                 return String(val) === String(actual);
-              }),
-            );
+              });
+            });
 
             if (!isValidPath) {
               await renderErrorPage(
@@ -453,7 +466,7 @@ export function createSSRHandler(
             params,
             req,
             res,
-            query: parseQuery(url),
+            query,
             resolvedUrl: localeStrippedUrl,
             locale: locale ?? currentDefaultLocale,
             locales: i18nConfig?.locales,
@@ -564,7 +577,7 @@ export function createSSRHandler(
             const revalidateSecs = getRevalidateDuration(cacheKey) ?? 60;
             const hitHeaders: Record<string, string> = {
               "Content-Type": "text/html",
-              "X-Vinext-Cache": "HIT",
+              [VINEXT_CACHE_HEADER]: "HIT",
               "Cache-Control": `s-maxage=${revalidateSecs}, stale-while-revalidate`,
             };
             if (earlyFontLinkHeader) hitHeaders["Link"] = earlyFontLinkHeader;
@@ -607,7 +620,7 @@ export function createSSRHandler(
                       if (typeof routerShim.setSSRContext === "function") {
                         routerShim.setSSRContext({
                           pathname: patternToNextFormat(route.pattern),
-                          query: { ...params, ...parseQuery(url) },
+                          query,
                           asPath: url,
                           locale: locale ?? currentDefaultLocale,
                           locales: i18nConfig?.locales,
@@ -711,7 +724,7 @@ export function createSSRHandler(
             const revalidateSecs = getRevalidateDuration(cacheKey) ?? 60;
             const staleHeaders: Record<string, string> = {
               "Content-Type": "text/html",
-              "X-Vinext-Cache": "STALE",
+              [VINEXT_CACHE_HEADER]: "STALE",
               "Cache-Control": `s-maxage=${revalidateSecs}, stale-while-revalidate`,
             };
             if (earlyFontLinkHeader) staleHeaders["Link"] = earlyFontLinkHeader;
@@ -786,7 +799,7 @@ export function createSSRHandler(
         let element: React.ReactElement;
 
         // wrapWithRouterContext wraps the element in RouterContext.Provider so that
-        // next/compat/router's useRouter() returns the real router.
+        // next/router and next/compat/router return the real Pages Router.
         const wrapWithRouterContext = routerShim.wrapWithRouterContext;
 
         if (AppComponent) {
@@ -880,6 +893,7 @@ export function createSSRHandler(
 import "vinext/instrumentation-client";
 import React from "react";
 import { hydrateRoot } from "react-dom/client";
+import { installPagesRouterRuntime } from "vinext/pages-router-runtime";
 import { wrapWithRouterContext } from "next/router";
 
 const nextData = window.__NEXT_DATA__;
@@ -904,6 +918,7 @@ async function hydrate() {
   element = wrapWithRouterContext(element);
   const root = hydrateRoot(document.getElementById("__next"), element);
   window.__VINEXT_ROOT__ = root;
+  installPagesRouterRuntime();
   window.__VINEXT_HYDRATED_AT = performance.now();
 }
 hydrate();
@@ -955,7 +970,7 @@ hydrate();
           } else {
             extraHeaders["Cache-Control"] =
               `s-maxage=${isrRevalidateSeconds}, stale-while-revalidate`;
-            extraHeaders["X-Vinext-Cache"] = "MISS";
+            extraHeaders[VINEXT_CACHE_HEADER] = "MISS";
           }
         }
 

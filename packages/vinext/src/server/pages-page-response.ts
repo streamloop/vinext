@@ -1,7 +1,13 @@
 import React, { type ComponentType, type ReactNode } from "react";
+import type { VinextNextData } from "../client/vinext-next-data.js";
+import type { CachedPagesValue } from "vinext/shims/cache";
 import { withScriptNonce } from "vinext/shims/script-nonce-context";
+import { getRequestExecutionContext } from "vinext/shims/request-context";
 import { buildRevalidateCacheControl } from "./cache-control.js";
+import { VINEXT_CACHE_HEADER } from "./headers.js";
 import { createInlineScriptTag, createNonceAttribute, escapeHtmlAttr } from "./html.js";
+import { reportRequestError } from "./instrumentation.js";
+import { readStreamAsText } from "../utils/text-stream.js";
 
 type PagesFontPreload = {
   href: string;
@@ -42,13 +48,7 @@ type RenderPagesPageResponseOptions = {
   isrRevalidateSeconds: number | null;
   isrSet: (
     key: string,
-    data: {
-      kind: "PAGES";
-      html: string;
-      pageData: Record<string, unknown>;
-      headers: undefined;
-      status: undefined;
-    },
+    data: CachedPagesValue,
     revalidateSeconds: number,
     tags?: string[],
     expireSeconds?: number,
@@ -57,7 +57,6 @@ type RenderPagesPageResponseOptions = {
   pageProps: Record<string, unknown>;
   params: Record<string, unknown>;
   renderDocumentToString: (element: ReactNode) => Promise<string>;
-  renderIsrPassToStringAsync: (element: ReactNode) => Promise<string>;
   renderToReadableStream: (element: ReactNode) => Promise<ReadableStream<Uint8Array>>;
   resetSSRHead?: (() => void) | undefined;
   routePattern: string;
@@ -100,7 +99,9 @@ export function buildPagesNextDataScript(
     | "routePattern"
     | "safeJsonStringify"
     | "scriptNonce"
-  >,
+  > & {
+    vinext?: VinextNextData["__vinext"];
+  },
 ): string {
   const nextDataPayload: Record<string, unknown> = {
     props: { pageProps: options.pageProps },
@@ -115,6 +116,10 @@ export function buildPagesNextDataScript(
     nextDataPayload.locales = options.i18n.locales;
     nextDataPayload.defaultLocale = options.i18n.defaultLocale;
     nextDataPayload.domainLocales = options.i18n.domainLocales;
+  }
+
+  if (options.vinext) {
+    nextDataPayload.__vinext = options.vinext;
   }
 
   const localeGlobals = options.i18n.locales
@@ -197,6 +202,61 @@ async function buildPagesCompositeStream(
   });
 }
 
+async function reportPagesIsrCacheWriteError(
+  error: unknown,
+  cacheKey: string,
+  routePattern: string,
+): Promise<void> {
+  console.error(`[vinext] Pages ISR cache write failed for ${cacheKey}:`, error);
+  try {
+    await reportRequestError(
+      error instanceof Error ? error : new Error(String(error)),
+      { path: cacheKey, method: "GET", headers: {} },
+      {
+        routerKind: "Pages Router",
+        routePath: routePattern,
+        routeType: "render",
+      },
+    );
+  } catch {
+    // Cache-write failure reporting must never make the background task reject.
+  }
+}
+
+function schedulePagesIsrCacheWrite(options: {
+  cacheKey: string;
+  expireSeconds?: number;
+  pageData: Record<string, unknown>;
+  revalidateSeconds: number;
+  routePattern: string;
+  shellPrefix: string;
+  shellSuffix: string;
+  stream: ReadableStream<Uint8Array>;
+  setCache: RenderPagesPageResponseOptions["isrSet"];
+}): void {
+  const cacheWritePromise = readStreamAsText(options.stream)
+    .then((bodyHtml) =>
+      options.setCache(
+        options.cacheKey,
+        {
+          kind: "PAGES",
+          html: options.shellPrefix + bodyHtml + options.shellSuffix,
+          pageData: options.pageData,
+          headers: undefined,
+          status: undefined,
+        },
+        options.revalidateSeconds,
+        undefined,
+        options.expireSeconds,
+      ),
+    )
+    .catch((error: unknown) =>
+      reportPagesIsrCacheWriteError(error, options.cacheKey, options.routePattern),
+    );
+
+  getRequestExecutionContext()?.waitUntil(cacheWritePromise);
+}
+
 function applyGsspHeaders(headers: Headers, gsspRes: PagesGsspResponse | null): number {
   if (!gsspRes) {
     return 200;
@@ -270,8 +330,8 @@ export async function renderPagesPageResponse(
   const markerIndex = shellHtml.indexOf(bodyMarker);
   const shellPrefix = shellHtml.slice(0, markerIndex);
   const shellSuffix = shellHtml.slice(markerIndex + bodyMarker.length);
-  const compositeStream = await buildPagesCompositeStream(bodyStream, shellPrefix, shellSuffix);
 
+  let responseBodyStream = bodyStream;
   if (
     // Keep nonce-bearing pages out of ISR writes: rewritePagesCachedHtml()
     // later matches the cached __NEXT_DATA__ block via a bare <script> marker.
@@ -279,29 +339,30 @@ export async function renderPagesPageResponse(
     options.isrRevalidateSeconds !== null &&
     options.isrRevalidateSeconds > 0
   ) {
-    const isrElement = React.createElement(
-      React.Fragment,
-      null,
-      options.createPageElement(options.pageProps),
-    );
-    const isrHtml = await options.renderIsrPassToStringAsync(isrElement);
-    const fullHtml = shellPrefix + isrHtml + shellSuffix;
+    const cacheBodyStreamPair = bodyStream.tee();
+    responseBodyStream = cacheBodyStreamPair[0];
+    const cacheBodyStream = cacheBodyStreamPair[1];
     const isrPathname = options.routeUrl.split("?")[0];
     const cacheKey = options.isrCacheKey("pages", isrPathname);
-    await options.isrSet(
+
+    schedulePagesIsrCacheWrite({
       cacheKey,
-      {
-        kind: "PAGES",
-        html: fullHtml,
-        pageData: options.pageProps,
-        headers: undefined,
-        status: undefined,
-      },
-      options.isrRevalidateSeconds,
-      undefined,
-      options.expireSeconds,
-    );
+      expireSeconds: options.expireSeconds,
+      pageData: options.pageProps,
+      revalidateSeconds: options.isrRevalidateSeconds,
+      routePattern: options.routePattern,
+      setCache: options.isrSet,
+      shellPrefix,
+      shellSuffix,
+      stream: cacheBodyStream,
+    });
   }
+
+  const compositeStream = await buildPagesCompositeStream(
+    responseBodyStream,
+    shellPrefix,
+    shellSuffix,
+  );
 
   const responseHeaders = new Headers({ "Content-Type": "text/html" });
   const finalStatus = applyGsspHeaders(responseHeaders, options.gsspRes);
@@ -313,18 +374,22 @@ export async function renderPagesPageResponse(
       "Cache-Control",
       buildRevalidateCacheControl(options.isrRevalidateSeconds, options.expireSeconds),
     );
-    responseHeaders.set("X-Vinext-Cache", "MISS");
+    responseHeaders.set(VINEXT_CACHE_HEADER, "MISS");
   }
   if (options.fontLinkHeader) {
     responseHeaders.set("Link", options.fontLinkHeader);
   }
 
-  const response = new Response(compositeStream, {
-    status: finalStatus,
-    headers: responseHeaders,
-  }) as PagesStreamedHtmlResponse;
+  const response: PagesStreamedHtmlResponse = Object.assign(
+    new Response(compositeStream, {
+      status: finalStatus,
+      headers: responseHeaders,
+    }),
+    {
+      __vinextStreamedHtmlResponse: true,
+    },
+  );
   // Mark the normal streamed HTML render so the Node prod server can strip
   // stale Content-Length only for this path, not for custom gSSP responses.
-  response.__vinextStreamedHtmlResponse = true;
   return response;
 }

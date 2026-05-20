@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 import {
+  type AppPageCacheOutcomeMetric,
   buildAppPageCacheTags,
   buildAppPageCachedResponse,
   finalizeAppPageHtmlCacheResponse,
@@ -8,7 +9,12 @@ import {
   scheduleAppPageRscCacheWrite,
 } from "../packages/vinext/src/server/app-page-cache.js";
 import type { ISRCacheEntry } from "../packages/vinext/src/server/isr-cache.js";
+import {
+  VINEXT_RSC_COMPATIBILITY_ID_HEADER,
+  VINEXT_RSC_VARY_HEADER,
+} from "../packages/vinext/src/server/app-rsc-cache-busting.js";
 import type { CachedAppPageValue } from "../packages/vinext/src/shims/cache.js";
+import { withEnvVar } from "./env-test-helpers.js";
 
 function buildISRCacheEntry(
   value: CachedAppPageValue,
@@ -69,15 +75,66 @@ describe("app page cache helpers", () => {
     expect(htmlResponse?.headers.get("x-vinext-cache")).toBe("HIT");
     await expect(htmlResponse?.text()).resolves.toBe("<h1>cached</h1>");
 
-    const rscResponse = buildAppPageCachedResponse(cachedValue, {
-      cacheState: "STALE",
-      expireSeconds: 300,
-      isRscRequest: true,
+    const rscResponse = withEnvVar("__VINEXT_RSC_COMPATIBILITY_ID", "compat-a", () =>
+      buildAppPageCachedResponse(cachedValue, {
+        cacheState: "STALE",
+        expireSeconds: 300,
+        isRscRequest: true,
+        revalidateSeconds: 60,
+      }),
+    );
+    expect(rscResponse?.headers.get("content-type")).toBe("text/x-component");
+    expect(rscResponse?.headers.get("cache-control")).toBe("s-maxage=0, stale-while-revalidate");
+    expect(rscResponse?.headers.get(VINEXT_RSC_COMPATIBILITY_ID_HEADER)).toBe("compat-a");
+    expect(await rscResponse?.arrayBuffer()).toEqual(rscData);
+  });
+
+  it("merges middleware response headers into cached HTML responses", async () => {
+    const middlewareHeaders = new Headers({
+      "Cache-Control": "private, no-store",
+      "Content-Security-Policy": "frame-ancestors 'none'",
+      Vary: "Accept-Encoding",
+      "X-Frame-Options": "DENY",
+    });
+    middlewareHeaders.append("Set-Cookie", "session=abc; Path=/; HttpOnly");
+
+    const response = buildAppPageCachedResponse(buildCachedAppPageValue("<h1>cached</h1>"), {
+      cacheState: "HIT",
+      isRscRequest: false,
+      middlewareHeaders,
       revalidateSeconds: 60,
     });
-    expect(rscResponse?.headers.get("content-type")).toBe("text/x-component; charset=utf-8");
-    expect(rscResponse?.headers.get("cache-control")).toBe("s-maxage=0, stale-while-revalidate");
-    expect(await rscResponse?.arrayBuffer()).toEqual(rscData);
+
+    expect(response?.headers.get("Cache-Control")).toBe("private, no-store");
+    expect(response?.headers.get("Content-Security-Policy")).toBe("frame-ancestors 'none'");
+    expect(response?.headers.get("Set-Cookie")).toBe("session=abc; Path=/; HttpOnly");
+    expect(response?.headers.get("Vary")).toBe(`${VINEXT_RSC_VARY_HEADER}, Accept-Encoding`);
+    expect(response?.headers.get("X-Frame-Options")).toBe("DENY");
+    expect(response?.headers.get("X-Vinext-Cache")).toBe("HIT");
+  });
+
+  it("merges middleware response headers into cached RSC responses", async () => {
+    const rscData = new TextEncoder().encode("flight").buffer;
+    const middlewareHeaders = new Headers({
+      "Access-Control-Allow-Origin": "https://example.com",
+      [VINEXT_RSC_COMPATIBILITY_ID_HEADER]: "middleware-compat",
+      Vary: "Origin",
+    });
+
+    const response = withEnvVar("__VINEXT_RSC_COMPATIBILITY_ID", "framework-compat", () =>
+      buildAppPageCachedResponse(buildCachedAppPageValue("", rscData), {
+        cacheState: "STALE",
+        isRscRequest: true,
+        middlewareHeaders,
+        revalidateSeconds: 60,
+      }),
+    );
+
+    expect(response?.headers.get("Access-Control-Allow-Origin")).toBe("https://example.com");
+    expect(response?.headers.get(VINEXT_RSC_COMPATIBILITY_ID_HEADER)).toBe("framework-compat");
+    expect(response?.headers.get("Vary")).toBe(`${VINEXT_RSC_VARY_HEADER}, Origin`);
+    expect(response?.headers.get("X-Vinext-Cache")).toBe("STALE");
+    await expect(response?.arrayBuffer()).resolves.toEqual(rscData);
   });
 
   it("uses stored cache-control metadata instead of global config for cached HIT responses", async () => {
@@ -104,6 +161,18 @@ describe("app page cache helpers", () => {
     });
 
     expect(response?.headers.get("cache-control")).toBe("s-maxage=60, stale-while-revalidate=240");
+  });
+
+  it("emits static cache-control for cached indefinite app pages", async () => {
+    const response = buildAppPageCachedResponse(buildCachedAppPageValue("<h1>cached</h1>"), {
+      cacheState: "HIT",
+      isRscRequest: false,
+      revalidateSeconds: Infinity,
+    });
+
+    expect(response?.headers.get("cache-control")).toBe(
+      "s-maxage=31536000, stale-while-revalidate",
+    );
   });
 
   it("preserves legacy STALE headers when cached entries lack cache-control metadata", async () => {
@@ -147,6 +216,20 @@ describe("app page cache helpers", () => {
     expect(response?.status).toBe(200);
   });
 
+  it("uses middleware status for cached responses when middleware continues", () => {
+    const response = buildAppPageCachedResponse(
+      buildCachedAppPageValue("<h1>cached</h1>", undefined, 201),
+      {
+        cacheState: "HIT",
+        isRscRequest: false,
+        middlewareStatus: 202,
+        revalidateSeconds: 60,
+      },
+    );
+
+    expect(response?.status).toBe(202);
+  });
+
   it("returns null when a cached entry lacks the requested HTML or RSC payload", () => {
     const htmlOnly = buildCachedAppPageValue("<h1>cached</h1>");
     const rscOnly = buildCachedAppPageValue("", new TextEncoder().encode("flight").buffer);
@@ -169,6 +252,8 @@ describe("app page cache helpers", () => {
 
   it("returns cached HIT responses and clears request state", async () => {
     let didClearRequestContext = false;
+    const middlewareHeaders = new Headers({ "X-From-Middleware": "hit" });
+    const cacheOutcomes: AppPageCacheOutcomeMetric[] = [];
 
     const response = await readAppPageCacheResponse({
       cleanPathname: "/cached",
@@ -186,6 +271,57 @@ describe("app page cache helpers", () => {
         return "rsc:" + pathname;
       },
       async isrSet() {},
+      middlewareHeaders,
+      middlewareStatus: 203,
+      recordCacheOutcome(metric) {
+        cacheOutcomes.push(metric);
+      },
+      revalidateSeconds: 60,
+      async renderFreshPageForCache() {
+        throw new Error("should not render");
+      },
+      scheduleBackgroundRegeneration() {
+        throw new Error("should not schedule regeneration");
+      },
+    });
+
+    expect(response?.headers.get("x-vinext-cache")).toBe("HIT");
+    expect(response?.headers.get("x-from-middleware")).toBe("hit");
+    expect(response?.status).toBe(203);
+    await expect(response?.text()).resolves.toBe("<h1>cached</h1>");
+    expect(didClearRequestContext).toBe(true);
+    expect(cacheOutcomes).toEqual([
+      {
+        artifact: "html",
+        cacheKey: "html:/cached",
+        outcome: "hit",
+        reason: "served",
+      },
+    ]);
+  });
+
+  it("returns cached HIT responses when the cache outcome recorder throws", async () => {
+    let didClearRequestContext = false;
+
+    const response = await readAppPageCacheResponse({
+      cleanPathname: "/cached",
+      clearRequestContext() {
+        didClearRequestContext = true;
+      },
+      isRscRequest: false,
+      async isrGet() {
+        return buildISRCacheEntry(buildCachedAppPageValue("<h1>cached</h1>"));
+      },
+      isrHtmlKey(pathname) {
+        return "html:" + pathname;
+      },
+      isrRscKey(pathname) {
+        return "rsc:" + pathname;
+      },
+      async isrSet() {},
+      recordCacheOutcome() {
+        throw new Error("metrics sink unavailable");
+      },
       revalidateSeconds: 60,
       async renderFreshPageForCache() {
         throw new Error("should not render");
@@ -299,6 +435,41 @@ describe("app page cache helpers", () => {
     ]);
   });
 
+  it("dedups stale RSC regeneration by the slot-specific cache key", async () => {
+    const scheduledKeys: string[] = [];
+    const rscData = new TextEncoder().encode("stale-flight").buffer;
+
+    await readAppPageCacheResponse({
+      cleanPathname: "/parallel",
+      clearRequestContext() {},
+      isRscRequest: true,
+      async isrGet() {
+        return buildISRCacheEntry(buildCachedAppPageValue("", rscData), true);
+      },
+      isrHtmlKey(pathname) {
+        return "html:" + pathname;
+      },
+      isrRscKey(pathname, mountedSlotsHeader) {
+        return `rsc:${pathname}:${mountedSlotsHeader ?? "none"}`;
+      },
+      async isrSet() {},
+      mountedSlotsHeader: "slot:auth:/",
+      revalidateSeconds: 60,
+      async renderFreshPageForCache() {
+        return {
+          html: "<h1>fresh</h1>",
+          rscData,
+          tags: ["/parallel", "_N_T_/parallel"],
+        };
+      },
+      scheduleBackgroundRegeneration(key) {
+        scheduledKeys.push(key);
+      },
+    });
+
+    expect(scheduledKeys).toEqual(["rsc:/parallel:slot:auth:/"]);
+  });
+
   it("serves stale HTML entries and regenerates HTML plus canonical RSC cache keys", async () => {
     const scheduledRegenerations: Array<() => Promise<void>> = [];
     const isrSetCalls: Array<{
@@ -395,6 +566,7 @@ describe("app page cache helpers", () => {
 
   it("falls through and logs on cache read errors", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const cacheOutcomes: AppPageCacheOutcomeMetric[] = [];
 
     const response = await readAppPageCacheResponse({
       cleanPathname: "/broken",
@@ -410,6 +582,9 @@ describe("app page cache helpers", () => {
         return "rsc:" + pathname;
       },
       async isrSet() {},
+      recordCacheOutcome(metric) {
+        cacheOutcomes.push(metric);
+      },
       revalidateSeconds: 60,
       async renderFreshPageForCache() {
         throw new Error("should not render");
@@ -418,8 +593,67 @@ describe("app page cache helpers", () => {
     });
 
     expect(response).toBeNull();
+    expect(cacheOutcomes).toEqual([
+      {
+        artifact: "html",
+        cacheKey: "html:/broken",
+        outcome: "miss",
+        reason: "read-error",
+      },
+    ]);
     expect(errorSpy).toHaveBeenCalledOnce();
     errorSpy.mockRestore();
+  });
+
+  it("records a miss when a cache key contains a non-app-page value", async () => {
+    const cacheOutcomes: AppPageCacheOutcomeMetric[] = [];
+
+    const response = await readAppPageCacheResponse({
+      cleanPathname: "/wrong-kind",
+      clearRequestContext() {
+        throw new Error("should not clear request context when falling through");
+      },
+      isRscRequest: false,
+      async isrGet() {
+        return {
+          isStale: false,
+          value: {
+            lastModified: Date.now(),
+            value: {
+              kind: "REDIRECT",
+              props: {},
+            },
+          },
+        };
+      },
+      isrHtmlKey(pathname) {
+        return "html:" + pathname;
+      },
+      isrRscKey(pathname) {
+        return "rsc:" + pathname;
+      },
+      async isrSet() {},
+      recordCacheOutcome(metric) {
+        cacheOutcomes.push(metric);
+      },
+      revalidateSeconds: 60,
+      async renderFreshPageForCache() {
+        throw new Error("should not render");
+      },
+      scheduleBackgroundRegeneration() {
+        throw new Error("should not schedule regeneration");
+      },
+    });
+
+    expect(response).toBeNull();
+    expect(cacheOutcomes).toEqual([
+      {
+        artifact: "html",
+        cacheKey: "html:/wrong-kind",
+        outcome: "miss",
+        reason: "non-app-page-entry",
+      },
+    ]);
   });
 
   it("finalizes HTML responses by teeing the stream and writing HTML and RSC cache keys", async () => {
@@ -564,6 +798,60 @@ describe("app page cache helpers", () => {
     ]);
   });
 
+  it("skips HTML and RSC cache writes when dynamic usage was captured before context cleanup", async () => {
+    const pendingCacheWrites: Promise<void>[] = [];
+    const debugCalls: Array<[string, string]> = [];
+    const isrSet = vi.fn();
+
+    const response = finalizeAppPageHtmlCacheResponse(
+      new Response("<h1>personalized</h1>", {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "s-maxage=60, stale-while-revalidate",
+          Vary: "RSC, Accept",
+          "X-Vinext-Cache": "MISS",
+        },
+      }),
+      {
+        capturedDynamicUsageBeforeContextCleanup() {
+          return true;
+        },
+        capturedRscDataPromise: Promise.resolve(new TextEncoder().encode("flight").buffer),
+        cleanPathname: "/dynamic-html-cleanup",
+        consumeDynamicUsage() {
+          return false;
+        },
+        getPageTags() {
+          return ["/dynamic-html-cleanup", "_N_T_/dynamic-html-cleanup"];
+        },
+        isrDebug(event, detail) {
+          debugCalls.push([event, detail]);
+        },
+        isrHtmlKey(pathname) {
+          return "html:" + pathname;
+        },
+        isrRscKey(pathname) {
+          return "rsc:" + pathname;
+        },
+        isrSet,
+        revalidateSeconds: 60,
+        waitUntil(promise) {
+          pendingCacheWrites.push(promise);
+        },
+      },
+    );
+
+    await expect(response.text()).resolves.toBe("<h1>personalized</h1>");
+    expect(pendingCacheWrites).toHaveLength(1);
+
+    await pendingCacheWrites[0];
+
+    expect(isrSet).not.toHaveBeenCalled();
+    expect(debugCalls).toEqual([
+      ["HTML cache write skipped (dynamic usage during render)", "html:/dynamic-html-cleanup"],
+    ]);
+  });
+
   it("schedules RSC cache writes when the page stayed static through stream consumption", async () => {
     const pendingCacheWrites: Promise<void>[] = [];
     const debugCalls: Array<[string, string]> = [];
@@ -634,7 +922,7 @@ describe("app page cache helpers", () => {
     const response = finalizeAppPageRscCacheResponse(
       new Response("flight", {
         headers: {
-          "Content-Type": "text/x-component; charset=utf-8",
+          "Content-Type": "text/x-component",
           "Cache-Control": "s-maxage=60, stale-while-revalidate",
           "X-Vinext-Cache": "MISS",
         },

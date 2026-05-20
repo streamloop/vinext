@@ -8,14 +8,22 @@
  * We support both the sync (legacy) and async patterns.
  */
 
-import { AsyncLocalStorage } from "node:async_hooks";
+import type { AsyncLocalStorage } from "node:async_hooks";
+import { MIDDLEWARE_SET_COOKIE_HEADER } from "../server/headers.js";
 import { buildRequestHeadersFromMiddlewareResponse } from "../server/middleware-request-headers.js";
+import { getOrCreateAls } from "./internal/als-registry.js";
+import {
+  serializeSetCookie,
+  validateCookieAttributeValue,
+  validateCookieName,
+} from "./internal/cookie-serialize.js";
 import { parseCookieHeader } from "./internal/parse-cookie-header.js";
 import {
   isInsideUnifiedScope,
   getRequestContext,
   runWithUnifiedStateMutation,
 } from "./unified-request-context.js";
+import type { RenderRequestApiKind } from "../server/cache-proof.js";
 
 // ---------------------------------------------------------------------------
 // Request context
@@ -36,6 +44,7 @@ export type HeadersAccessPhase = "render" | "action" | "route-handler";
 export type VinextHeadersShimState = {
   headersContext: HeadersContext | null;
   dynamicUsageDetected: boolean;
+  renderRequestApiUsage: Set<RenderRequestApiKind>;
   /** Error recorded by throwIfInsideCacheScope for dev diagnostics, persists even if caught by user code. */
   invalidDynamicUsageError: unknown;
   pendingSetCookies: string[];
@@ -50,22 +59,20 @@ export type VinextHeadersShimState = {
 //   (next/headers) always share it.
 // - We use AsyncLocalStorage so concurrent requests don't stomp each other's
 //   headers/cookies/dynamic-usage state.
-const _ALS_KEY = Symbol.for("vinext.nextHeadersShim.als");
 const _FALLBACK_KEY = Symbol.for("vinext.nextHeadersShim.fallback");
 const _g = globalThis as unknown as Record<PropertyKey, unknown>;
-const _als = (_g[_ALS_KEY] ??=
-  new AsyncLocalStorage<VinextHeadersShimState>()) as AsyncLocalStorage<VinextHeadersShimState>;
+const _als = getOrCreateAls<VinextHeadersShimState>("vinext.nextHeadersShim.als");
 
 const _fallbackState = (_g[_FALLBACK_KEY] ??= {
   headersContext: null,
   dynamicUsageDetected: false,
+  renderRequestApiUsage: new Set<RenderRequestApiKind>(),
   invalidDynamicUsageError: null,
   pendingSetCookies: [],
   draftModeCookieHeader: null,
   phase: "render",
 } satisfies VinextHeadersShimState) as VinextHeadersShimState;
 const EXPIRED_COOKIE_DATE = new Date(0).toUTCString();
-const MIDDLEWARE_SET_COOKIE_HEADER = "x-middleware-set-cookie";
 
 function splitMiddlewareSetCookieHeader(value: string): string[] {
   const cookies: string[] = [];
@@ -171,6 +178,21 @@ export function markDynamicUsage(): void {
     return;
   }
   state.dynamicUsageDetected = true;
+}
+
+export function markRenderRequestApiUsage(kind: RenderRequestApiKind): void {
+  _getState().renderRequestApiUsage.add(kind);
+}
+
+export function peekRenderRequestApiUsage(): RenderRequestApiKind[] {
+  return [..._getState().renderRequestApiUsage].sort();
+}
+
+export function consumeRenderRequestApiUsage(): RenderRequestApiKind[] {
+  const state = _getState();
+  const observed = [...state.renderRequestApiUsage].sort();
+  state.renderRequestApiUsage = new Set<RenderRequestApiKind>();
+  return observed;
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +306,10 @@ export function setHeadersAccessPhase(phase: HeadersAccessPhase): HeadersAccessP
   return _setStatePhase(_getState(), phase);
 }
 
+export function getHeadersAccessPhase(): HeadersAccessPhase {
+  return _getState().phase;
+}
+
 /**
  * Set the headers/cookies context for the current RSC render.
  * Called by the framework's RSC entry before rendering each request.
@@ -307,6 +333,7 @@ export function setHeadersContext(ctx: HeadersContext | null): void {
   if (ctx !== null) {
     state.headersContext = ctx;
     state.dynamicUsageDetected = false;
+    state.renderRequestApiUsage = new Set();
     state.pendingSetCookies = [];
     state.draftModeCookieHeader = null;
     state.phase = "render";
@@ -339,6 +366,7 @@ export function runWithHeadersContext<T>(
     return runWithUnifiedStateMutation((uCtx) => {
       uCtx.headersContext = ctx;
       uCtx.dynamicUsageDetected = false;
+      uCtx.renderRequestApiUsage = new Set();
       uCtx.pendingSetCookies = [];
       uCtx.draftModeCookieHeader = null;
       uCtx.phase = "render";
@@ -348,6 +376,7 @@ export function runWithHeadersContext<T>(
   const state: VinextHeadersShimState = {
     headersContext: ctx,
     dynamicUsageDetected: false,
+    renderRequestApiUsage: new Set(),
     invalidDynamicUsageError: null,
     pendingSetCookies: [],
     draftModeCookieHeader: null,
@@ -467,6 +496,26 @@ function _decorateRequestApiPromise<T extends object>(
       );
     },
   });
+}
+
+// React.use() tracks thenables by identity, so request APIs must reuse the
+// same decorated promise for the same underlying request view.
+const _decoratedHeadersPromises = new WeakMap<Headers, Promise<Headers> & Headers>();
+const _decoratedCookiesPromises = new WeakMap<
+  RequestCookies,
+  Promise<RequestCookies> & RequestCookies
+>();
+
+function _getOrCreateDecoratedRequestApiPromise<T extends object>(
+  cache: WeakMap<T, Promise<T> & T>,
+  target: T,
+): Promise<T> & T {
+  const cached = cache.get(target);
+  if (cached) return cached;
+
+  const promise = _decorateRequestApiPromise(Promise.resolve(target), target);
+  cache.set(target, promise);
+  return promise;
 }
 
 function _decorateRejectedRequestApiPromise<T extends object>(error: unknown): Promise<T> & T {
@@ -649,6 +698,7 @@ export function headersContextFromRequest(request: Request): HeadersContext {
  * the context is already available).
  */
 export function headers(): Promise<Headers> & Headers {
+  markRenderRequestApiUsage("headers");
   try {
     throwIfInsideCacheScope("headers()");
   } catch (error) {
@@ -671,7 +721,7 @@ export function headers(): Promise<Headers> & Headers {
 
   markDynamicUsage();
   const readonlyHeaders = _getReadonlyHeaders(state.headersContext);
-  return _decorateRequestApiPromise(Promise.resolve(readonlyHeaders), readonlyHeaders);
+  return _getOrCreateDecoratedRequestApiPromise(_decoratedHeadersPromises, readonlyHeaders);
 }
 
 /**
@@ -679,6 +729,7 @@ export function headers(): Promise<Headers> & Headers {
  * Returns a ReadonlyRequestCookies-like object.
  */
 export function cookies(): Promise<RequestCookies> & RequestCookies {
+  markRenderRequestApiUsage("cookies");
   try {
     throwIfInsideCacheScope("cookies()");
   } catch (error) {
@@ -703,7 +754,7 @@ export function cookies(): Promise<RequestCookies> & RequestCookies {
     ? _getMutableCookies(state.headersContext)
     : _getReadonlyCookies(state.headersContext);
 
-  return _decorateRequestApiPromise(Promise.resolve(cookieStore), cookieStore);
+  return _getOrCreateDecoratedRequestApiPromise(_decoratedCookiesPromises, cookieStore);
 }
 
 // ---------------------------------------------------------------------------
@@ -756,8 +807,14 @@ export function getDraftModeCookieHeader(): string | null {
   return header;
 }
 
+export function isDraftModeRequest(request: Request): boolean {
+  const cookieHeader = request.headers.get("cookie");
+  if (!cookieHeader) return false;
+  return parseCookieHeader(cookieHeader).get(DRAFT_MODE_COOKIE) === getDraftSecret();
+}
+
 type DraftModeResult = {
-  isEnabled: boolean;
+  readonly isEnabled: boolean;
   enable(): void;
   disable(): void;
 };
@@ -777,21 +834,28 @@ function draftModeCookieAttributes(): string {
  * - `disable()`: clears the bypass cookie
  */
 export async function draftMode(): Promise<DraftModeResult> {
+  markRenderRequestApiUsage("draftMode");
   throwIfInsideCacheScope("draftMode()");
 
   const state = _getState();
   if (state.headersContext?.accessError) {
     throw state.headersContext.accessError;
   }
-  markDynamicUsage();
+  // Reading `draftMode()` itself is not dynamic — `isEnabled` is a plain
+  // getter and merely calling `draftMode()` does not require bailing out
+  // of static prerendering. Only `enable()`/`disable()` mutate state and
+  // must be tracked as dynamic, mirroring Next.js's `trackDynamicDraftMode`
+  // (see .nextjs-ref/packages/next/src/server/request/draft-mode.ts:152-165).
   const secret = getDraftSecret();
-  const isEnabled = state.headersContext
-    ? state.headersContext.cookies.get(DRAFT_MODE_COOKIE) === secret
-    : false;
 
   return {
-    isEnabled,
+    get isEnabled(): boolean {
+      return state.headersContext
+        ? state.headersContext.cookies.get(DRAFT_MODE_COOKIE) === secret
+        : false;
+    },
     enable(): void {
+      markDynamicUsage();
       if (state.headersContext?.accessError) {
         throw state.headersContext.accessError;
       }
@@ -801,6 +865,7 @@ export async function draftMode(): Promise<DraftModeResult> {
       state.draftModeCookieHeader = `${DRAFT_MODE_COOKIE}=${secret}; ${draftModeCookieAttributes()}`;
     },
     disable(): void {
+      markDynamicUsage();
       if (state.headersContext?.accessError) {
         throw state.headersContext.accessError;
       }
@@ -810,36 +875,6 @@ export async function draftMode(): Promise<DraftModeResult> {
       state.draftModeCookieHeader = `${DRAFT_MODE_COOKIE}=; ${draftModeCookieAttributes()}; Expires=${DRAFT_MODE_EXPIRED_DATE}`;
     },
   };
-}
-
-// ---------------------------------------------------------------------------
-// Cookie name/value validation (RFC 6265)
-// ---------------------------------------------------------------------------
-
-/**
- * RFC 6265 §4.1.1: cookie-name is a token (RFC 2616 §2.2).
- * Allowed: any visible ASCII (0x21-0x7E) except separators: ()<>@,;:\"/[]?={}
- */
-const VALID_COOKIE_NAME_RE =
-  /^[\x21\x23-\x27\x2A\x2B\x2D\x2E\x30-\x39\x41-\x5A\x5E-\x7A\x7C\x7E]+$/;
-
-function validateCookieName(name: string): void {
-  if (!name || !VALID_COOKIE_NAME_RE.test(name)) {
-    throw new Error(`Invalid cookie name: ${JSON.stringify(name)}`);
-  }
-}
-
-/**
- * Validate cookie attribute values (path, domain) to prevent injection
- * via semicolons, newlines, or other control characters.
- */
-function validateCookieAttributeValue(value: string, attributeName: string): void {
-  for (let i = 0; i < value.length; i++) {
-    const code = value.charCodeAt(i);
-    if (code <= 0x1f || code === 0x7f || value[i] === ";") {
-      throw new Error(`Invalid cookie ${attributeName} value: ${JSON.stringify(value)}`);
-    }
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -922,22 +957,7 @@ class RequestCookies {
     // Update the local cookie map
     this._cookies.set(cookieName, cookieValue);
 
-    // Build Set-Cookie header string
-    const parts = [`${cookieName}=${encodeURIComponent(cookieValue)}`];
-    const path = opts?.path ?? "/";
-    validateCookieAttributeValue(path, "Path");
-    parts.push(`Path=${path}`);
-    if (opts?.domain) {
-      validateCookieAttributeValue(opts.domain, "Domain");
-      parts.push(`Domain=${opts.domain}`);
-    }
-    if (opts?.maxAge !== undefined) parts.push(`Max-Age=${opts.maxAge}`);
-    if (opts?.expires) parts.push(`Expires=${opts.expires.toUTCString()}`);
-    if (opts?.httpOnly) parts.push("HttpOnly");
-    if (opts?.secure) parts.push("Secure");
-    if (opts?.sameSite) parts.push(`SameSite=${opts.sameSite}`);
-
-    _getState().pendingSetCookies.push(parts.join("; "));
+    _getState().pendingSetCookies.push(serializeSetCookie(cookieName, cookieValue, opts));
     return this;
   }
 
