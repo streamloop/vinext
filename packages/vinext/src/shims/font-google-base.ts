@@ -408,12 +408,15 @@ const injectedSelfHosted = ((_g[_INJECTED_SELF_HOSTED_KEY] as Set<string>) ??= n
  * Inject self-hosted @font-face CSS (from the build plugin).
  * This replaces the CDN <link> tag with inline CSS.
  */
-function injectSelfHostedCSS(css: string): void {
+function injectSelfHostedCSS(css: string, collectPreloads = true): void {
   if (injectedSelfHosted.has(css)) return;
   injectedSelfHosted.add(css);
 
-  // Extract font file URLs for preload hints (SSR only)
-  collectFontPreloadsFromCSS(css);
+  // Extract font file URLs for preload hints (SSR only). Skipped when the
+  // font was declared with `preload: false` — otherwise every font is
+  // preloaded on every route (the SSR preload list is process-global), so a
+  // `preload: false` font still gets preloaded everywhere.
+  if (collectPreloads) collectFontPreloadsFromCSS(css);
 
   if (typeof document === "undefined") {
     // SSR: add to collected styles
@@ -469,8 +472,10 @@ export function createFontLoader(family: string): FontLoader {
     });
 
     if (internal?.selfHostedCSS) {
-      // Self-hosted mode: inject local @font-face CSS instead of CDN link
-      injectSelfHostedCSS(internal.selfHostedCSS);
+      // Self-hosted mode: inject local @font-face CSS instead of CDN link.
+      // Only collect preload hints when the caller opted into preloading
+      // (`preload` defaults to true in next/font).
+      injectSelfHostedCSS(internal.selfHostedCSS, options.preload !== false);
     } else {
       // CDN mode: inject <link> to Google Fonts
       const url = buildGoogleFontsUrl(family, options);
