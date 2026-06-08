@@ -144,6 +144,57 @@ describe("Pages i18n domain routing (production)", () => {
       '"domainLocales":[{"domain":"example.com","defaultLocale":"en"},{"domain":"example.fr","defaultLocale":"fr","http":true}]',
     );
   });
+
+  it("keys Pages ISR entries by i18n domain context", async () => {
+    const fr = await requestNodeServerWithHost(prodPort, "/isr-about", "example.fr");
+    expect(fr.status).toBe(200);
+    expect(fr.headers["x-vinext-cache"]).toBe("MISS");
+    expect(fr.body).toContain('<p id="locale">fr</p>');
+    expect(fr.body).toContain('<p id="defaultLocale">fr</p>');
+
+    const en = await requestNodeServerWithHost(prodPort, "/isr-about", "example.com");
+    expect(en.status).toBe(200);
+    expect(en.headers["x-vinext-cache"]).toBe("MISS");
+    expect(en.body).toContain('<p id="locale">en</p>');
+    expect(en.body).toContain('<p id="defaultLocale">en</p>');
+    expect(en.body).not.toContain('<p id="locale">fr</p>');
+
+    const enHit = await requestNodeServerWithHost(prodPort, "/isr-about", "example.com");
+    expect(enHit.status).toBe(200);
+    expect(enHit.headers["x-vinext-cache"]).toBe("HIT");
+    expect(enHit.body).toContain('<p id="locale">en</p>');
+  });
+
+  // Issue #1336 item 3: locale prefix must be stripped before API route matching.
+  //
+  // Ported from Next.js: test/e2e/middleware-redirects/test/index.test.ts
+  // (the "should redirect to api route with locale" case, which exercises
+  // /fr/api/ok hitting pages/api/ok.js)
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/middleware-redirects/test/index.test.ts
+  it("matches /api/ok without a locale prefix", async () => {
+    const res = await requestNodeServerWithHost(prodPort, "/api/ok", "example.com");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toBe("ok");
+  });
+
+  it("matches /fr/api/ok by stripping the locale prefix (issue #1336)", async () => {
+    const res = await requestNodeServerWithHost(prodPort, "/fr/api/ok", "example.com");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toBe("ok");
+  });
+
+  it("preserves query parameters when stripping the locale prefix from an API path", async () => {
+    const res = await requestNodeServerWithHost(
+      prodPort,
+      "/fr/api/ok?foo=bar&baz=qux",
+      "example.com",
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toBe("ok");
+  });
 });
 
 describe("Pages i18n domain routing with basePath (production)", () => {

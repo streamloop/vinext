@@ -6,6 +6,33 @@ import {
 import type { AppPageParams } from "../packages/vinext/src/server/app-page-boundary.js";
 
 describe("app page head resolution", () => {
+  it("reports whether the matched route has generated metadata", async () => {
+    // Ported from Next.js: test/e2e/app-dir/metadata-streaming/metadata-streaming.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/metadata-streaming/metadata-streaming.test.ts
+    const staticResult = await resolveAppPageHead<Record<string, unknown>>({
+      layoutModules: [],
+      metadataRoutes: [],
+      pageModule: { metadata: { title: "static page" } },
+      params: {},
+      routePath: "/static",
+    });
+
+    const generatedResult = await resolveAppPageHead<Record<string, unknown>>({
+      layoutModules: [],
+      metadataRoutes: [],
+      pageModule: {
+        async generateMetadata() {
+          return { title: "generated page" };
+        },
+      },
+      params: {},
+      routePath: "/generated",
+    });
+
+    expect(staticResult.hasDynamicMetadata).toBe(false);
+    expect(generatedResult.hasDynamicMetadata).toBe(true);
+  });
+
   it("collects repeated search params into a null-prototype object", () => {
     const { hasSearchParams, pageSearchParams } = collectAppPageSearchParams(
       new URLSearchParams("__proto__=safe&tag=a&tag=b"),
@@ -334,6 +361,78 @@ describe("app page head resolution", () => {
     });
   });
 
+  // Regression: a `generateMetadata` that does not declare the `parent`
+  // argument must NOT receive it. Matches Next.js, which omits the parent
+  // argument for cached `generateMetadata` functions that don't use it
+  // (resolve-metadata.ts `getResult` / `useCacheFunctionInfo.usedArgs[1]`).
+  // Passing the parent into a `'use cache'` function feeds it to the cache-key
+  // encoder (encodeReply), which throws on non-serializable values such as a
+  // `URL` `metadataBase` ("URL objects are not supported").
+  it("omits the parent argument for generateMetadata that does not declare it", async () => {
+    const receivedArgCounts: number[] = [];
+    const rootLayout = {
+      metadata: {
+        metadataBase: new URL("https://example.com"),
+        title: "Root",
+      },
+    };
+    const page = {
+      // Arity 0 — declares no `parent` parameter.
+      generateMetadata: async function () {
+        receivedArgCounts.push(arguments.length);
+        return { title: "Page" };
+      },
+    };
+
+    const result = await resolveAppPageHead<Record<string, unknown>>({
+      layoutModules: [rootLayout],
+      layoutTreePositions: [0],
+      metadataRoutes: [],
+      pageModule: page,
+      params: {},
+      routePath: "/",
+      routeSegments: [],
+    });
+
+    // Only `props` was passed (no parent).
+    expect(receivedArgCounts).toEqual([1]);
+    // metadataBase from the root layout still flows into the resolved metadata.
+    expect(result.metadata?.metadataBase).toBeInstanceOf(URL);
+    expect(String(result.metadata?.metadataBase)).toBe("https://example.com/");
+    expect(result.metadata?.title).toBe("Page");
+  });
+
+  it("still passes the parent argument to generateMetadata that declares it", async () => {
+    const receivedArgCounts: number[] = [];
+    const rootLayout = {
+      metadata: {
+        metadataBase: new URL("https://example.com"),
+        description: "Root description",
+      },
+    };
+    const page = {
+      // Arity 2 — declares `parent`, so it must receive it.
+      generateMetadata: async function (_props: unknown, parent: Promise<Record<string, unknown>>) {
+        receivedArgCounts.push(arguments.length);
+        const parentMetadata = await parent;
+        return { title: String(parentMetadata.description) };
+      },
+    };
+
+    const result = await resolveAppPageHead<Record<string, unknown>>({
+      layoutModules: [rootLayout],
+      layoutTreePositions: [0],
+      metadataRoutes: [],
+      pageModule: page,
+      params: {},
+      routePath: "/",
+      routeSegments: [],
+    });
+
+    expect(receivedArgCounts).toEqual([2]);
+    expect(result.metadata?.title).toBe("Root description");
+  });
+
   it("keeps primary page title handling independent from active parallel route metadata", async () => {
     const rootLayout = {
       metadata: {
@@ -390,6 +489,100 @@ describe("app page head resolution", () => {
         title: "Slot OG title",
       },
     });
+  });
+
+  it("uses parallel route slot page title when no primary page module is present", async () => {
+    // Ported from Next.js: test/e2e/app-dir/metadata-streaming-parallel-routes/metadata-streaming-parallel-routes.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/metadata-streaming-parallel-routes/metadata-streaming-parallel-routes.test.ts
+    //
+    // Reproduces:
+    //   "should change metadata when navigating between two pages under a slot
+    //   when children is not rendered"
+    //
+    // The route has no `pageModule` (the layout doesn't render children and there
+    // is no children-slot default to fill in). The active title must come from
+    // the parallel slot's page metadata.
+    const rootLayout = {
+      metadata: {
+        title: "Root",
+      },
+    };
+    const parallelLayout = {
+      metadata: {
+        title: "parallel-routes-no-children layout title",
+      },
+    };
+    const slotPage = {
+      metadata: {
+        title: "first page - @bar",
+      },
+    };
+
+    const result = await resolveAppPageHead<Record<string, unknown>>({
+      layoutModules: [rootLayout, parallelLayout],
+      layoutTreePositions: [0, 1],
+      metadataRoutes: [],
+      pageModule: null,
+      parallelRoutes: [
+        {
+          layoutModules: [],
+          pageModule: slotPage,
+          routeSegments: ["parallel-routes-no-children", "@bar", "first"],
+        },
+      ],
+      params: {},
+      routePath: "/parallel-routes-no-children/first",
+      routeSegments: ["parallel-routes-no-children", "first"],
+    });
+
+    expect(result.metadata?.title).toBe("first page - @bar");
+  });
+
+  it("uses parallel layout title when neither primary page nor slot page set a title", async () => {
+    // Ported from Next.js: test/e2e/app-dir/metadata-streaming-parallel-routes/metadata-streaming-parallel-routes.test.ts
+    //
+    // Reproduces:
+    //   "should still render metadata if children is not rendered in parallel
+    //   routes layout"
+    //
+    // The route has only a `default.tsx` (no `metadata`) at the children slot and
+    // the parallel slots render their default fallbacks (no `metadata`). The
+    // active title must come from the parallel layout's metadata.
+    const rootLayout = {
+      metadata: {
+        title: "Root",
+      },
+    };
+    const parallelLayout = {
+      metadata: {
+        title: "parallel-routes-default layout title",
+      },
+    };
+    const defaultPage = {
+      // default.tsx with no metadata
+    };
+    const slotDefault = {
+      // @bar/default.tsx with no metadata
+    };
+
+    const result = await resolveAppPageHead<Record<string, unknown>>({
+      layoutModules: [rootLayout, parallelLayout],
+      layoutTreePositions: [0, 1],
+      metadataRoutes: [],
+      pageModule: defaultPage,
+      parallelRoutes: [
+        {
+          layoutModules: [],
+          pageModule: slotDefault,
+          routeSegments: ["parallel-routes-default"],
+        },
+      ],
+      params: {},
+      routePath: "/parallel-routes-default",
+      routeSegments: ["parallel-routes-default"],
+    });
+
+    expect(result.metadata?.title).toBe("parallel-routes-default layout title");
   });
 
   it("bubbles active parallel page metadata errors", async () => {

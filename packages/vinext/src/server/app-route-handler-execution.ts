@@ -31,9 +31,20 @@ import {
 export type AppRouteParams = Record<string, string | string[]>;
 export type AppRouteDynamicUsageFn = () => boolean;
 export type MarkAppRouteDynamicUsageFn = () => void;
+/**
+ * Route handler context.
+ *
+ * `params` is `null` for non-dynamic routes (no `[param]` segments) so that
+ * user code like `params ? await params : null` resolves to `null`, matching
+ * Next.js behavior. For dynamic routes it's a thenable that resolves to the
+ * matched params object.
+ *
+ * See: test/e2e/app-dir/app-routes/app-custom-routes.test.ts in Next.js for
+ * the authoritative assertion (`expect(meta.params).toEqual(null)`).
+ */
 export type AppRouteHandlerFunction = (
   request: NextRequest,
-  context: { params: AppRouteParams },
+  context: { params: AppRouteParams | null },
 ) => Response | Promise<Response>;
 export type RouteHandlerCacheSetter = (
   key: string,
@@ -52,12 +63,17 @@ export type AppRouteDebugLogger = (event: string, detail: string) => void;
 type RunAppRouteHandlerOptions = {
   basePath?: string;
   consumeDynamicUsage: AppRouteDynamicUsageFn;
+  draftModeSecret?: string;
   dynamicConfig?: string;
   handlerFn: AppRouteHandlerFunction;
   i18n?: NextI18nConfig | null;
   markDynamicUsage: MarkAppRouteDynamicUsageFn;
   middlewareRequestHeaders?: Headers | null;
-  params: AppRouteParams;
+  /**
+   * `null` for non-dynamic routes. Passed through to the handler context
+   * unchanged — callers are expected to compute this from `route.isDynamic`.
+   */
+  params: AppRouteParams | null;
   request: Request;
   routePattern?: string;
   setHeadersAccessPhase?: (phase: HeadersAccessPhase) => HeadersAccessPhase;
@@ -95,6 +111,7 @@ function configureAppRouteStaticGenerationContext(options: RunAppRouteHandlerOpt
   if (options.dynamicConfig === "force-static" || options.dynamicConfig === "error") {
     setHeadersContext(
       createStaticGenerationHeadersContext({
+        draftModeSecret: options.draftModeSecret,
         dynamicConfig: options.dynamicConfig,
         routeKind: "route",
         routePattern: options.routePattern,
@@ -151,6 +168,13 @@ export async function executeAppRouteHandler(
       markKnownDynamicAppRoute(options.routePattern);
     }
 
+    // The route's cache tags, shared by the response Cache-Tag header (so edge
+    // adapters can purge by tag) and the ISR write below. Cheap + side-effect free.
+    const routeTags = options.buildPageCacheTags(
+      options.cleanPathname,
+      options.getCollectedFetchTags(),
+    );
+
     if (
       shouldApplyAppRouteHandlerRevalidateHeader({
         dynamicUsedInHandler,
@@ -164,7 +188,12 @@ export async function executeAppRouteHandler(
       if (revalidateSeconds == null) {
         throw new Error("Expected route handler revalidate seconds");
       }
-      applyRouteHandlerRevalidateHeader(response, revalidateSeconds, options.expireSeconds);
+      applyRouteHandlerRevalidateHeader(
+        response,
+        revalidateSeconds,
+        options.expireSeconds,
+        routeTags,
+      );
     }
 
     if (
@@ -185,10 +214,6 @@ export async function executeAppRouteHandler(
       if (revalidateSeconds == null) {
         throw new Error("Expected route handler cache revalidate seconds");
       }
-      const routeTags = options.buildPageCacheTags(
-        options.cleanPathname,
-        options.getCollectedFetchTags(),
-      );
       const routeWritePromise = (async () => {
         try {
           const routeCacheValue = await buildAppRouteCacheValue(routeClone);

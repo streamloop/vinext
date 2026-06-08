@@ -1,15 +1,23 @@
 import type { ReactNode } from "react";
+import type { VinextNextData } from "../client/vinext-next-data.js";
 import type { Route } from "../routing/pages-router.js";
 import { normalizeStaticPathname } from "../routing/route-pattern.js";
 import type { CachedPagesValue, CacheControlMetadata } from "vinext/shims/cache";
-import { buildCachedRevalidateCacheControl } from "./cache-control.js";
-import { VINEXT_CACHE_HEADER } from "./headers.js";
+import { applyCdnResponseHeaders, buildCachedRevalidateCacheControl } from "./cache-control.js";
+import { buildCacheStateHeaders } from "./cache-headers.js";
 import { buildPagesCacheValue, type ISRCacheEntry } from "./isr-cache.js";
 import {
   buildPagesNextDataScript,
   type PagesGsspResponse,
   type PagesI18nRenderContext,
 } from "./pages-page-response.js";
+import {
+  hasPagesGetInitialProps,
+  isResponseSent,
+  loadPagesGetInitialProps,
+} from "./pages-get-initial-props.js";
+import { buildNextDataJsonResponse } from "./pages-data-route.js";
+import { isSerializableProps } from "./pages-serializable-props.js";
 
 type PagesRedirectResult = {
   destination: string;
@@ -38,11 +46,11 @@ type PagesPagePropsResult = {
   revalidate?: number;
 };
 
-export type PagesMutableGsspResponse = {
+type PagesMutableGsspResponse = {
   headersSent: boolean;
 } & PagesGsspResponse;
 
-export type PagesGsspContextResponse = {
+type PagesGsspContextResponse = {
   req: unknown;
   res: PagesMutableGsspResponse;
   responsePromise: Promise<Response>;
@@ -54,8 +62,19 @@ export type PagesPageModule = {
     locales: string[];
     defaultLocale: string;
   }) => Promise<PagesStaticPathsResult> | PagesStaticPathsResult;
+  /**
+   * Pages Router data-fetching context.
+   *
+   * `params` is `null` for non-dynamic routes (no `[param]` segments) to
+   * match Next.js. User code typically falls back via `params || null`, so
+   * passing `null` (rather than `{}`) is required for the value to be
+   * observable as `null` once the data flows through to the page props.
+   *
+   * See: test/e2e/edge-pages-support/index.test.ts in Next.js for the
+   * authoritative assertion (`expect(props.params).toBe(null)`).
+   */
   getServerSideProps?: (context: {
-    params: Record<string, unknown>;
+    params: Record<string, unknown> | null;
     req: unknown;
     res: PagesMutableGsspResponse;
     query: Record<string, unknown>;
@@ -65,10 +84,22 @@ export type PagesPageModule = {
     defaultLocale?: string;
   }) => Promise<PagesPagePropsResult> | PagesPagePropsResult;
   getStaticProps?: (context: {
-    params: Record<string, unknown>;
+    params: Record<string, unknown> | null;
     locale?: string;
     locales?: string[];
     defaultLocale?: string;
+    /**
+     * Indicates why `getStaticProps` was invoked.
+     *
+     * - `"build"`: initial build-time prerender (before runtime traffic).
+     * - `"on-demand"`: triggered by `res.revalidate()` from an API route.
+     * - `"stale"`: stale-while-revalidate background regeneration.
+     *
+     * Mirrors Next.js `render.tsx`'s `revalidateReason` on the
+     * `GetStaticPropsContext` type — see
+     * `.nextjs-ref/packages/next/src/types.ts`.
+     */
+    revalidateReason?: "build" | "on-demand" | "stale";
   }) => Promise<PagesPagePropsResult> | PagesPagePropsResult;
 };
 
@@ -82,11 +113,22 @@ type RenderPagesIsrHtmlOptions = {
   renderIsrPassToStringAsync: (element: ReactNode) => Promise<string>;
   routePattern: string;
   safeJsonStringify: (value: unknown) => string;
+  vinext?: VinextNextData["__vinext"];
 };
 
 export type ResolvePagesPageDataOptions = {
   applyRequestContexts: () => void;
   buildId: string | null;
+  /**
+   * When true, this is a `/_next/data/<buildId>/<page>.json` request. Callers
+   * that respond with a JSON envelope (`{ pageProps }`) instead of HTML must
+   * bypass the HTML ISR cache: a cached HTML body cannot be reshaped into the
+   * expected JSON shape, and storing JSON in the HTML cache would corrupt
+   * subsequent HTML hits. Next.js handles this the same way — see
+   * `isNextDataRequest` checks in `packages/next/src/server/base-server.ts`.
+   */
+  isDataReq?: boolean;
+  err?: unknown;
   createGsspReqRes: () => PagesGsspContextResponse;
   createPageElement: (pageProps: Record<string, unknown>) => ReactNode;
   fontLinkHeader: string;
@@ -101,9 +143,34 @@ export type ResolvePagesPageDataOptions = {
     expireSeconds?: number,
   ) => Promise<void>;
   expireSeconds?: number;
+  /**
+   * When true, this dispatch corresponds to a build-time prerender (the
+   * `vinext` build phase fetches each statically generated page through the
+   * production server). Maps to `revalidateReason: "build"` when
+   * `getStaticProps` is invoked. Mirrors Next.js's
+   * `renderOpts.isBuildTimePrerendering` flag — see
+   * `.nextjs-ref/packages/next/src/server/render.tsx`.
+   */
+  isBuildTimePrerendering?: boolean;
+  /**
+   * When true, this dispatch was triggered by an on-demand revalidation
+   * request (e.g. `res.revalidate()` in a Pages Router API route, or an
+   * equivalent webhook). Maps to `revalidateReason: "on-demand"` when
+   * `getStaticProps` is invoked. Mirrors Next.js's
+   * `renderOpts.isOnDemandRevalidate` flag — see
+   * `.nextjs-ref/packages/next/src/server/render.tsx`.
+   *
+   * Forward-looking plumbing: no caller currently sets this — `res.revalidate()`
+   * is not yet implemented in vinext. The `"on-demand"` branch in the
+   * `revalidateReason` resolver is intentionally unreachable today; keeping the
+   * typed contract here means wiring it up will be a one-line change once the
+   * trigger lands.
+   */
+  isOnDemandRevalidate?: boolean;
   pageModule: PagesPageModule;
   params: Record<string, unknown>;
   query: Record<string, unknown>;
+  asPath?: string;
   route: Pick<Route, "isDynamic">;
   routePattern: string;
   routeUrl: string;
@@ -111,12 +178,14 @@ export type ResolvePagesPageDataOptions = {
   safeJsonStringify: (value: unknown) => string;
   sanitizeDestination: (destination: string) => string;
   scriptNonce?: string;
+  statusCode?: number;
   triggerBackgroundRegeneration: (
     key: string,
     renderFn: () => Promise<void>,
     errorContext?: { routerKind: "Pages Router"; routePath: string; routeType: "render" },
   ) => void;
   renderIsrPassToStringAsync: (element: ReactNode) => Promise<string>;
+  vinext?: VinextNextData["__vinext"];
 };
 
 type ResolvePagesPageDataRenderResult = {
@@ -124,6 +193,13 @@ type ResolvePagesPageDataRenderResult = {
   gsspRes: PagesGsspResponse | null;
   isrRevalidateSeconds: number | null;
   pageProps: Record<string, unknown>;
+  /**
+   * True when `getStaticPaths` returned `fallback: true` AND the requested path
+   * is not in the pre-rendered list. The caller renders a loading shell with
+   * empty props and `useRouter().isFallback === true` (matching Next.js's
+   * `render.tsx` — `getStaticProps` is skipped on the fallback render).
+   */
+  isFallback: boolean;
 };
 
 type ResolvePagesPageDataResponseResult = {
@@ -131,23 +207,86 @@ type ResolvePagesPageDataResponseResult = {
   response: Response;
 };
 
+type ResolvePagesPageDataNotFoundResult = {
+  kind: "notFound";
+};
+
 type ResolvePagesPageDataResult =
   | ResolvePagesPageDataRenderResult
-  | ResolvePagesPageDataResponseResult;
+  | ResolvePagesPageDataResponseResult
+  | ResolvePagesPageDataNotFoundResult;
 
-function buildPagesNotFoundResponse(): Response {
-  return new Response("<!DOCTYPE html><html><body><h1>404 - Page not found</h1></body></html>", {
+function buildPagesDataNotFoundResponse(): Response {
+  // Matches Next.js: `/_next/data/<buildId>/<page>.json` 404 responses use
+  // application/json with an empty object body so clients can call
+  // `res.json()` without throwing before inspecting the status code.
+  return new Response("{}", {
     status: 404,
-    headers: { "Content-Type": "text/html" },
+    headers: { "Content-Type": "application/json" },
   });
 }
 
-function buildPagesDataNotFoundResponse(): Response {
-  return new Response("404", { status: 404 });
+function buildPagesNotFoundResult(
+  options: Pick<ResolvePagesPageDataOptions, "isDataReq">,
+): ResolvePagesPageDataResponseResult | ResolvePagesPageDataNotFoundResult {
+  if (options.isDataReq) {
+    return {
+      kind: "response",
+      response: buildPagesDataNotFoundResponse(),
+    };
+  }
+
+  return { kind: "notFound" };
 }
 
 function resolvePagesRedirectStatus(redirect: PagesRedirectResult): number {
   return redirect.statusCode != null ? redirect.statusCode : redirect.permanent ? 308 : 307;
+}
+
+/**
+ * Build the response for a `getServerSideProps` / `getStaticProps`
+ * `{ redirect }` result.
+ *
+ * For an HTML page request we emit a real HTTP redirect (`Location` header) so
+ * a hard navigation lands on the destination.
+ *
+ * For a `/_next/data/<buildId>/<page>.json` request (a client-side navigation)
+ * we must NOT emit an HTTP redirect: the client's `fetch()` would transparently
+ * follow it to the destination's HTML, which is not a valid data envelope and
+ * would force a hard reload (and console error noise). Instead we mirror
+ * Next.js and return a 200 JSON envelope carrying `__N_REDIRECT` /
+ * `__N_REDIRECT_STATUS` inside `pageProps`. The client router detects these
+ * markers and performs a fresh client navigation to the destination, which
+ * supersedes (cancels) the in-flight navigation.
+ *
+ * Ported from Next.js: `packages/next/src/server/render.tsx` — the
+ * `__N_REDIRECT` / `__N_REDIRECT_STATUS` props assignment for gSSP/gSP
+ * redirects (search `__N_REDIRECT`), consumed in
+ * `packages/next/src/shared/lib/router/router.ts` (`pageProps.__N_REDIRECT`).
+ */
+function buildPagesRedirectResponse(
+  redirect: PagesRedirectResult,
+  options: Pick<
+    ResolvePagesPageDataOptions,
+    "isDataReq" | "sanitizeDestination" | "safeJsonStringify"
+  >,
+): Response {
+  const destination = options.sanitizeDestination(redirect.destination);
+
+  if (options.isDataReq) {
+    return buildNextDataJsonResponse(
+      {
+        __N_REDIRECT: destination,
+        __N_REDIRECT_STATUS: resolvePagesRedirectStatus(redirect),
+      },
+      options.safeJsonStringify,
+    );
+  }
+
+  return new Response(null, {
+    status: resolvePagesRedirectStatus(redirect),
+    headers: { Location: destination },
+  });
 }
 
 /**
@@ -193,6 +332,7 @@ function buildPagesCacheResponse(
   revalidateSeconds?: number,
   expireSeconds?: number,
   cacheControl?: CacheControlMetadata,
+  status?: number,
 ): Response {
   // Legacy cache entries written before cacheControl metadata existed can still
   // hit this path without a persisted revalidate value; keep the historic
@@ -200,22 +340,27 @@ function buildPagesCacheResponse(
   const effectiveRevalidateSeconds = cacheControl?.revalidate ?? revalidateSeconds ?? 60;
   const effectiveExpireSeconds =
     cacheControl === undefined ? undefined : (cacheControl.expire ?? expireSeconds);
-  const headers: Record<string, string> = {
+  // HIT/STALE served from the origin store: route the cache header through the
+  // CDN adapter (default: identical single Cache-Control). Edge adapters never
+  // reach this path because their get() returns null.
+  const headers = new Headers({
     "Content-Type": "text/html",
-    [VINEXT_CACHE_HEADER]: cacheState,
-    "Cache-Control": buildCachedRevalidateCacheControl(
+    ...buildCacheStateHeaders(cacheState),
+  });
+  applyCdnResponseHeaders(headers, {
+    cacheControl: buildCachedRevalidateCacheControl(
       cacheState,
       effectiveRevalidateSeconds,
       effectiveExpireSeconds,
     ),
-  };
+  });
 
   if (fontLinkHeader) {
-    headers.Link = fontLinkHeader;
+    headers.set("Link", fontLinkHeader);
   }
 
   return new Response(html, {
-    status: 200,
+    status: status ?? 200,
     headers,
   });
 }
@@ -264,6 +409,7 @@ export async function renderPagesIsrHtml(options: RenderPagesIsrHtmlOptions): Pr
     params: options.params,
     routePattern: options.routePattern,
     safeJsonStringify: options.safeJsonStringify,
+    vinext: options.vinext,
   });
 
   return rewritePagesCachedHtml(options.cachedHtml, freshBody, nextDataScript);
@@ -272,35 +418,67 @@ export async function renderPagesIsrHtml(options: RenderPagesIsrHtmlOptions): Pr
 export async function resolvePagesPageData(
   options: ResolvePagesPageDataOptions,
 ): Promise<ResolvePagesPageDataResult> {
+  // Next.js passes `params: null` (effectively) to gSSP/gSP context for
+  // non-dynamic routes — see render.tsx's `...(pageIsDynamic ? { params } : undefined)`.
+  // Internal bookkeeping (route param hydration, ISR HTML, getStaticPaths
+  // validation) still uses the matched-but-empty object — only user-facing
+  // data-fetching contexts surface `null`.
+  const userFacingParams: Record<string, unknown> | null = options.route.isDynamic
+    ? options.params
+    : null;
+
+  // Set when `getStaticPaths: { fallback: true }` is configured and the
+  // requested path is NOT in the pre-rendered list. When true, we render the
+  // loading shell with empty props and `useRouter().isFallback === true`,
+  // skipping `getStaticProps`. Matches Next.js `render.tsx`'s
+  // `if (isSSG && !isFallback)` gate around `getStaticProps`. Data requests
+  // (`/_next/data/...json`) still call `getStaticProps` so the client can
+  // hydrate the page after the fallback shell ships.
+  let isFallback = false;
+
   if (typeof options.pageModule.getStaticPaths === "function" && options.route.isDynamic) {
     const pathsResult = await options.pageModule.getStaticPaths({
       locales: options.i18n.locales ?? [],
       defaultLocale: options.i18n.defaultLocale ?? "",
     });
     const fallback = pathsResult?.fallback ?? false;
+    const paths = pathsResult?.paths ?? [];
+    const isValidPath = paths.some((pathEntry) =>
+      matchesPagesStaticPath(pathEntry, options.params, options.routeUrl),
+    );
 
-    if (fallback === false) {
-      const paths = pathsResult?.paths ?? [];
-      const isValidPath = paths.some((pathEntry) =>
-        matchesPagesStaticPath(pathEntry, options.params, options.routeUrl),
-      );
+    if (fallback === false && !isValidPath) {
+      // For data requests (`/_next/data/...json`), return a JSON-shaped 404
+      // so the client router can `res.json()` without blowing up — matches
+      // Next.js' behavior. HTML navigations still get the configured 404 page.
+      return buildPagesNotFoundResult(options);
+    }
 
-      if (!isValidPath) {
-        return {
-          kind: "response",
-          response: buildPagesNotFoundResponse(),
-        };
-      }
+    // Render the fallback shell for unlisted paths under `fallback: true`.
+    // Data requests resolve props normally so the client can fill in after
+    // the loading shell ships (`fallback: 'blocking'` keeps SSRing as before).
+    if (fallback === true && !isValidPath && !options.isDataReq) {
+      isFallback = true;
     }
   }
 
   let pageProps: Record<string, unknown> = {};
   let gsspRes: PagesMutableGsspResponse | null = null;
 
+  if (isFallback) {
+    return {
+      kind: "render",
+      gsspRes: null,
+      isrRevalidateSeconds: null,
+      pageProps,
+      isFallback: true,
+    };
+  }
+
   if (typeof options.pageModule.getServerSideProps === "function") {
     const { req, res, responsePromise } = options.createGsspReqRes();
     const result = await options.pageModule.getServerSideProps({
-      params: options.params,
+      params: userFacingParams,
       req,
       res,
       query: options.query,
@@ -310,7 +488,7 @@ export async function resolvePagesPageData(
       defaultLocale: options.i18n.defaultLocale,
     });
 
-    if (res.headersSent) {
+    if (isResponseSent(res)) {
       return {
         kind: "response",
         response: await responsePromise,
@@ -318,24 +496,34 @@ export async function resolvePagesPageData(
     }
 
     if (result?.props) {
-      pageProps = result.props;
+      // Next.js explicitly supports a Promise value for `props`. Await it
+      // before serialising; otherwise pageProps would be a Promise and the
+      // rendered page would receive empty props. See
+      // packages/next/src/server/render.tsx (deferredContent).
+      pageProps = (await Promise.resolve(result.props)) as Record<string, unknown>;
     }
 
     if (result?.redirect) {
       return {
         kind: "response",
-        response: new Response(null, {
-          status: resolvePagesRedirectStatus(result.redirect),
-          headers: { Location: options.sanitizeDestination(result.redirect.destination) },
-        }),
+        response: buildPagesRedirectResponse(result.redirect, options),
       };
     }
 
     if (result?.notFound) {
-      return {
-        kind: "response",
-        response: buildPagesDataNotFoundResponse(),
-      };
+      return buildPagesNotFoundResult(options);
+    }
+
+    // Mirrors Next.js render.tsx's `isSerializableProps(pathname, "getServerSideProps", data.props)`
+    // check, gated on `!metadata.isRedirect && !metadata.isNotFound` (both
+    // short-circuit above). Throws a friendly `SerializableError` so the
+    // caller's existing try/catch surfaces a clear 500 instead of rendering
+    // an empty page. See
+    // .nextjs-ref/packages/next/src/server/render.tsx (~line 1200) and
+    // .nextjs-ref/packages/next/src/lib/is-serializable-props.ts. Tracked in
+    // vinext#1478.
+    if (result?.props !== undefined) {
+      isSerializableProps(options.routePattern, "getServerSideProps", pageProps);
     }
 
     gsspRes = res;
@@ -349,7 +537,13 @@ export async function resolvePagesPageData(
     const cached = await options.isrGet(cacheKey);
     const cachedValue = cached?.value.value;
 
-    if (cachedValue?.kind === "PAGES" && cached && !cached.isStale && !options.scriptNonce) {
+    if (
+      cachedValue?.kind === "PAGES" &&
+      cached &&
+      !cached.isStale &&
+      !options.scriptNonce &&
+      !options.isDataReq
+    ) {
       return {
         kind: "response",
         response: buildPagesCacheResponse(
@@ -359,20 +553,32 @@ export async function resolvePagesPageData(
           undefined,
           options.expireSeconds,
           cached.value.cacheControl,
+          cachedValue.status,
         ),
       };
     }
 
-    if (cachedValue?.kind === "PAGES" && cached && cached.isStale && !options.scriptNonce) {
+    if (
+      cachedValue?.kind === "PAGES" &&
+      cached &&
+      cached.isStale &&
+      !options.scriptNonce &&
+      !options.isDataReq
+    ) {
       options.triggerBackgroundRegeneration(
         cacheKey,
         async function () {
           return options.runInFreshUnifiedContext(async () => {
             const freshResult = await options.pageModule.getStaticProps?.({
-              params: options.params,
+              params: userFacingParams,
               locale: options.i18n.locale,
               locales: options.i18n.locales,
               defaultLocale: options.i18n.defaultLocale,
+              // Background regeneration for an entry that is already in the
+              // cache is always a stale-while-revalidate refresh — mirrors
+              // Next.js `render.tsx` (`isBuildTimeSSG ? "build" : "stale"`,
+              // and we're not at build time here).
+              revalidateReason: "stale",
             });
 
             if (
@@ -391,11 +597,12 @@ export async function resolvePagesPageData(
                 renderIsrPassToStringAsync: options.renderIsrPassToStringAsync,
                 routePattern: options.routePattern,
                 safeJsonStringify: options.safeJsonStringify,
+                vinext: options.vinext,
               });
 
               await options.isrSet(
                 cacheKey,
-                buildPagesCacheValue(freshHtml, freshResult.props),
+                buildPagesCacheValue(freshHtml, freshResult.props, options.statusCode),
                 freshResult.revalidate,
                 undefined,
                 options.expireSeconds,
@@ -419,15 +626,27 @@ export async function resolvePagesPageData(
           undefined,
           options.expireSeconds,
           cached.value.cacheControl,
+          cachedValue.status,
         ),
       };
     }
 
     const result = await options.pageModule.getStaticProps({
-      params: options.params,
+      params: userFacingParams,
       locale: options.i18n.locale,
       locales: options.i18n.locales,
       defaultLocale: options.i18n.defaultLocale,
+      // Maps Next.js's resolution in `render.tsx`:
+      //   isOnDemandRevalidate ? "on-demand"
+      //     : isBuildTimeSSG    ? "build"
+      //                         : "stale"
+      // We pick "stale" as the default at runtime so existing-but-missing
+      // (cache evicted) entries surface as a regeneration rather than a build.
+      revalidateReason: options.isOnDemandRevalidate
+        ? "on-demand"
+        : options.isBuildTimePrerendering
+          ? "build"
+          : "stale",
     });
 
     if (result?.props) {
@@ -437,22 +656,58 @@ export async function resolvePagesPageData(
     if (result?.redirect) {
       return {
         kind: "response",
-        response: new Response(null, {
-          status: resolvePagesRedirectStatus(result.redirect),
-          headers: { Location: options.sanitizeDestination(result.redirect.destination) },
-        }),
+        response: buildPagesRedirectResponse(result.redirect, options),
       };
     }
 
     if (result?.notFound) {
-      return {
-        kind: "response",
-        response: buildPagesDataNotFoundResponse(),
-      };
+      return buildPagesNotFoundResult(options);
+    }
+
+    // Mirrors Next.js render.tsx's `isSerializableProps(pathname, "getStaticProps", data.props)`
+    // check, gated on `!metadata.isNotFound` (notFound + redirect both
+    // short-circuit above). Throws a friendly `SerializableError` so the
+    // caller's existing try/catch surfaces a clear 500 instead of rendering
+    // an empty page. See
+    // .nextjs-ref/packages/next/src/server/render.tsx (~line 982) and
+    // .nextjs-ref/packages/next/src/lib/is-serializable-props.ts. Tracked in
+    // vinext#1478.
+    if (result?.props !== undefined) {
+      isSerializableProps(options.routePattern, "getStaticProps", pageProps);
     }
 
     if (typeof result?.revalidate === "number" && result.revalidate > 0) {
       isrRevalidateSeconds = result.revalidate;
+    }
+  }
+
+  if (
+    typeof options.pageModule.getServerSideProps !== "function" &&
+    typeof options.pageModule.getStaticProps !== "function" &&
+    hasPagesGetInitialProps(options.pageModule.default)
+  ) {
+    const { req, res, responsePromise } = options.createGsspReqRes();
+    const initialProps = await loadPagesGetInitialProps(options.pageModule.default, {
+      req,
+      res,
+      err: options.err,
+      pathname: options.routePattern,
+      query: options.query,
+      asPath: options.asPath ?? options.routeUrl,
+      locale: options.i18n.locale,
+      locales: options.i18n.locales,
+      defaultLocale: options.i18n.defaultLocale,
+    });
+
+    if (isResponseSent(res)) {
+      return {
+        kind: "response",
+        response: await responsePromise,
+      };
+    }
+
+    if (initialProps) {
+      pageProps = { ...pageProps, ...initialProps };
     }
   }
 
@@ -461,5 +716,6 @@ export async function resolvePagesPageData(
     gsspRes,
     isrRevalidateSeconds,
     pageProps,
+    isFallback: false,
   };
 }

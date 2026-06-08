@@ -29,10 +29,11 @@
  */
 
 import {
-  getCacheHandler,
+  getDataCacheHandler,
   cacheLifeProfiles,
   _setRequestScopedCacheLife,
   _registerCacheContextAccessor,
+  type CachedFetchValue,
   type CacheControlMetadata,
   type CacheHandlerValue,
   type CacheLifeConfig,
@@ -45,10 +46,13 @@ import {
   getRequestContext,
   runWithUnifiedStateMutation,
 } from "./unified-request-context.js";
+import { markDynamicUsage } from "./headers.js";
 
 // ---------------------------------------------------------------------------
 // Constants for nested-dynamic cache life detection
 // ---------------------------------------------------------------------------
+
+const APP_PAGE_PROPS_CACHE_KEY_MARKER = Symbol.for("vinext.appPagePropsCacheKeyMarker");
 
 /** Threshold below which expire is considered "dynamic" (5 minutes in seconds). */
 const DYNAMIC_EXPIRE = 300;
@@ -130,6 +134,12 @@ export type CacheContext = {
    * cache. Used as `cause` for the nested-dynamic cache error.
    */
   dynamicNestedCacheError: Error | undefined;
+  /**
+   * Dynamic request API error recorded inside this cache scope. This persists
+   * even if user code catches the original throw, so the wrapper can avoid
+   * storing request-specific output under a shared cache key.
+   */
+  invalidDynamicUsageError?: unknown;
 };
 
 // Store on globalThis via Symbol so headers.ts can detect "use cache" scope
@@ -437,9 +447,30 @@ export function clearPrivateCache(): void {
   }
 }
 
+export function markAppPagePropsForUseCache<T extends object>(props: T): T {
+  Object.defineProperty(props, APP_PAGE_PROPS_CACHE_KEY_MARKER, {
+    configurable: false,
+    enumerable: false,
+    value: true,
+    writable: false,
+  });
+  return props;
+}
+
 // ---------------------------------------------------------------------------
 // Core runtime: registerCachedFunction
 // ---------------------------------------------------------------------------
+
+type RegisterCachedFunctionOptions = {
+  /**
+   * Internal transform metadata for file-level `"use cache"` default exports
+   * in App Router `page.*` files. Page components receive framework-owned
+   * `{ params, searchParams }` props. React may copy that props object before
+   * invocation, so this invariant must live at the cached function boundary
+   * rather than on the intermediate createElement config object.
+   */
+  appPageDefaultExport?: boolean;
+};
 
 /**
  * Register a function as a cached function. This is called by the Vite
@@ -450,13 +481,14 @@ export function clearPrivateCache(): void {
  * @param variant - Cache variant: "" (default/shared), "remote", "private"
  * @returns A wrapper function that checks cache before calling the original
  */
-// oxlint-disable-next-line typescript/no-explicit-any
-export function registerCachedFunction<T extends (...args: any[]) => Promise<any>>(
-  fn: T,
+export function registerCachedFunction<TArgs extends unknown[], TResult>(
+  fn: (...args: TArgs) => Promise<TResult>,
   id: string,
   variant?: string,
-): T {
+  options: RegisterCachedFunctionOptions = {},
+): (...args: TArgs) => Promise<TResult> {
   const cacheVariant = variant ?? "";
+  const omitAppPageSearchParamsFromFirstArg = options.appPageDefaultExport === true;
 
   // In dev mode, skip the shared cache so code changes are immediately
   // visible after HMR. Without this, the MemoryCacheHandler returns stale
@@ -466,8 +498,7 @@ export function registerCachedFunction<T extends (...args: any[]) => Promise<any
   // it's scoped to a single request and doesn't persist across HMR.
   const isDev = typeof process !== "undefined" && process.env.NODE_ENV === "development";
 
-  // oxlint-disable-next-line @typescript-eslint/no-explicit-any
-  const cachedFn = async (...args: any[]): Promise<any> => {
+  const cachedFn = async (...args: TArgs): Promise<TResult> => {
     const rsc = await getRscModule();
     const keySeed = getUseCacheKeySeed();
 
@@ -476,6 +507,10 @@ export function registerCachedFunction<T extends (...args: any[]) => Promise<any
     // from key). Falls back to stableStringify when RSC is unavailable.
     let cacheKey: string;
     try {
+      const processedArgs =
+        args.length > 0
+          ? unwrapThenableObjectArray(args, { omitAppPageSearchParamsFromFirstArg })
+          : [];
       if (rsc && args.length > 0) {
         // Temporary references let encodeReply handle non-serializable values
         // (like React elements in args) by excluding them from the key.
@@ -488,13 +523,12 @@ export function registerCachedFunction<T extends (...args: any[]) => Promise<any
         // values (e.g., section:"sports" vs section:"electronics") produce
         // identical cache keys. We must extract the plain data so the actual
         // values are included in the cache key.
-        const processedArgs = unwrapThenableObjects(args) as unknown[];
         const encoded = await rsc.encodeReply(processedArgs, {
           temporaryReferences: tempRefs,
         });
         cacheKey = buildUseCacheKey(id, keySeed, await replyToCacheKey(encoded));
       } else {
-        const argsKey = args.length > 0 ? stableStringify(args) : undefined;
+        const argsKey = processedArgs.length > 0 ? stableStringify(processedArgs) : undefined;
         cacheKey = buildUseCacheKey(id, keySeed, argsKey);
       }
     } catch {
@@ -504,10 +538,24 @@ export function registerCachedFunction<T extends (...args: any[]) => Promise<any
 
     // "use cache: private" uses per-request in-memory cache
     if (cacheVariant === "private") {
+      const parentCtx = cacheContextStorage.getStore();
+      if (parentCtx && parentCtx.variant !== "private") {
+        throwPrivateUseCacheInsidePublicUseCacheError();
+      }
+
+      if (typeof process !== "undefined" && process.env.VINEXT_PRERENDER === "1") {
+        // Next.js treats "use cache: private" as dynamic during prerendering:
+        // it is excluded from the static artifact and resolved per request.
+        // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/use-cache/use-cache-wrapper.ts
+        markDynamicUsage();
+      }
+
       const privateCache = _getPrivateState()._privateCache!;
       const privateHit = privateCache.get(cacheKey);
       if (privateHit !== undefined) {
-        return privateHit;
+        // The private cache is heterogeneous across cached functions; the key
+        // includes this function's stable id, so a hit belongs to this TResult.
+        return privateHit as TResult;
       }
 
       const result = await executeWithContext(fn, args, cacheVariant);
@@ -522,7 +570,7 @@ export function registerCachedFunction<T extends (...args: any[]) => Promise<any
     }
 
     // Shared cache ("use cache" / "use cache: remote")
-    const handler = getCacheHandler();
+    const handler = getDataCacheHandler();
 
     // Check cache — deserialize via RSC stream when available, JSON otherwise.
     // A handler failure (e.g. a transient KV error, or a key the store rejects)
@@ -542,7 +590,7 @@ export function registerCachedFunction<T extends (...args: any[]) => Promise<any
           // RSC-serialized entry: base64 → bytes → stream → deserialize
           const bytes = base64ToUint8(existing.value.data.body);
           const stream = uint8ToStream(bytes);
-          const result = await rsc.createFromReadableStream(stream);
+          const result = await rsc.createFromReadableStream<TResult>(stream);
           recordRequestScopedCacheControl(existing.cacheControl);
           return result;
         }
@@ -587,7 +635,7 @@ export function registerCachedFunction<T extends (...args: any[]) => Promise<any
       }
 
       const cacheValue = {
-        kind: "FETCH" as const,
+        kind: "FETCH",
         data: {
           headers,
           body,
@@ -595,7 +643,7 @@ export function registerCachedFunction<T extends (...args: any[]) => Promise<any
         },
         tags: ctx.tags,
         revalidate: revalidateSeconds,
-      };
+      } satisfies CachedFetchValue;
 
       await handler.set(cacheKey, cacheValue, {
         fetchCache: true,
@@ -612,7 +660,26 @@ export function registerCachedFunction<T extends (...args: any[]) => Promise<any
     return result;
   };
 
-  return cachedFn as T;
+  // Preserve the original function's arity on the wrapper. The wrapper is
+  // declared as `(...args)` (arity 0), which hides the original signature.
+  // Callers like `resolveModuleMetadata` rely on `fn.length` to decide whether
+  // to pass optional arguments (e.g. the `parent` metadata) — matching Next.js,
+  // which omits the `parent` argument when a cached `generateMetadata` does not
+  // declare/use it, so non-serializable parent values (like a `URL`
+  // `metadataBase`) never reach the cache-key encoder.
+  // Function `length` is always `configurable: true` per spec, so this is safe.
+  Object.defineProperty(cachedFn, "length", { value: fn.length, configurable: true });
+
+  return cachedFn;
+}
+
+function throwPrivateUseCacheInsidePublicUseCacheError(): never {
+  const error = new Error(
+    '"use cache: private" must not be used within "use cache". It can only be nested inside of another "use cache: private".',
+  );
+  const ctx = getRequestContext();
+  if (ctx) ctx.invalidDynamicUsageError = error;
+  throw error;
 }
 
 function recordRequestScopedCacheControl(cacheControl: CacheControlMetadata | undefined): void {
@@ -665,9 +732,9 @@ async function executeWithContext<T extends (...args: any[]) => Promise<any>>(
  *   propagates lifeConfigs/dynamicNestedCacheError up to the parent.
  * - Private variant (`"use cache: private"`): always reaches here via
  *   `executeWithContext`. The variant is excluded from being a *parent* that
- *   throws (see the `parentCtx.variant !== "private"` guard below), but can
- *   still propagate its resolved life *up* to a public parent — matching
- *   Next.js's `propagateCacheEntryMetadata` for `private` kind.
+ *   throws (see the `parentCtx.variant !== "private"` guard below). Entry into
+ *   a private cache from a public parent is rejected earlier to prevent request
+ *   data from flowing into a shared cache entry.
  * - Dev mode (`registerCachedFunction`, NODE_ENV=development): skips the
  *   shared cache and always reaches here via `executeWithContext`.
  *
@@ -725,9 +792,14 @@ async function runCachedFunctionWithContext<T extends (...args: any[]) => Promis
     hasExplicitRevalidate: false,
     hasExplicitExpire: false,
     dynamicNestedCacheError: undefined,
+    invalidDynamicUsageError: undefined,
   };
 
   const result = await cacheContextStorage.run(ctx, () => fn(...args));
+
+  if (ctx.invalidDynamicUsageError) {
+    throw ctx.invalidDynamicUsageError;
+  }
 
   // Resolve effective cache life from collected configs.
   //
@@ -877,13 +949,24 @@ async function runCachedFunctionWithContext<T extends (...args: any[]) => Promis
  * Only used for cache key generation — the original Promise-augmented
  * objects are still passed to the actual function on cache miss.
  */
-function unwrapThenableObjects(value: unknown): unknown {
+type UnwrapThenableObjectsOptions = {
+  omitAppPageSearchParamsAtRoot?: boolean;
+};
+
+type UnwrapThenableObjectArrayOptions = {
+  omitAppPageSearchParamsFromFirstArg: boolean;
+};
+
+function unwrapThenableObjects(
+  value: unknown,
+  options: UnwrapThenableObjectsOptions = {},
+): unknown {
   if (value === null || value === undefined || typeof value !== "object") {
     return value;
   }
 
   if (Array.isArray(value)) {
-    return value.map(unwrapThenableObjects);
+    return value.map((item) => unwrapThenableObjects(item));
   }
 
   // Detect thenable (Promise-like) with own enumerable properties —
@@ -906,10 +989,31 @@ function unwrapThenableObjects(value: unknown): unknown {
   // Regular object — recurse into values
   const result: Record<string, unknown> = {};
   for (const key of Object.keys(value)) {
+    if (
+      key === "searchParams" &&
+      (options.omitAppPageSearchParamsAtRoot || isMarkedAppPagePropsObject(value))
+    ) {
+      continue;
+    }
     // oxlint-disable-next-line @typescript-eslint/no-explicit-any
     result[key] = unwrapThenableObjects((value as any)[key]);
   }
   return result;
+}
+
+function isMarkedAppPagePropsObject(value: object): boolean {
+  return Reflect.get(value, APP_PAGE_PROPS_CACHE_KEY_MARKER) === true;
+}
+
+function unwrapThenableObjectArray(
+  values: readonly unknown[],
+  options: UnwrapThenableObjectArrayOptions,
+): unknown[] {
+  return values.map((value, index) =>
+    unwrapThenableObjects(value, {
+      omitAppPageSearchParamsAtRoot: index === 0 && options.omitAppPageSearchParamsFromFirstArg,
+    }),
+  );
 }
 
 // ---------------------------------------------------------------------------

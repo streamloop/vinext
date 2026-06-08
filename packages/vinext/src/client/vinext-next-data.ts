@@ -9,8 +9,9 @@ import type { NEXT_DATA } from "vinext/shims/internal/utils";
 import { isUnknownRecord } from "../utils/record.js";
 
 export type VinextLinkPrefetchRoute = {
-  patternParts: string[];
+  canPrefetchLoadingShell: boolean;
   isDynamic: boolean;
+  patternParts: string[];
 };
 
 export type VinextNextData = {
@@ -20,6 +21,8 @@ export type VinextNextData = {
     pageModuleUrl?: string;
     /** Absolute URL of the `_app` module for dynamic import. */
     appModuleUrl?: string;
+    /** True when the Pages Router server has middleware/proxy configured. */
+    hasMiddleware?: boolean;
   };
 } & NEXT_DATA;
 

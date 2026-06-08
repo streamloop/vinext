@@ -1,6 +1,8 @@
 import { normalizeMountedSlotsHeader } from "./app-mounted-slots-header.js";
 import { AppElementsWire, UNMATCHED_SLOT, type AppElements } from "./app-elements-wire.js";
 
+export const APP_PREFETCH_LOADING_SHELL_MARKER_KEY = "__prefetchLoadingShell";
+
 export {
   AppElementsWire,
   APP_ARTIFACT_COMPATIBILITY_KEY,
@@ -12,7 +14,9 @@ export {
   APP_RENDER_OBSERVATION_KEY,
   APP_ROOT_LAYOUT_KEY,
   APP_ROUTE_KEY,
+  APP_SKIPPED_LAYOUT_IDS_KEY,
   APP_SLOT_BINDINGS_KEY,
+  APP_STATIC_SIBLINGS_KEY,
   APP_UNMATCHED_SLOT_WIRE_VALUE,
   UNMATCHED_SLOT,
   buildOutgoingAppPayload,

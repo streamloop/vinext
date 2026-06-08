@@ -8,7 +8,6 @@
  * We support both the sync (legacy) and async patterns.
  */
 
-import type { AsyncLocalStorage } from "node:async_hooks";
 import { MIDDLEWARE_SET_COOKIE_HEADER } from "../server/headers.js";
 import { buildRequestHeadersFromMiddlewareResponse } from "../server/middleware-request-headers.js";
 import { getOrCreateAls } from "./internal/als-registry.js";
@@ -37,6 +36,11 @@ export type HeadersContext = {
   mutableCookies?: RequestCookies;
   readonlyCookies?: RequestCookies;
   readonlyHeaders?: Headers;
+  draftModeSecret?: string;
+};
+
+type HeadersContextFromRequestOptions = {
+  draftModeSecret?: string;
 };
 
 export type HeadersAccessPhase = "render" | "action" | "route-handler";
@@ -206,16 +210,45 @@ export function consumeRenderRequestApiUsage(): RenderRequestApiKind[] {
 const _USE_CACHE_ALS_KEY = Symbol.for("vinext.cacheRuntime.contextAls");
 /** Symbol used by cache.ts to store the unstable_cache ALS on globalThis */
 const _UNSTABLE_CACHE_ALS_KEY = Symbol.for("vinext.unstableCache.als");
-const _gHeaders = globalThis as unknown as Record<PropertyKey, unknown>;
 
-function _isInsideUseCache(): boolean {
-  const als = _gHeaders[_USE_CACHE_ALS_KEY] as AsyncLocalStorage<unknown> | undefined;
-  return als?.getStore() != null;
+type UseCacheGuardContext = {
+  variant?: unknown;
+  invalidDynamicUsageError?: unknown;
+};
+
+type CacheScopeStorage = {
+  getStore: () => unknown;
+};
+
+function _getGlobalCacheScopeStorage(key: symbol): CacheScopeStorage | null {
+  const value = Reflect.get(globalThis, key);
+  if (!value || typeof value !== "object") return null;
+
+  const getStore = Reflect.get(value, "getStore");
+  if (typeof getStore !== "function") return null;
+
+  return {
+    getStore: () => getStore.call(value),
+  };
+}
+
+function _getUseCacheGuardContext(): UseCacheGuardContext | null {
+  const store = _getGlobalCacheScopeStorage(_USE_CACHE_ALS_KEY)?.getStore();
+  if (!store || typeof store !== "object") return null;
+  return store;
+}
+
+function _isInsidePublicUseCache(): boolean {
+  const ctx = _getUseCacheGuardContext();
+  // Next.js models "use cache: private" as a private-cache work unit that
+  // carries request headers and cookies. Only public "use cache" scopes freeze
+  // request APIs into persisted cache entries and must reject these reads.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/work-unit-async-storage.external.ts
+  return ctx !== null && ctx.variant !== "private";
 }
 
 function _isInsideUnstableCache(): boolean {
-  const als = _gHeaders[_UNSTABLE_CACHE_ALS_KEY] as AsyncLocalStorage<unknown> | undefined;
-  return als?.getStore() === true;
+  return _getGlobalCacheScopeStorage(_UNSTABLE_CACHE_ALS_KEY)?.getStore() === true;
 }
 
 /**
@@ -226,7 +259,7 @@ function _isInsideUnstableCache(): boolean {
  * @param apiName - The name of the API being called (e.g. "connection()")
  */
 export function throwIfInsideCacheScope(apiName: string): void {
-  if (_isInsideUseCache()) {
+  if (_isInsidePublicUseCache()) {
     const error = new Error(
       `\`${apiName}\` cannot be called inside "use cache". ` +
         `If you need this data inside a cached function, call \`${apiName}\` ` +
@@ -238,6 +271,8 @@ export function throwIfInsideCacheScope(apiName: string): void {
     // packages/next/src/server/app-render/app-render.tsx
     // https://github.com/vercel/next.js/commit/f5e54c06726b571a042fce67417e40a29f6b8689
     try {
+      const cacheCtx = _getUseCacheGuardContext();
+      if (cacheCtx) cacheCtx.invalidDynamicUsageError = error;
       const ctx = getRequestContext();
       if (ctx) ctx.invalidDynamicUsageError = error;
     } catch {
@@ -286,6 +321,17 @@ export function consumeDynamicUsage(): boolean {
   const used = state.dynamicUsageDetected;
   state.dynamicUsageDetected = false;
   return used;
+}
+
+/**
+ * Read the dynamic usage flag without resetting it.
+ * Used by the layout probe to fold a probe-scoped `markDynamicUsage()` into the
+ * per-layout observation before the isolated probe scope is discarded, so the
+ * observation captures `markDynamicUsage()` paths (e.g. `"use cache: private"`)
+ * that leave no other observable trace.
+ */
+export function peekDynamicUsage(): boolean {
+  return _getState().dynamicUsageDetected;
 }
 
 function _setStatePhase(
@@ -632,7 +678,10 @@ function _getReadonlyHeaders(ctx: HeadersContext): Headers {
  * Cookie parsing is also deferred: the `cookie` header string is not split
  * until the first call to `cookies()` or `draftMode()`.
  */
-export function headersContextFromRequest(request: Request): HeadersContext {
+export function headersContextFromRequest(
+  request: Request,
+  options?: HeadersContextFromRequestOptions,
+): HeadersContext {
   // ---------------------------------------------------------------------------
   // Lazy mutable Headers proxy
   // ---------------------------------------------------------------------------
@@ -683,6 +732,7 @@ export function headersContextFromRequest(request: Request): HeadersContext {
     get cookies(): Map<string, string> {
       return getCookies();
     },
+    draftModeSecret: options?.draftModeSecret,
   } satisfies HeadersContext;
 
   return ctx;
@@ -779,20 +829,6 @@ export function getAndClearPendingCookies(): string[] {
 const DRAFT_MODE_COOKIE = "__prerender_bypass";
 const DRAFT_MODE_EXPIRED_DATE = new Date(0).toUTCString();
 
-// Draft mode secret — generated once at build time via Vite `define` so the
-// __prerender_bypass cookie is consistent across all server instances (e.g.
-// multiple Cloudflare Workers isolates).
-function getDraftSecret(): string {
-  const secret = process.env.__VINEXT_DRAFT_SECRET;
-  if (!secret) {
-    throw new Error(
-      "[vinext] __VINEXT_DRAFT_SECRET is not defined. " +
-        "This should be set by the Vite plugin at build time.",
-    );
-  }
-  return secret;
-}
-
 // Store for Set-Cookie headers generated by draftMode().enable()/disable()
 // (stored on _state)
 
@@ -807,10 +843,42 @@ export function getDraftModeCookieHeader(): string | null {
   return header;
 }
 
-export function isDraftModeRequest(request: Request): boolean {
+function validateDraftModeSecret(secret: string): string {
+  if (secret.length === 0) {
+    throw new Error("[vinext] draft mode secret must be a non-empty string.");
+  }
+  return secret;
+}
+
+function createDraftModeSecret(): string {
+  const crypto = globalThis.crypto;
+  if (crypto && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+
+  throw new Error(
+    "[vinext] draft mode secret is not initialized. " +
+      "This should be initialized by the server entry before handling requests.",
+  );
+}
+
+function ensureContextDraftModeSecret(ctx: HeadersContext): string {
+  if (ctx.draftModeSecret !== undefined) {
+    return validateDraftModeSecret(ctx.draftModeSecret);
+  }
+
+  const secret = createDraftModeSecret();
+  ctx.draftModeSecret = secret;
+  return secret;
+}
+
+export function isDraftModeRequest(request: Request, draftModeSecret: string): boolean {
   const cookieHeader = request.headers.get("cookie");
   if (!cookieHeader) return false;
-  return parseCookieHeader(cookieHeader).get(DRAFT_MODE_COOKIE) === getDraftSecret();
+  return (
+    parseCookieHeader(cookieHeader).get(DRAFT_MODE_COOKIE) ===
+    validateDraftModeSecret(draftModeSecret)
+  );
 }
 
 type DraftModeResult = {
@@ -826,52 +894,77 @@ function draftModeCookieAttributes(): string {
   return "Path=/; HttpOnly; SameSite=None; Secure";
 }
 
+function createDraftModeScopeError(expression: string): Error {
+  return new Error(
+    `${expression} can only be called from a Server Component, Route Handler, or Server Action.`,
+  );
+}
+
+function requireActiveDraftModeContext(
+  state: VinextHeadersShimState,
+  expectedContext: HeadersContext,
+  expression: string,
+): HeadersContext {
+  const currentContext = state.headersContext;
+  if (currentContext !== expectedContext) {
+    throw createDraftModeScopeError(expression);
+  }
+  if (currentContext.accessError) {
+    throw currentContext.accessError;
+  }
+  return currentContext;
+}
+
 /**
  * Draft mode — check/toggle via a `__prerender_bypass` cookie.
  *
  * - `isEnabled`: true if the bypass cookie is present in the request
  * - `enable()`: sets the bypass cookie (for Route Handlers)
  * - `disable()`: clears the bypass cookie
+ *
+ * Unlike `headers()` / `cookies()`, calling `draftMode()` itself is allowed
+ * inside `"use cache"` and `unstable_cache()` scopes — reads of `isEnabled`
+ * are non-dynamic and supported in cached functions. Only the mutating
+ * `enable()` / `disable()` methods throw when invoked inside a cache scope.
+ * Ported from Next.js: packages/next/src/server/request/draft-mode.ts
+ * (`getDraftModeProviderForCacheScope` + `trackDynamicDraftMode`).
  */
 export async function draftMode(): Promise<DraftModeResult> {
   markRenderRequestApiUsage("draftMode");
-  throwIfInsideCacheScope("draftMode()");
 
   const state = _getState();
-  if (state.headersContext?.accessError) {
-    throw state.headersContext.accessError;
+  const context = state.headersContext;
+  if (!context) {
+    throw createDraftModeScopeError("draftMode()");
+  }
+  if (context.accessError) {
+    throw context.accessError;
   }
   // Reading `draftMode()` itself is not dynamic — `isEnabled` is a plain
   // getter and merely calling `draftMode()` does not require bailing out
   // of static prerendering. Only `enable()`/`disable()` mutate state and
   // must be tracked as dynamic, mirroring Next.js's `trackDynamicDraftMode`
   // (see .nextjs-ref/packages/next/src/server/request/draft-mode.ts:152-165).
-  const secret = getDraftSecret();
+  const secret = ensureContextDraftModeSecret(context);
 
   return {
     get isEnabled(): boolean {
-      return state.headersContext
-        ? state.headersContext.cookies.get(DRAFT_MODE_COOKIE) === secret
-        : false;
+      return context.cookies.get(DRAFT_MODE_COOKIE) === secret;
     },
     enable(): void {
+      // Mutating draft mode inside a cache scope would freeze a Set-Cookie
+      // side-effect into the cached entry, so Next.js throws here. Match that.
+      throwIfInsideCacheScope("draftMode().enable()");
+      const activeContext = requireActiveDraftModeContext(state, context, "draftMode().enable()");
       markDynamicUsage();
-      if (state.headersContext?.accessError) {
-        throw state.headersContext.accessError;
-      }
-      if (state.headersContext) {
-        state.headersContext.cookies.set(DRAFT_MODE_COOKIE, secret);
-      }
+      activeContext.cookies.set(DRAFT_MODE_COOKIE, secret);
       state.draftModeCookieHeader = `${DRAFT_MODE_COOKIE}=${secret}; ${draftModeCookieAttributes()}`;
     },
     disable(): void {
+      throwIfInsideCacheScope("draftMode().disable()");
+      const activeContext = requireActiveDraftModeContext(state, context, "draftMode().disable()");
       markDynamicUsage();
-      if (state.headersContext?.accessError) {
-        throw state.headersContext.accessError;
-      }
-      if (state.headersContext) {
-        state.headersContext.cookies.delete(DRAFT_MODE_COOKIE);
-      }
+      activeContext.cookies.delete(DRAFT_MODE_COOKIE);
       state.draftModeCookieHeader = `${DRAFT_MODE_COOKIE}=; ${draftModeCookieAttributes()}; Expires=${DRAFT_MODE_EXPIRED_DATE}`;
     },
   };

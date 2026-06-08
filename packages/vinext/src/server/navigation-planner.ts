@@ -95,12 +95,12 @@ export type NavigationEvent =
   | { kind: "prefetch"; href: string }
   | { kind: "flightResponseArrived"; token: OperationToken; result: FlightResultV0 };
 
-export type RequestedWork =
+type RequestedWork =
   | { kind: "flight"; href: string; mode: "push" | "replace" | "refresh" }
   | { direction: TraverseDirection; historyState: unknown; kind: "traverseFlight" }
   | { kind: "prefetch"; href: string };
 
-export type CommitProposal = {
+type CommitProposal = {
   cacheEntryReuseDecision?: AcceptedCacheEntryReuseDecision;
   preserveAbsentSlots: boolean;
   preserveElementIds: readonly string[];
@@ -109,8 +109,8 @@ export type CommitProposal = {
   targetSnapshot: RouteSnapshotV0;
 };
 
-export type NoCommitReason = "prefetchOnly";
-export type HardNavigationReason =
+type NoCommitReason = "prefetchOnly";
+type HardNavigationReason =
   | "cacheProofRejected"
   | "interceptionProofRejected"
   | "rootBoundaryChanged";
@@ -555,7 +555,7 @@ function resolveCurrentRootBoundaryCommitSlotPersistence(options: {
  *
  * Wire absence and UNMATCHED_SLOT markers are not semantic proof.
  */
-function resolveDefaultOrUnmatchedSlotPersistenceForLayouts(options: {
+export function resolveDefaultOrUnmatchedSlotPersistenceForLayouts(options: {
   currentSlotBindings: readonly ParallelSlotBindingSnapshotV0[];
   preservedLayoutIds: readonly string[];
   targetSlotBindings: readonly ParallelSlotBindingSnapshotV0[];

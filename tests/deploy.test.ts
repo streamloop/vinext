@@ -16,10 +16,14 @@ import {
   buildWranglerDeployArgs,
   parseDeployArgs,
   resolveWranglerBin,
+  withCloudflareEnv,
   isPackageResolvable,
   viteConfigHasCloudflarePlugin,
+  viteConfigHasCacheAdapter,
+  workerEntryHasCacheHandler,
   hasWranglerConfig,
   formatMissingCloudflarePluginError,
+  formatMissingCacheAdapterError,
 } from "../packages/vinext/src/deploy.js";
 import {
   detectPackageManager,
@@ -30,6 +34,7 @@ import {
 import { manifestFileWithBase } from "../packages/vinext/src/utils/manifest-paths.js";
 import { scanPublicFileRoutes } from "../packages/vinext/src/utils/public-routes.js";
 import { computeLazyChunks } from "../packages/vinext/src/utils/lazy-chunks.js";
+import { isUnknownRecord } from "../packages/vinext/src/utils/record.js";
 import {
   mergeHeaders,
   resolveStaticAssetSignal,
@@ -53,6 +58,38 @@ function writeFile(dir: string, relativePath: string, content: string): void {
 
 function mkdir(dir: string, relativePath: string): void {
   fs.mkdirSync(path.join(dir, relativePath), { recursive: true });
+}
+
+function readVinextPackageExports(): Record<string, unknown> {
+  const packageJsonPath = path.resolve("packages/vinext/package.json");
+  const parsed: unknown = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8"));
+  if (!isUnknownRecord(parsed) || !isUnknownRecord(parsed.exports)) {
+    throw new Error("packages/vinext/package.json must define an exports object");
+  }
+  return parsed.exports;
+}
+
+function extractVinextImportSubpaths(source: string): string[] {
+  const imports = new Set<string>();
+  const pattern = /\bfrom\s+["']vinext\/([^"']+)["']/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(source)) !== null) {
+    imports.add(`./${match[1]}`);
+  }
+  return [...imports].sort();
+}
+
+function hasPackageExport(exportsMap: Record<string, unknown>, subpath: string): boolean {
+  if (Object.hasOwn(exportsMap, subpath)) return true;
+
+  for (const exportKey of Object.keys(exportsMap)) {
+    if (!exportKey.includes("*")) continue;
+    const [prefix, suffix] = exportKey.split("*");
+    if (prefix === undefined || suffix === undefined) continue;
+    if (subpath.startsWith(prefix) && subpath.endsWith(suffix)) return true;
+  }
+
+  return false;
 }
 
 beforeEach(() => {
@@ -93,6 +130,81 @@ describe("buildWranglerDeployArgs", () => {
 
   it("treats empty string env as production", () => {
     expect(buildWranglerDeployArgs({ env: "" })).toEqual({ args: ["deploy"], env: undefined });
+  });
+});
+
+// ─── CLOUDFLARE_ENV propagation (issue #1210) ──────────────────────────────
+
+describe("withCloudflareEnv", () => {
+  let priorEnv: string | undefined;
+  let priorHadEnv: boolean;
+
+  beforeEach(() => {
+    priorHadEnv = "CLOUDFLARE_ENV" in process.env;
+    priorEnv = process.env.CLOUDFLARE_ENV;
+    delete process.env.CLOUDFLARE_ENV;
+  });
+
+  afterEach(() => {
+    if (priorHadEnv) {
+      process.env.CLOUDFLARE_ENV = priorEnv;
+    } else {
+      delete process.env.CLOUDFLARE_ENV;
+    }
+  });
+
+  it("sets CLOUDFLARE_ENV for the duration of the callback", async () => {
+    let observed: string | undefined;
+    await withCloudflareEnv("staging", async () => {
+      observed = process.env.CLOUDFLARE_ENV;
+    });
+    expect(observed).toBe("staging");
+  });
+
+  it("restores absence of CLOUDFLARE_ENV after the callback when no prior value existed", async () => {
+    await withCloudflareEnv("hml", async () => {
+      // no-op
+    });
+    expect("CLOUDFLARE_ENV" in process.env).toBe(false);
+  });
+
+  it("restores the prior CLOUDFLARE_ENV value after the callback", async () => {
+    process.env.CLOUDFLARE_ENV = "preview";
+    await withCloudflareEnv("staging", async () => {
+      expect(process.env.CLOUDFLARE_ENV).toBe("staging");
+    });
+    expect(process.env.CLOUDFLARE_ENV).toBe("preview");
+  });
+
+  it("does not touch process.env when env is undefined", async () => {
+    let observed: string | undefined = "sentinel";
+    await withCloudflareEnv(undefined, async () => {
+      observed = process.env.CLOUDFLARE_ENV;
+    });
+    expect(observed).toBeUndefined();
+    expect("CLOUDFLARE_ENV" in process.env).toBe(false);
+  });
+
+  it("does not touch process.env when env is empty string", async () => {
+    await withCloudflareEnv("", async () => {
+      expect("CLOUDFLARE_ENV" in process.env).toBe(false);
+    });
+    expect("CLOUDFLARE_ENV" in process.env).toBe(false);
+  });
+
+  it("restores CLOUDFLARE_ENV after the callback throws", async () => {
+    process.env.CLOUDFLARE_ENV = "preview";
+    await expect(
+      withCloudflareEnv("staging", async () => {
+        throw new Error("boom");
+      }),
+    ).rejects.toThrow("boom");
+    expect(process.env.CLOUDFLARE_ENV).toBe("preview");
+  });
+
+  it("returns the callback's resolved value", async () => {
+    const result = await withCloudflareEnv("staging", async () => 42);
+    expect(result).toBe(42);
   });
 });
 
@@ -408,7 +520,7 @@ describe("generateWranglerConfig", () => {
     const parsed = JSON.parse(config);
 
     expect(parsed.kv_namespaces).toBeDefined();
-    expect(parsed.kv_namespaces[0].binding).toBe("VINEXT_CACHE");
+    expect(parsed.kv_namespaces[0].binding).toBe("VINEXT_KV_CACHE");
   });
 
   it("omits KV namespace when no ISR", () => {
@@ -453,9 +565,9 @@ describe("generateAppRouterWorkerEntry", () => {
     expect(content).toContain("Promise<Response>");
   });
 
-  it("includes /_vinext/image handler", () => {
+  it("includes image optimization handler", () => {
     const content = generateAppRouterWorkerEntry();
-    expect(content).toContain("/_vinext/image");
+    expect(content).toContain("isImageOptimizationPath");
     expect(content).toContain("handleImageOptimization");
   });
 
@@ -480,20 +592,139 @@ describe("generateAppRouterWorkerEntry", () => {
     expect(content).toContain("env.IMAGES");
   });
 
-  it("does not include KV wiring when hasISR is false", () => {
-    const content = generateAppRouterWorkerEntry(false);
+  it("never wires a cache handler into the Worker entry", () => {
+    // Cache backends are configured declaratively via vinext({ cache }) in
+    // vite.config; the Worker entry must not scaffold setDataCacheHandler.
+    const content = generateAppRouterWorkerEntry();
     expect(content).not.toContain("KVCacheHandler");
-    expect(content).not.toContain("setCacheHandler");
-    expect(content).not.toContain("VINEXT_CACHE");
+    expect(content).not.toContain("setDataCacheHandler");
+    expect(content).not.toContain("setCdnCacheAdapter");
+    expect(content).not.toContain("VINEXT_KV_CACHE");
   });
 
-  it("includes KV wiring when hasISR is true", () => {
-    const content = generateAppRouterWorkerEntry(true);
-    expect(content).toContain('import { KVCacheHandler } from "vinext/cloudflare"');
-    expect(content).toContain('import { setCacheHandler } from "vinext/shims/cache"');
-    expect(content).toContain("VINEXT_CACHE: KVNamespace");
-    expect(content).toContain("new KVCacheHandler(env.VINEXT_CACHE)");
-    expect(content).toContain("setCacheHandler(");
+  it("points users to the declarative cache config", () => {
+    const content = generateAppRouterWorkerEntry();
+    expect(content).toContain("vinext({ cache })");
+  });
+});
+
+describe("viteConfigHasCacheAdapter", () => {
+  it("detects a data field assigned an adapter", () => {
+    writeFile(
+      tmpDir,
+      "vite.config.ts",
+      `import { kvDataAdapter } from "@vinext/cloudflare/cache/kv-data-adapter";
+       export default { plugins: [vinext({ cache: { data: kvDataAdapter() } })] };`,
+    );
+    expect(viteConfigHasCacheAdapter(tmpDir)).toBe(true);
+  });
+
+  it("detects a cdn field assigned an adapter", () => {
+    writeFile(
+      tmpDir,
+      "vite.config.ts",
+      `export default { plugins: [vinext({ cache: { cdn: cdnAdapter() } })] };`,
+    );
+    expect(viteConfigHasCacheAdapter(tmpDir)).toBe(true);
+  });
+
+  it("detects a hand-written descriptor object on the data field", () => {
+    writeFile(
+      tmpDir,
+      "vite.config.ts",
+      `export default {
+         plugins: [vinext({ cache: { data: { adapter: "./x.js", options: {} } } })],
+       };`,
+    );
+    expect(viteConfigHasCacheAdapter(tmpDir)).toBe(true);
+  });
+
+  it("returns false when the cache object is empty", () => {
+    writeFile(tmpDir, "vite.config.ts", `export default { plugins: [vinext({ cache: {} })] };`);
+    expect(viteConfigHasCacheAdapter(tmpDir)).toBe(false);
+  });
+
+  it("returns false when cdn/data are explicitly undefined", () => {
+    writeFile(
+      tmpDir,
+      "vite.config.ts",
+      `export default { plugins: [vinext({ cache: { cdn: undefined, data: undefined } })] };`,
+    );
+    expect(viteConfigHasCacheAdapter(tmpDir)).toBe(false);
+  });
+
+  it("returns false when there is no cache config at all", () => {
+    writeFile(tmpDir, "vite.config.ts", `export default { plugins: [vinext()] };`);
+    expect(viteConfigHasCacheAdapter(tmpDir)).toBe(false);
+  });
+
+  it("returns true (does not block) when there is no Vite config to inspect", () => {
+    expect(viteConfigHasCacheAdapter(tmpDir)).toBe(true);
+  });
+});
+
+describe("workerEntryHasCacheHandler", () => {
+  it("detects a setCacheHandler call in worker/index.ts", () => {
+    writeFile(
+      tmpDir,
+      "worker/index.ts",
+      `import { setCacheHandler } from "vinext/shims/cache";
+       setCacheHandler(new KVCacheHandler(env.VINEXT_KV_CACHE));`,
+    );
+    expect(workerEntryHasCacheHandler(tmpDir)).toBe(true);
+  });
+
+  it("detects a setDataCacheHandler call", () => {
+    writeFile(
+      tmpDir,
+      "worker/index.ts",
+      `import { setDataCacheHandler } from "vinext/shims/cache";
+       setDataCacheHandler(handler);`,
+    );
+    expect(workerEntryHasCacheHandler(tmpDir)).toBe(true);
+  });
+
+  it("detects a setCdnCacheAdapter call", () => {
+    writeFile(
+      tmpDir,
+      "worker/index.ts",
+      `import { setCdnCacheAdapter } from "vinext/shims/cdn-cache";
+       setCdnCacheAdapter(adapter);`,
+    );
+    expect(workerEntryHasCacheHandler(tmpDir)).toBe(true);
+  });
+
+  it("detects a setter in worker/index.js", () => {
+    writeFile(
+      tmpDir,
+      "worker/index.js",
+      `setCacheHandler(new KVCacheHandler(env.VINEXT_KV_CACHE));`,
+    );
+    expect(workerEntryHasCacheHandler(tmpDir)).toBe(true);
+  });
+
+  it("returns false when the Worker entry has no cache setter", () => {
+    writeFile(tmpDir, "worker/index.ts", `export default { fetch() {} };`);
+    expect(workerEntryHasCacheHandler(tmpDir)).toBe(false);
+  });
+
+  it("returns false when there is no Worker entry to inspect", () => {
+    expect(workerEntryHasCacheHandler(tmpDir)).toBe(false);
+  });
+});
+
+describe("formatMissingCacheAdapterError", () => {
+  it("names the data adapter builder and the KV namespace command", () => {
+    const msg = formatMissingCacheAdapterError({});
+    expect(msg).toContain("no cache adapter is configured");
+    expect(msg).toContain("kvDataAdapter()");
+    expect(msg).toContain("npx wrangler kv namespace create VINEXT_KV_CACHE");
+  });
+
+  it("no longer references the cdn adapter", () => {
+    const msg = formatMissingCacheAdapterError({});
+    expect(msg).not.toContain("cdnAdapter");
+    expect(msg).not.toContain("cdn-adapter");
   });
 });
 
@@ -520,9 +751,12 @@ describe("generatePagesRouterWorkerEntry", () => {
 
   it("runs middleware before routing", () => {
     const content = generatePagesRouterWorkerEntry();
-    // Middleware should appear before API route check
-    const middlewarePos = content.indexOf("runMiddleware(request, ctx)");
-    const apiRoutePos = content.indexOf('resolvedPathname.startsWith("/api/")');
+    // Middleware should appear before API route check.
+    // The API check now uses apiLookupPathname (post-locale-strip), but the
+    // ordering invariant still holds (issue #1336 item 3 only changes the
+    // variable name, not the relative position).
+    const middlewarePos = content.indexOf("runMiddleware(request, ctx, { isDataRequest })");
+    const apiRoutePos = content.indexOf('apiLookupPathname.startsWith("/api/")');
     expect(middlewarePos).toBeGreaterThan(-1);
     expect(apiRoutePos).toBeGreaterThan(-1);
     expect(middlewarePos).toBeLessThan(apiRoutePos);
@@ -530,8 +764,16 @@ describe("generatePagesRouterWorkerEntry", () => {
 
   it("applies next.config.js redirects before middleware", () => {
     const content = generatePagesRouterWorkerEntry();
-    const redirectPos = content.indexOf("matchRedirect(pathname, configRedirects, reqCtx)");
-    const middlewarePos = content.indexOf("runMiddleware(request, ctx)");
+    // Redirect matching uses the locale-normalised `matchPathname` so that
+    // `:locale` placeholders and `locale: false` redirect rules continue to
+    // match default-locale URLs that arrive without a prefix (issue #1336
+    // item 4). It also passes `basePathState` for basePath: false opt-out
+    // gating. Whatever the exact form, redirect matching must still happen
+    // before middleware runs.
+    const redirectPos = content.indexOf(
+      "matchRedirect(matchPathname, configRedirects, reqCtx, basePathState)",
+    );
+    const middlewarePos = content.indexOf("runMiddleware(request, ctx, { isDataRequest })");
     expect(redirectPos).toBeGreaterThan(-1);
     expect(middlewarePos).toBeGreaterThan(-1);
     expect(redirectPos).toBeLessThan(middlewarePos);
@@ -566,7 +808,8 @@ describe("generatePagesRouterWorkerEntry", () => {
     const content = generatePagesRouterWorkerEntry();
     const middlewareRewritePos = content.indexOf("resolvedUrl = result.rewriteUrl");
     const externalCheckPos = content.indexOf("isExternalUrl(resolvedUrl)", middlewareRewritePos);
-    const localApiRoutePos = content.indexOf('resolvedPathname.startsWith("/api/")');
+    // API check uses apiLookupPathname (post-locale-strip) since #1336 item 3.
+    const localApiRoutePos = content.indexOf('apiLookupPathname.startsWith("/api/")');
 
     expect(middlewareRewritePos).toBeGreaterThan(-1);
     expect(externalCheckPos).toBeGreaterThan(middlewareRewritePos);
@@ -584,7 +827,13 @@ describe("generatePagesRouterWorkerEntry", () => {
   it("applies next.config.js redirects", () => {
     const content = generatePagesRouterWorkerEntry();
     expect(content).toContain("configRedirects");
-    expect(content).toContain("matchRedirect(pathname");
+    // Redirect matching uses the default-locale-normalised pathname so that
+    // locale-aware redirect rules with `:locale` placeholders and rules with
+    // `locale: false` still match requests that arrive without a locale
+    // prefix (issue #1336 item 4). Before the fix the call site read
+    // `matchRedirect(pathname, ...)`.
+    expect(content).toContain("matchRedirect(matchPathname");
+    expect(content).toContain("normalizeDefaultLocalePathname");
   });
 
   it("applies next.config.js rewrites (beforeFiles, afterFiles, fallback)", () => {
@@ -592,7 +841,12 @@ describe("generatePagesRouterWorkerEntry", () => {
     expect(content).toContain("configRewrites.beforeFiles");
     expect(content).toContain("configRewrites.afterFiles");
     expect(content).toContain("configRewrites.fallback");
-    expect(content).toContain("matchRewrite(resolvedPathname");
+    // Rewrite matching runs against the locale-normalised resolved pathname
+    // via the local `matchResolvedPathname` helper (issue #1336 item 4) and
+    // passes `basePathState` for basePath: false opt-out gating.
+    expect(content).toContain("matchResolvedPathname(resolvedPathname)");
+    expect(content).toMatch(/matchRewrite\(\s*matchResolvedPathname\(resolvedPathname\)/);
+    expect(content).toContain("basePathState");
     expect(content).toContain("matchPageRoute");
     expect(content).toContain("matchPageRoute(resolvedPathname, request)");
   });
@@ -607,9 +861,9 @@ describe("generatePagesRouterWorkerEntry", () => {
   it("handles basePath stripping and creates a new request with stripped URL for middleware", () => {
     const content = generatePagesRouterWorkerEntry();
     expect(content).toContain("basePath");
-    expect(content).toContain("function hasBasePath(pathname: string, basePath: string): boolean");
-    expect(content).toContain("function stripBasePath(pathname: string, basePath: string): string");
-    expect(content).toContain('pathname === basePath || pathname.startsWith(basePath + "/")');
+    expect(content).toContain(
+      'import { hasBasePath, stripBasePath } from "vinext/utils/base-path"',
+    );
     expect(content).toContain("const stripped = stripBasePath(pathname, basePath);");
     // After stripping, a new request with the stripped URL must be created
     // so middleware matchers see the basePath-free pathname (matching prod-server)
@@ -624,10 +878,17 @@ describe("generatePagesRouterWorkerEntry", () => {
     expect(content).toContain('from "vinext/server/request-pipeline"');
   });
 
-  it("routes /api/ to handleApiRoute using resolved URL", () => {
+  it("routes /api/ to handleApiRoute using resolved URL and forwards ctx", () => {
     const content = generatePagesRouterWorkerEntry();
-    expect(content).toContain('resolvedPathname.startsWith("/api/")');
-    expect(content).toContain("handleApiRoute(request, resolvedUrl)");
+    // Locale prefix is stripped before the /api/ check so /fr/api/ok matches
+    // pages/api/ok (issue #1336 item 3). The resulting URL (apiLookupUrl) is
+    // then used both for the prefix check and for the handleApiRoute call.
+    expect(content).toContain("stripI18nLocaleForApiRoute");
+    expect(content).toContain('apiLookupPathname.startsWith("/api/")');
+    // Forwarding ctx lets handlePagesApiRoute wrap the handler in
+    // runWithExecutionContext so after() and other shims can reach
+    // ctx.waitUntil(). See #1365.
+    expect(content).toContain("handleApiRoute(request, apiLookupUrl, ctx)");
   });
 
   it("includes error handling", () => {
@@ -636,9 +897,9 @@ describe("generatePagesRouterWorkerEntry", () => {
     expect(content).toContain("Internal Server Error");
   });
 
-  it("includes /_vinext/image handler", () => {
+  it("includes image optimization handler", () => {
     const content = generatePagesRouterWorkerEntry();
-    expect(content).toContain("/_vinext/image");
+    expect(content).toContain("isImageOptimizationPath");
     expect(content).toContain("handleImageOptimization");
   });
 
@@ -664,19 +925,28 @@ describe("generatePagesRouterWorkerEntry", () => {
     expect(content).toContain("env.IMAGES");
   });
 
+  it("exports every vinext subpath imported by generated worker entries", () => {
+    const exportsMap = readVinextPackageExports();
+    const generatedImports = [
+      ...extractVinextImportSubpaths(generateAppRouterWorkerEntry()),
+      ...extractVinextImportSubpaths(generatePagesRouterWorkerEntry()),
+    ];
+    const uniqueGeneratedImports = [...new Set(generatedImports)].sort();
+
+    expect(uniqueGeneratedImports.length).toBeGreaterThan(0);
+    expect(
+      uniqueGeneratedImports.filter((subpath) => !hasPackageExport(exportsMap, subpath)),
+    ).toEqual([]);
+  });
+
   it("merges middleware and config headers into responses with correct precedence", () => {
     const content = generatePagesRouterWorkerEntry();
-    expect(content).toContain("mergeHeaders");
+    expect(content).toContain('import { mergeHeaders } from "vinext/server/worker-utils"');
     expect(content).toContain("middlewareHeaders");
-    // Response headers must override middleware headers (matching prod-server).
-    // mergeHeaders uses Headers API and getSetCookie() to preserve multi-value cookies.
-    expect(content).toContain("merged.set(k, v)");
-    expect(content).toContain("getSetCookie");
+    expect(content).toContain("return mergeHeaders(response, middlewareHeaders");
   });
 
   it("mergeHeaders preserves multiple Set-Cookie headers from both middleware and response", () => {
-    // Behavioral test for the mergeHeaders function inlined in the generated worker entry.
-    // worker-utils.ts exports the same function — kept in sync with the deploy.ts template.
     const response = new Response("body", {
       headers: [
         ["set-cookie", "resp=1; Path=/"],
@@ -821,11 +1091,8 @@ describe("generatePagesRouterWorkerEntry", () => {
 
   it("generated worker entry includes the no-body and streamed content-length merge guards", () => {
     const content = generatePagesRouterWorkerEntry();
-    expect(content).toContain("NO_BODY_RESPONSE_STATUSES");
-    expect(content).toContain("__vinextStreamedHtmlResponse");
-    expect(content).toContain('merged.delete("content-length")');
-    expect(content).toContain("if (isContentLengthHeader(k)) continue;");
-    expect(content).toContain("cancelResponseBody(response)");
+    expect(content).toContain('import { mergeHeaders } from "vinext/server/worker-utils"');
+    expect(content).toContain("return mergeHeaders(response, middlewareHeaders");
   });
 
   it("resolveStaticAssetSignal fetches and merges static asset responses with middleware status", async () => {
@@ -878,10 +1145,17 @@ describe("generatePagesRouterWorkerEntry", () => {
     expect(content).toContain('typeof renderPage === "function"');
   });
 
+  it("does not defer error page rendering for data requests", () => {
+    const content = generatePagesRouterWorkerEntry();
+    expect(content).toContain(
+      'const shouldDeferErrorPageOnMiss =\n          !isDataRequest && typeof matchPageRoute === "function" && !renderPageMatch;',
+    );
+  });
+
   it("builds reqCtx before middleware runs", () => {
     const content = generatePagesRouterWorkerEntry();
     const reqCtxPos = content.indexOf("requestContextFromRequest(request)");
-    const middlewarePos = content.indexOf("runMiddleware(request, ctx)");
+    const middlewarePos = content.indexOf("runMiddleware(request, ctx, { isDataRequest })");
     expect(reqCtxPos).toBeGreaterThan(-1);
     expect(middlewarePos).toBeGreaterThan(-1);
     expect(reqCtxPos).toBeLessThan(middlewarePos);
@@ -890,7 +1164,7 @@ describe("generatePagesRouterWorkerEntry", () => {
   it("checks image optimization after basePath stripping", () => {
     const content = generatePagesRouterWorkerEntry();
     const basePathPos = content.indexOf("const stripped = stripBasePath(pathname, basePath);");
-    const imagePos = content.indexOf('pathname === "/_vinext/image"');
+    const imagePos = content.indexOf("isImageOptimizationPath(pathname)");
     expect(basePathPos).toBeGreaterThan(-1);
     expect(imagePos).toBeGreaterThan(-1);
     expect(basePathPos).toBeLessThan(imagePos);
@@ -900,6 +1174,30 @@ describe("generatePagesRouterWorkerEntry", () => {
     const content = generatePagesRouterWorkerEntry();
     expect(content).toContain("!isExternalUrl(redirect.destination)");
     expect(content).toContain("!hasBasePath(redirect.destination, basePath)");
+  });
+
+  // Regression for #1337: invalid `_next/static/*` paths must short-circuit
+  // with a plain-text 404 instead of falling through to renderPage (which
+  // would render the full HTML 404 page with bootstrap scripts + CSS).
+  // Matches Next.js: packages/next/src/server/lib/router-server.ts.
+  it("short-circuits invalid `_next/static/*` paths with plain-text 404", () => {
+    const content = generatePagesRouterWorkerEntry();
+    expect(content).toContain(
+      'import { notFoundStaticAssetResponse } from "vinext/server/http-error-responses"',
+    );
+    expect(content).toContain(
+      'import { assetPrefixPathname, isNextStaticPath } from "vinext/utils/asset-prefix"',
+    );
+    expect(content).toContain("assetPrefixPathname(vinextConfig?.assetPrefix");
+    expect(content).toContain("isNextStaticPath(pathname, basePath, assetPathPrefix)");
+    expect(content).toContain("return notFoundStaticAssetResponse();");
+
+    // The short-circuit must fire BEFORE renderPage so the rich HTML 404
+    // is never rendered for asset misses.
+    const staticPos = content.indexOf("isNextStaticPath(pathname, basePath, assetPathPrefix)");
+    const renderPagePos = content.indexOf("renderPage(request, resolvedUrl");
+    expect(staticPos).toBeGreaterThan(-1);
+    expect(renderPagePos).toBeGreaterThan(staticPos);
   });
 });
 
@@ -1817,7 +2115,7 @@ describe("detectProject on real fixtures", () => {
 
 describe("Cloudflare _headers file generation", () => {
   /** Replicates the _headers generation logic from the closeBundle hook. */
-  function generateHeaders(clientDir: string, assetsDir = "assets"): void {
+  function generateHeaders(clientDir: string, assetsDir = "_next/static"): void {
     const headersPath = path.join(clientDir, "_headers");
     if (!fs.existsSync(headersPath)) {
       const headersContent = [
@@ -1837,11 +2135,11 @@ describe("Cloudflare _headers file generation", () => {
     generateHeaders(clientDir);
 
     const content = fs.readFileSync(path.join(clientDir, "_headers"), "utf-8");
-    expect(content).toContain("/assets/*");
+    expect(content).toContain("/_next/static/*");
     expect(content).toContain("Cache-Control: public, max-age=31536000, immutable");
     // Verify Cloudflare _headers format: path on its own line, indented header below
     const lines = content.split("\n");
-    const pathLine = lines.findIndex((l) => l === "/assets/*");
+    const pathLine = lines.findIndex((l) => l === "/_next/static/*");
     expect(pathLine).toBeGreaterThanOrEqual(0);
     expect(lines[pathLine + 1]).toBe("  Cache-Control: public, max-age=31536000, immutable");
   });
@@ -1857,7 +2155,7 @@ describe("Cloudflare _headers file generation", () => {
 
     const content = fs.readFileSync(path.join(clientDir, "_headers"), "utf-8");
     expect(content).toBe(userContent);
-    expect(content).not.toContain("/assets/*");
+    expect(content).not.toContain("/_next/static/*");
   });
 
   it("respects custom assetsDir", () => {
@@ -1868,7 +2166,7 @@ describe("Cloudflare _headers file generation", () => {
 
     const content = fs.readFileSync(path.join(clientDir, "_headers"), "utf-8");
     expect(content).toContain("/static/*");
-    expect(content).not.toContain("/assets/*");
+    expect(content).not.toContain("/_next/static/*");
   });
 
   it("ends with a trailing newline", () => {
@@ -2587,12 +2885,12 @@ describe("parseWranglerConfig — custom domain extraction", () => {
     expect(config?.customDomain).toBeUndefined();
   });
 
-  it("extracts KV namespace ID for VINEXT_CACHE", () => {
+  it("extracts KV namespace ID for VINEXT_KV_CACHE", () => {
     writeFile(
       tmpDir,
       "wrangler.json",
       JSON.stringify({
-        kv_namespaces: [{ binding: "VINEXT_CACHE", id: "abc123" }],
+        kv_namespaces: [{ binding: "VINEXT_KV_CACHE", id: "abc123" }],
       }),
     );
     const config = parseWranglerConfig(tmpDir);

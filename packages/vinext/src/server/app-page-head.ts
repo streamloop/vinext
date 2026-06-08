@@ -2,7 +2,7 @@ import {
   mergeMetadataEntries,
   mergeViewport,
   postProcessMetadata,
-  resolveModuleMetadata,
+  resolveModuleMetadata as _resolveModuleMetadata,
   resolveModuleViewport,
   type Metadata,
   type MetadataMergeEntry,
@@ -11,10 +11,33 @@ import {
 import { runWithFetchDedupe } from "vinext/shims/fetch-cache";
 import { applyFileBasedMetadata } from "./file-based-metadata.js";
 import type { AppPageParams } from "./app-page-boundary.js";
+import { tagAppPageMetadataError } from "./app-page-execution.js";
 import { resolveAppPageSegmentParams } from "./app-page-params.js";
 import type { MetadataFileRoute } from "./metadata-routes.js";
 
-type AppPageSearchParams = Record<string, string | string[]>;
+/**
+ * Wrapped {@link _resolveModuleMetadata} that tags any thrown error with the
+ * `APP_PAGE_METADATA_ERROR_MARKER` symbol. The marker lets downstream special-
+ * error handling distinguish a `generateMetadata()` redirect/notFound from a
+ * page-component redirect/notFound, which matters because metadata is
+ * suspended/streamed in Next.js. Its redirects no longer become a plain
+ * HTTP 307: RSC navigation rides inside the flight payload (200), streaming
+ * document SSR gets an HTML refresh meta tag (200), and html-limited bots
+ * get a blocking 307 — whereas page redirects still emit a 307 for SSR.
+ * See https://github.com/cloudflare/vinext/issues/1347
+ * and Next.js test/e2e/app-dir/metadata-streaming.
+ */
+async function resolveModuleMetadata(
+  ...args: Parameters<typeof _resolveModuleMetadata>
+): Promise<Metadata | null> {
+  try {
+    return await _resolveModuleMetadata(...args);
+  } catch (error) {
+    throw tagAppPageMetadataError(error);
+  }
+}
+
+export type AppPageSearchParams = Record<string, string | string[]>;
 
 type AppPageHeadModule = Record<string, unknown>;
 
@@ -74,6 +97,7 @@ type ResolveAppPageHeadOptions<TModule extends AppPageHeadModule = AppPageHeadMo
 };
 
 type ResolveAppPageHeadResult = {
+  hasDynamicMetadata: boolean;
   hasSearchParams: boolean;
   metadata: Metadata | null;
   pageSearchParams: AppPageSearchParams;
@@ -86,6 +110,7 @@ type AppPageSearchParamsCollection = {
 };
 
 type ResolvedParallelRouteHead = {
+  hasDynamicMetadata: boolean;
   metadataResults: (Metadata | null)[];
   metadataSources: AppPageHeadSource[];
   viewportResults: (Viewport | null)[];
@@ -115,6 +140,10 @@ export function resolveActiveParallelRouteHeadInputs<TModule extends AppPageHead
 
 function isPresent<T>(value: T | null | undefined): value is T {
   return value !== null && value !== undefined;
+}
+
+function hasGenerateMetadata(module: AppPageHeadModule | null | undefined): boolean {
+  return typeof module?.generateMetadata === "function";
 }
 
 export function collectAppPageSearchParams(
@@ -254,6 +283,8 @@ async function resolveParallelRouteHead<TModule extends AppPageHeadModule>(
   const layoutModules = [...(parallelRoute.layoutModules ?? []), parallelRoute.layoutModule].filter(
     isPresent,
   );
+  const hasDynamicMetadata =
+    layoutModules.some(hasGenerateMetadata) || hasGenerateMetadata(parallelRoute.pageModule);
   const layoutViewportPromises = layoutModules.map((layoutModule) =>
     resolveModuleViewport(layoutModule, params),
   );
@@ -303,7 +334,7 @@ async function resolveParallelRouteHead<TModule extends AppPageHeadModule>(
     viewportResults.push(pageViewport);
   }
 
-  return { metadataResults, metadataSources, viewportResults };
+  return { hasDynamicMetadata, metadataResults, metadataSources, viewportResults };
 }
 
 export async function resolveAppPageHead<TModule extends AppPageHeadModule>(
@@ -319,6 +350,9 @@ async function resolveAppPageHeadInner<TModule extends AppPageHeadModule>(
   const layoutTreePositions = options.layoutTreePositions ?? [];
   const layoutInputs = createLayoutInputs(options.layoutModules, layoutTreePositions);
   const layoutSourcePositions = layoutInputs.map((input) => input.treePosition);
+  const primaryHasDynamicMetadata =
+    layoutInputs.some((input) => hasGenerateMetadata(input.module)) ||
+    hasGenerateMetadata(options.pageModule);
   const { hasSearchParams, pageSearchParams } = collectAppPageSearchParams(options.searchParams);
   const layoutMetadataPromise = resolveLayoutMetadata(layoutInputs, options.params, routeSegments);
   const layoutViewportPromise = resolveLayoutViewport(layoutInputs, options.params, routeSegments);
@@ -367,13 +401,26 @@ async function resolveAppPageHeadInner<TModule extends AppPageHeadModule>(
   const parallelMetadataResults = parallelRouteHeads.flatMap((head) => head.metadataResults);
   const parallelViewportResults = parallelRouteHeads.flatMap((head) => head.viewportResults);
   const parallelMetadataSources = parallelRouteHeads.flatMap((head) => head.metadataSources);
+  const hasDynamicMetadata =
+    primaryHasDynamicMetadata || parallelRouteHeads.some((head) => head.hasDynamicMetadata);
 
+  // Active parallel slot metadata is suppressed from contributing the primary
+  // <title> when the matched page already provides one. This preserves Next.js
+  // behavior where slot pages (typically modals/sidebars rendered alongside the
+  // main page) don't clobber the page title. When the route has no children
+  // page providing a title (e.g. a parallel layout that doesn't render
+  // `{children}`, or a parent that only has `default.tsx`), the slot page's
+  // title is the most specific signal and is allowed to contribute — matching
+  // Next.js's loader-tree walk which appends slot metadata items in tree order
+  // with no title suppression.
+  // Reference: https://github.com/vercel/next.js/blob/canary/packages/next/src/lib/metadata/resolve-metadata.ts
+  const primaryPageHasTitle = pageMetadata != null && pageMetadata.title !== undefined;
   const metadataEntries: MetadataMergeEntry[] = [
     ...layoutMetadataResults.filter(isPresent).map((metadata) => ({ metadata })),
     ...(pageMetadata ? [{ isPage: true, metadata: pageMetadata }] : []),
     ...parallelMetadataResults
       .filter(isPresent)
-      .map((metadata) => ({ contributesTitle: false, metadata })),
+      .map((metadata) => ({ contributesTitle: !primaryPageHasTitle, metadata })),
   ];
   const viewportList = [
     ...layoutViewportResults.filter(isPresent),
@@ -420,6 +467,7 @@ async function resolveAppPageHeadInner<TModule extends AppPageHeadModule>(
   }
 
   return {
+    hasDynamicMetadata,
     hasSearchParams,
     metadata,
     pageSearchParams,

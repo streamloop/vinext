@@ -1,5 +1,6 @@
-import type { ReactNode } from "react";
+import React, { type ReactNode } from "react";
 import type { ReactFormState } from "react-dom/client";
+import type { NavigationContext } from "vinext/shims/navigation";
 import type { ClassificationReason } from "../build/layout-classification-types.js";
 import {
   _consumeRequestScopedCacheLife,
@@ -32,7 +33,10 @@ import {
 } from "vinext/shims/fetch-cache";
 import { AppElementsWire, type AppOutgoingElements } from "./app-elements.js";
 import { readAppPageCacheResponse } from "./app-page-cache.js";
-import { resolveAppPageParentHttpAccessBoundaryModule } from "./app-page-boundary.js";
+import {
+  resolveAppPageParentHttpAccessBoundary,
+  resolveAppPageParentHttpAccessBoundaryModule,
+} from "./app-page-boundary.js";
 import { readStreamAsText } from "../utils/text-stream.js";
 import {
   buildAppPageSpecialErrorResponse,
@@ -45,6 +49,7 @@ import {
 import { resolveAppPageMethodResponse } from "./app-page-method.js";
 import {
   buildAppPageElement,
+  resolveAppPageInterceptionRerenderTarget,
   resolveAppPageIntercept,
   validateAppPageDynamicParams,
   type ValidateAppPageDynamicParamsOptions,
@@ -69,11 +74,18 @@ import {
   shouldSuppressLoadingBoundaries,
   type AppRscRenderMode,
 } from "./app-rsc-render-mode.js";
+import { shouldServeStreamingMetadata } from "./streaming-metadata.js";
 import { createAppPageTreePath } from "./app-page-route-wiring.js";
-import type { AppPageSsrHandler } from "./app-page-stream.js";
+import { isAppSsrRenderResult, type AppPageSsrHandler } from "./app-page-stream.js";
+import type { ClientReuseManifestParseResult } from "./client-reuse-manifest.js";
 import { createStaticGenerationHeadersContext } from "./app-static-generation.js";
 import { buildPageCacheTags } from "./implicit-tags.js";
 import type { ISRCacheEntry } from "./isr-cache.js";
+import {
+  createAppLayoutParamAccessTracker,
+  isAppLayoutObservationUnsafeForStaticReuse,
+  type AppLayoutParamAccessTracker,
+} from "./app-layout-param-observation.js";
 
 type AppPageParams = Record<string, string | string[]>;
 type AppPageElement = ReactNode | Readonly<Record<string, ReactNode>>;
@@ -124,40 +136,81 @@ type AppPageDispatchInterceptOptions<TPage = unknown> = {
 
 type AppPageModule = {
   default?: unknown;
+  dynamic?: unknown;
+  revalidate?: unknown;
 };
+
+type LayoutSegmentConfigClassification = Readonly<{
+  kind: "dynamic" | "static";
+  reason: ClassificationReason;
+}>;
+
+type EffectiveLayoutClassifications = Readonly<{
+  buildTimeClassifications: ReadonlyMap<number, "static" | "dynamic"> | null;
+  buildTimeReasons: ReadonlyMap<number, ClassificationReason> | null | undefined;
+}>;
 
 type AppPageDispatchRoute = {
   __buildTimeClassifications?: LayoutClassificationOptions["buildTimeClassifications"];
   __buildTimeReasons?: LayoutClassificationOptions["buildTimeReasons"];
   error?: AppPageModule | null;
   errors?: readonly (AppPageModule | null | undefined)[];
+  forbidden?: AppPageModule | null;
   forbiddens?: readonly (AppPageModule | null | undefined)[];
   isDynamic: boolean;
   layouts: readonly AppPageModule[];
   layoutTreePositions?: readonly number[];
   loading?: AppPageModule | null;
+  notFound?: AppPageModule | null;
   notFounds?: readonly (AppPageModule | null | undefined)[];
   params: readonly string[];
   pattern: string;
   routeSegments: readonly string[];
+  unauthorized?: AppPageModule | null;
   unauthorizeds?: readonly (AppPageModule | null | undefined)[];
 };
+
+function resolveAppPageRouteBoundaryModule(
+  route: AppPageDispatchRoute,
+  statusCode: number,
+): AppPageModule | null {
+  if (statusCode === 403) return route.forbidden ?? null;
+  if (statusCode === 401) return route.unauthorized ?? null;
+  if (statusCode === 404) return route.notFound ?? null;
+  return null;
+}
 
 type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
   /** Configured basePath (e.g. "/blog"). Used to prefix redirect Locations. */
   basePath?: string;
+  /**
+   * Allow-list of OpenTelemetry propagation keys (from
+   * `experimental.clientTraceMetadata`) to surface as `<meta>` tags in the
+   * SSR head. Undefined or empty disables emission entirely.
+   */
+  clientTraceMetadata?: readonly string[];
   buildPageElement: (
     route: TRoute,
     params: AppPageParams,
     opts: AppPageDispatchInterceptOptions | undefined,
     searchParams: URLSearchParams,
+    layoutParamAccess?: AppLayoutParamAccessTracker,
   ) => Promise<AppPageElement>;
+  clientReuseManifest?: ClientReuseManifestParseResult;
   cleanPathname: string;
   clearRequestContext: () => void;
   createRscOnErrorHandler: (pathname: string, routePath: string) => AppPageBoundaryOnError;
   debugClassification?: (layoutId: string, reason: ClassificationReason) => void;
+  draftModeSecret: string;
   dynamicConfig?: string;
+  dynamicStaleTimeSeconds?: number;
   dynamicParamsConfig?: boolean;
+  /**
+   * Hydrate a source route's lazy page/route-handler modules before reading
+   * `route.page` (e.g. for fetch-cache-mode resolution) on intercept and ISR
+   * revalidation targets obtained via `getSourceRoute`. Idempotent.
+   */
+  ensureRouteLoaded?: (route: TRoute) => unknown;
   fetchCache?: FetchCacheMode | null;
   findIntercept: (pathname: string) => AppPageDispatchIntercept | null;
   formState?: ReactFormState | null;
@@ -167,13 +220,15 @@ type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
   getFontLinks: () => string[];
   getFontPreloads: () => AppPageFontPreload[];
   getFontStyles: () => string[];
-  getNavigationContext: () => unknown;
+  getNavigationContext: () => NavigationContext | null;
   getSourceRoute: (sourceRouteIndex: number) => TRoute | undefined;
   hasGenerateStaticParams: boolean;
   hasPageDefaultExport: boolean;
   hasPageModule: boolean;
   handlerStart: number;
+  htmlLimitedBots?: string;
   interceptionContext: string | null;
+  isEdgeRuntime?: boolean;
   isProgressiveActionRender?: boolean;
   isProduction: boolean;
   isRscRequest: boolean;
@@ -184,14 +239,16 @@ type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
     pathname: string,
     mountedSlotsHeader?: string | null,
     renderMode?: AppRscRenderMode,
+    interceptionContext?: string | null,
   ) => string;
   isrSet: AppPageCacheSetter;
   loadSsrHandler: () => Promise<AppPageSsrHandler>;
   middlewareContext: AppPageMiddlewareContext;
   mountedSlotsHeader?: string | null;
   params: AppPageParams;
+  staticParamsValidationParams?: AppPageParams;
   rootParams?: RootParams;
-  probeLayoutAt: (layoutIndex: number) => unknown;
+  probeLayoutAt: (layoutIndex: number, layoutParamAccess?: AppLayoutParamAccessTracker) => unknown;
   probePage: () => unknown;
   expireSeconds?: number;
   renderErrorBoundaryPage: (error: unknown) => Promise<Response | null>;
@@ -199,6 +256,7 @@ type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
     statusCode: number,
     opts: {
       boundaryComponent?: unknown;
+      boundaryModule?: AppPageModule | null;
       layouts?: readonly AppPageModule[];
       matchedParams: AppPageParams;
     },
@@ -227,6 +285,87 @@ type DispatchAppPageOptions<TRoute extends AppPageDispatchRoute> = {
   renderMode?: AppRscRenderMode;
 };
 
+/**
+ * Request-time counterpart to the build-time `classifyLayoutSegmentConfig`
+ * (`build/report.ts`). Both classify a layout by its `dynamic`/`revalidate`
+ * segment config and agree on the shared cases (the build-time version
+ * normalizes `revalidate = false` to `Infinity` upstream, so both treat it as
+ * static); keep them aligned when either changes.
+ *
+ * The meaningful difference is scope, not logic: this request-time pass reads
+ * the resolved module value, so it classifies layouts that were never captured
+ * at build time (e.g. dev mode). Its result is merged on top of the build-time
+ * classification map in `createEffectiveLayoutClassifications`, so such layouts
+ * are classified here where they previously were not.
+ */
+function classifyLayoutSegmentConfigFromModule(
+  layout: AppPageModule | null | undefined,
+): LayoutSegmentConfigClassification | null {
+  if (!layout) return null;
+
+  switch (layout.dynamic) {
+    case "force-dynamic":
+      return {
+        kind: "dynamic",
+        reason: { layer: "segment-config", key: "dynamic", value: "force-dynamic" },
+      };
+    case "force-static":
+    case "error":
+      return {
+        kind: "static",
+        reason: { layer: "segment-config", key: "dynamic", value: layout.dynamic },
+      };
+  }
+
+  if (layout.revalidate === false || layout.revalidate === Infinity) {
+    return {
+      kind: "static",
+      reason: { layer: "segment-config", key: "revalidate", value: Infinity },
+    };
+  }
+  if (layout.revalidate === 0) {
+    return {
+      kind: "dynamic",
+      reason: { layer: "segment-config", key: "revalidate", value: 0 },
+    };
+  }
+
+  return null;
+}
+
+function createEffectiveLayoutClassifications(
+  route: AppPageDispatchRoute,
+  includeReasons: boolean,
+): EffectiveLayoutClassifications {
+  const classifications = new Map(route.__buildTimeClassifications ?? []);
+  const reasons = includeReasons ? new Map(route.__buildTimeReasons ?? []) : null;
+
+  for (let index = 0; index < route.layouts.length; index++) {
+    const classification = classifyLayoutSegmentConfigFromModule(route.layouts[index]);
+    if (classification === null) continue;
+
+    // Precedence: when a layout's module segment config classifies, it is
+    // authoritative and overrides the build-time map for that layout — even if
+    // a Layer 1/2 build-time classifier marked it differently for a
+    // non-segment-config reason. Downstream consumers should treat this merged
+    // result, not `__buildTimeClassifications`, as the source of truth.
+    classifications.set(index, classification.kind);
+    reasons?.set(index, classification.reason);
+  }
+
+  return {
+    buildTimeClassifications: classifications.size > 0 ? classifications : null,
+    buildTimeReasons: reasons && reasons.size > 0 ? reasons : null,
+  };
+}
+
+function getEffectiveLayoutClassifications(
+  route: AppPageDispatchRoute,
+  debugClassification: DispatchAppPageOptions<AppPageDispatchRoute>["debugClassification"],
+): EffectiveLayoutClassifications {
+  return createEffectiveLayoutClassifications(route, debugClassification !== undefined);
+}
+
 function shouldReadAppPageCache(options: {
   isProgressiveActionRender: boolean;
   isDraftMode: boolean;
@@ -244,6 +383,10 @@ function shouldReadAppPageCache(options: {
     (options.isRscRequest || !options.scriptNonce) &&
     (options.revalidateSeconds === null || options.revalidateSeconds > 0)
   );
+}
+
+function hasSearchParams(searchParams: URLSearchParams | null | undefined): boolean {
+  return searchParams !== null && searchParams !== undefined && searchParams.size > 0;
 }
 
 function buildAppPageTags(
@@ -264,6 +407,7 @@ async function runAppPageRevalidationContext<
   options: {
     cleanPathname: string;
     currentFetchCacheMode?: FetchCacheMode | null;
+    draftModeSecret: string;
     dynamicConfig?: string;
     params: AppPageParams;
     routePattern: string;
@@ -273,6 +417,7 @@ async function runAppPageRevalidationContext<
   renderFn: () => Promise<TResult>,
 ): Promise<TResult> {
   const headersContext = createStaticGenerationHeadersContext({
+    draftModeSecret: options.draftModeSecret,
     dynamicConfig: options.dynamicConfig,
     routeKind: "page",
     routePattern: options.routePattern,
@@ -338,7 +483,8 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   const isForceStatic = dynamicConfig === "force-static";
   const isDynamicError = dynamicConfig === "error";
   const isForceDynamic = dynamicConfig === "force-dynamic";
-  const isDraftMode = isDraftModeRequest(options.request);
+  const isDraftMode = isDraftModeRequest(options.request, options.draftModeSecret);
+  const layoutParamAccess = createAppLayoutParamAccessTracker();
 
   setCurrentFetchSoftTags(buildAppPageTags(options.cleanPathname, [], route.routeSegments));
   setCurrentFetchCacheMode(options.fetchCache ?? null);
@@ -364,6 +510,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   if ((isForceStatic || isDynamicError) && !isDraftMode) {
     setHeadersContext(
       createStaticGenerationHeadersContext({
+        draftModeSecret: options.draftModeSecret,
         dynamicConfig,
         routeKind: "page",
         routePattern: route.pattern,
@@ -390,12 +537,15 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     const cachedPageResponse = await readAppPageCacheResponse({
       cleanPathname: options.cleanPathname,
       clearRequestContext: options.clearRequestContext,
+      hasRequestSearchParams: !isForceStatic && hasSearchParams(options.searchParams),
+      isEdgeRuntime: options.isEdgeRuntime,
       isRscRequest: options.isRscRequest,
       isrDebug: options.isrDebug,
       isrGet: options.isrGet,
       isrHtmlKey: options.isrHtmlKey,
       isrRscKey: options.isrRscKey,
       isrSet: options.isrSet,
+      interceptionContext: options.interceptionContext,
       middlewareHeaders: options.middlewareContext.headers,
       middlewareStatus: options.middlewareContext.status,
       mountedSlotsHeader: options.mountedSlotsHeader,
@@ -404,27 +554,50 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
       // cacheLife-only routes discover their actual revalidate during the
       // fresh render; this seed only gets them into the cache read path.
       revalidateSeconds: currentRevalidateSeconds ?? 0,
-      renderFreshPageForCache: async () =>
-        runAppPageRevalidationContext(
+      renderFreshPageForCache: async () => {
+        const revalidationTarget = await resolveAppPageInterceptionRerenderTarget({
+          cleanPathname: options.cleanPathname,
+          currentParams: options.params,
+          currentRoute: route,
+          findIntercept: options.findIntercept,
+          getRouteParamNames(sourceRoute) {
+            return sourceRoute.params;
+          },
+          getSourceRoute(sourceRouteIndex) {
+            return options.getSourceRoute(sourceRouteIndex);
+          },
+          isRscRequest: options.isRscRequest,
+          toInterceptOpts(intercept) {
+            return toInterceptOptions(options.interceptionContext, intercept);
+          },
+        });
+
+        // Hydrate the (possibly different) source route before reading its
+        // page module for fetch-cache-mode resolution.
+        await options.ensureRouteLoaded?.(revalidationTarget.route);
+        return runAppPageRevalidationContext(
           {
             cleanPathname: options.cleanPathname,
-            currentFetchCacheMode: options.fetchCache ?? null,
+            currentFetchCacheMode:
+              options.resolveRouteFetchCacheMode?.(revalidationTarget.route) ??
+              (revalidationTarget.route === route ? (options.fetchCache ?? null) : null),
+            draftModeSecret: options.draftModeSecret,
             dynamicConfig,
-            params: options.params,
-            routePattern: route.pattern,
-            routeSegments: route.routeSegments,
+            params: revalidationTarget.navigationParams,
+            routePattern: revalidationTarget.route.pattern,
+            routeSegments: revalidationTarget.route.routeSegments,
             setNavigationContext: options.setNavigationContext,
           },
           async () => {
             const revalidatedElement = await options.buildPageElement(
-              route,
-              options.params,
-              undefined,
+              revalidationTarget.route,
+              revalidationTarget.params,
+              revalidationTarget.interceptOpts,
               new URLSearchParams(),
             );
             const revalidatedOnError = options.createRscOnErrorHandler(
               options.cleanPathname,
-              route.pattern,
+              revalidationTarget.route.pattern,
             );
             // No inner runWithFetchDedupe here: this renderFn is already
             // wrapped in runWithFetchDedupe by runAppPageRevalidationContext.
@@ -436,7 +609,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
             const revalidatedCapturedRscRef: { value: Promise<ArrayBuffer> | null } = {
               value: null,
             };
-            const revalidatedHtmlStream = await revalidatedSsrEntry.handleSsr(
+            const revalidatedHtmlResult = await revalidatedSsrEntry.handleSsr(
               revalidatedRscCapture.ssrStream,
               options.getNavigationContext(),
               {
@@ -446,7 +619,9 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
               },
               {
                 basePath: options.basePath,
+                clientTraceMetadata: options.clientTraceMetadata,
                 rootParams: options.rootParams,
+                waitForAllReady: true,
                 ...(revalidatedRscCapture.sideStream
                   ? {
                       sideStream: revalidatedRscCapture.sideStream,
@@ -455,6 +630,9 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
                   : {}),
               },
             );
+            const revalidatedHtmlStream = isAppSsrRenderResult(revalidatedHtmlResult)
+              ? revalidatedHtmlResult.htmlStream
+              : revalidatedHtmlResult;
             const html = await readStreamAsText(revalidatedHtmlStream);
             const rscData = await getCapturedRscDataPromise(revalidatedCapturedRscRef.value);
             const cacheLife = _consumeRequestScopedCacheLife();
@@ -462,7 +640,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
             const tags = buildAppPageTags(
               options.cleanPathname,
               getCollectedFetchTags(),
-              route.routeSegments,
+              revalidationTarget.route.routeSegments,
             );
             // Consume once: HTML and RSC artifacts are produced by the same
             // regeneration render and should carry the same observation set.
@@ -482,9 +660,9 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
                   element: revalidatedElement,
                   renderEpoch: null,
                   rootBoundaryId: null,
-                  routePattern: route.pattern,
+                  routePattern: revalidationTarget.route.pattern,
                 }),
-                params: options.params,
+                params: revalidationTarget.navigationParams,
                 state: observationState,
               }),
               rscData,
@@ -499,9 +677,9 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
                   mountedSlotsHeader: options.mountedSlotsHeader,
                   renderEpoch: null,
                   rootBoundaryId: null,
-                  routePattern: route.pattern,
+                  routePattern: revalidationTarget.route.pattern,
                 }),
-                params: options.params,
+                params: revalidationTarget.navigationParams,
                 state: observationState,
               }),
               tags,
@@ -511,7 +689,8 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
                   : undefined,
             };
           },
-        ),
+        );
+      },
       scheduleBackgroundRegeneration(key, renderFn) {
         options.scheduleBackgroundRegeneration(key, renderFn, {
           routerKind: "App Router",
@@ -530,7 +709,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     enforceStaticParamsOnly: options.dynamicParamsConfig === false,
     generateStaticParams: options.generateStaticParams,
     isDynamicRoute: route.isDynamic,
-    params: options.params,
+    params: options.staticParamsValidationParams ?? options.params,
   });
   if (dynamicParamsResponse) {
     return dynamicParamsResponse;
@@ -542,13 +721,22 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     AppPageDispatchInterceptOptions,
     AppPageElement
   >({
-    buildPageElement(interceptRoute, interceptParams, interceptOpts, interceptSearchParams) {
+    async buildPageElement(
+      interceptRoute,
+      interceptParams,
+      interceptOpts,
+      interceptSearchParams,
+      interceptLayoutParamAccess,
+    ) {
+      // Hydrate the intercept source route before reading its page module.
+      await options.ensureRouteLoaded?.(interceptRoute);
       setCurrentFetchCacheMode(options.resolveRouteFetchCacheMode?.(interceptRoute) ?? null);
       return options.buildPageElement(
         interceptRoute,
         interceptParams,
         interceptOpts,
         interceptSearchParams,
+        interceptLayoutParamAccess,
       );
     },
     cleanPathname: options.cleanPathname,
@@ -563,6 +751,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
       return options.getSourceRoute(sourceRouteIndex);
     },
     isRscRequest: options.isRscRequest,
+    layoutParamAccess,
     renderInterceptResponse(sourceRoute, interceptElement) {
       const interceptOnError = options.createRscOnErrorHandler(
         options.cleanPathname,
@@ -604,6 +793,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
         options.params,
         interceptResult.interceptOpts,
         options.searchParams,
+        layoutParamAccess,
       );
     },
     renderErrorBoundaryPage(buildError) {
@@ -618,8 +808,14 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     return pageBuildResult.response;
   }
 
+  const layoutClassifications = getEffectiveLayoutClassifications(
+    route,
+    options.debugClassification,
+  );
+
   return renderAppPageLifecycle({
     basePath: options.basePath,
+    clientTraceMetadata: options.clientTraceMetadata,
     cleanPathname: options.cleanPathname,
     clearRequestContext: options.clearRequestContext,
     consumeDynamicUsage,
@@ -634,6 +830,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
       return options.createRscOnErrorHandler(pathname, routePath);
     },
     element: pageBuildResult.element,
+    clientReuseManifest: options.clientReuseManifest,
     getDraftModeCookieHeader,
     getFontLinks: options.getFontLinks,
     getFontPreloads: options.getFontPreloads,
@@ -660,6 +857,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     isDraftMode,
     isForceDynamic,
     isForceStatic,
+    isEdgeRuntime: options.isEdgeRuntime === true,
     isPrerender: process.env.VINEXT_PRERENDER === "1",
     isProduction: options.isProduction,
     isRscRequest: options.isRscRequest,
@@ -667,11 +865,13 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
     isrHtmlKey: options.isrHtmlKey,
     isrRscKey: options.isrRscKey,
     isrSet: options.isrSet,
+    interceptionContext: options.interceptionContext,
     expireSeconds: options.expireSeconds,
     layoutCount: route.layouts.length,
     loadSsrHandler: options.loadSsrHandler,
     middlewareContext: options.middlewareContext,
     params: options.params,
+    layoutParamAccess,
     rootParams: options.rootParams,
     peekRenderObservationState() {
       return {
@@ -680,7 +880,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
       };
     },
     probeLayoutAt(layoutIndex) {
-      return options.probeLayoutAt(layoutIndex);
+      return options.probeLayoutAt(layoutIndex, layoutParamAccess);
     },
     probePage() {
       return options.probePage();
@@ -692,9 +892,14 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
           createAppPageTreePath([...route.routeSegments], treePosition),
         );
       },
-      buildTimeClassifications: route.__buildTimeClassifications,
-      buildTimeReasons: route.__buildTimeReasons,
+      buildTimeClassifications: layoutClassifications.buildTimeClassifications,
+      buildTimeReasons: layoutClassifications.buildTimeReasons,
       debugClassification: options.debugClassification,
+      isLayoutObservationDynamic(layoutId) {
+        return isAppLayoutObservationUnsafeForStaticReuse(
+          layoutParamAccess.getLayoutObservation(layoutId),
+        );
+      },
       async runWithIsolatedDynamicScope(fn) {
         const priorDynamic = consumeDynamicUsage();
         try {
@@ -707,6 +912,7 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
         }
       },
     },
+    dynamicStaleTimeSeconds: options.dynamicStaleTimeSeconds,
     revalidateSeconds: currentRevalidateSeconds,
     mountedSlotsHeader: options.mountedSlotsHeader,
     renderMode: options.renderMode ?? APP_RSC_RENDER_MODE_NAVIGATION,
@@ -734,6 +940,35 @@ async function dispatchAppPageInner<TRoute extends AppPageDispatchRoute>(
   });
 }
 
+/**
+ * Builds an RSC flight payload that encodes a redirect as a React error chunk.
+ * We render a tiny element that immediately throws an `Error` whose `digest`
+ * is the canonical `NEXT_REDIRECT;...` string. `renderToReadableStream`'s
+ * `onError` returns that digest, react-server-dom-webpack serializes the
+ * error into the stream, and the client's `RedirectErrorBoundary` decodes it
+ * via `getURLFromRedirectError` / `getRedirectTypeFromError`.
+ *
+ * The thrown error's digest matches Next.js's well-known router error format,
+ * so neither vinext's RSC error handler nor Next.js's reporter logs it as a
+ * "real" server error. Mirrors `app-render.tsx generateDynamicFlightRenderResult`
+ * where a redirect thrown during RSC rendering propagates through
+ * `renderToFlightStream`'s `onError` callback into the flight payload.
+ */
+function buildRscRedirectFlightStream<TRoute extends AppPageDispatchRoute>(
+  options: DispatchAppPageOptions<TRoute>,
+  digest: string,
+): ReadableStream<Uint8Array> {
+  const throwingElement = React.createElement(function NextRedirectFlightThrower() {
+    const err = new Error("NEXT_REDIRECT") as Error & { digest: string };
+    err.digest = digest;
+    throw err;
+  });
+
+  return options.renderToReadableStream(throwingElement, {
+    onError: () => digest,
+  });
+}
+
 async function renderLayoutSpecialError<TRoute extends AppPageDispatchRoute>(
   options: DispatchAppPageOptions<TRoute>,
   specialError: AppPageSpecialError,
@@ -741,12 +976,19 @@ async function renderLayoutSpecialError<TRoute extends AppPageDispatchRoute>(
 ): Promise<Response> {
   return buildAppPageSpecialErrorResponse({
     basePath: options.basePath,
+    buildRscRedirectFlightStream: (rscOptions) =>
+      buildRscRedirectFlightStream(options, rscOptions.digest),
     clearRequestContext: options.clearRequestContext,
     getAndClearPendingCookies,
+    serveStreamingMetadata: shouldServeStreamingMetadata(
+      options.request.headers.get("user-agent") ?? "",
+      options.htmlLimitedBots,
+    ),
+    isEdgeRuntime: options.isEdgeRuntime,
     isRscRequest: options.isRscRequest,
     middlewareContext: options.middlewareContext,
     renderFallbackPage(statusCode) {
-      const parentBoundary = resolveAppPageParentHttpAccessBoundaryModule({
+      const parentBoundaryModule = resolveAppPageParentHttpAccessBoundaryModule({
         layoutIndex,
         rootForbiddenModule: options.rootForbiddenModule,
         rootNotFoundModule: options.rootNotFoundModule,
@@ -755,16 +997,16 @@ async function renderLayoutSpecialError<TRoute extends AppPageDispatchRoute>(
         routeNotFoundModules: options.route.notFounds,
         routeUnauthorizedModules: options.route.unauthorizeds,
         statusCode,
-      })?.default;
-      return options.renderHttpAccessFallbackPage(
-        statusCode,
-        {
-          boundaryComponent: parentBoundary,
-          layouts: options.route.layouts.slice(0, layoutIndex),
-          matchedParams: options.params,
-        },
-        null,
-      );
+      });
+      const fallbackOptions: Parameters<typeof options.renderHttpAccessFallbackPage>[1] = {
+        layouts: options.route.layouts.slice(0, layoutIndex),
+        matchedParams: options.params,
+      };
+      if (parentBoundaryModule) {
+        fallbackOptions.boundaryComponent = parentBoundaryModule.default;
+        fallbackOptions.boundaryModule = parentBoundaryModule;
+      }
+      return options.renderHttpAccessFallbackPage(statusCode, fallbackOptions, null);
     },
     request: options.request,
     specialError,
@@ -777,16 +1019,61 @@ async function renderPageSpecialError<TRoute extends AppPageDispatchRoute>(
 ): Promise<Response> {
   return buildAppPageSpecialErrorResponse({
     basePath: options.basePath,
+    buildRscRedirectFlightStream: (rscOptions) =>
+      buildRscRedirectFlightStream(options, rscOptions.digest),
     clearRequestContext: options.clearRequestContext,
     getAndClearPendingCookies,
+    serveStreamingMetadata: shouldServeStreamingMetadata(
+      options.request.headers.get("user-agent") ?? "",
+      options.htmlLimitedBots,
+    ),
+    isEdgeRuntime: options.isEdgeRuntime,
     isRscRequest: options.isRscRequest,
     middlewareContext: options.middlewareContext,
     renderFallbackPage(statusCode) {
-      return options.renderHttpAccessFallbackPage(
-        statusCode,
-        { matchedParams: options.params },
-        null,
-      );
+      // `forbidden()` / `unauthorized()` / `notFound()` should be caught by the
+      // nearest ancestor boundary. When the page (the deepest segment) calls
+      // one of these and an intermediate layout has no matching boundary file,
+      // resolve to the closest ancestor layout's boundary and slice off any
+      // layouts beneath it so their UI does not render alongside the fallback.
+      // Mirrors Next.js's per-segment boundary nesting in
+      // `create-component-tree.tsx` (issue #1547).
+      //
+      // We only narrow layouts when the resolved boundary file lives at a
+      // layout's own directory. A `forbidden.tsx` sibling to the route's
+      // `page.tsx` (no layout there) wraps just the page subtree in Next.js,
+      // so all of the route's layouts must still render.
+      const routeBoundaryModule = resolveAppPageRouteBoundaryModule(options.route, statusCode);
+      const layoutCount = options.route.layouts.length;
+      const { module: parentBoundaryModule, layoutIndex: boundaryLayoutIndex } =
+        resolveAppPageParentHttpAccessBoundary({
+          layoutIndex: layoutCount,
+          rootForbiddenModule: options.rootForbiddenModule,
+          rootNotFoundModule: options.rootNotFoundModule,
+          rootUnauthorizedModule: options.rootUnauthorizedModule,
+          routeForbiddenModules: options.route.forbiddens,
+          routeNotFoundModules: options.route.notFounds,
+          routeUnauthorizedModules: options.route.unauthorizeds,
+          statusCode,
+        });
+      // If the route-level boundary (closest walking up from page-dir) differs
+      // from the per-layout resolution, a non-layout-aligned boundary sits
+      // below the deepest layout — keep all layouts and let the existing route
+      // boundary handling render it.
+      const useLayoutAlignedBoundary =
+        boundaryLayoutIndex !== null &&
+        (routeBoundaryModule === null || routeBoundaryModule === parentBoundaryModule);
+      const fallbackOptions: Parameters<typeof options.renderHttpAccessFallbackPage>[1] = {
+        matchedParams: options.params,
+      };
+      if (useLayoutAlignedBoundary && boundaryLayoutIndex !== null) {
+        fallbackOptions.layouts = options.route.layouts.slice(0, boundaryLayoutIndex + 1);
+        if (parentBoundaryModule) {
+          fallbackOptions.boundaryComponent = parentBoundaryModule.default;
+          fallbackOptions.boundaryModule = parentBoundaryModule;
+        }
+      }
+      return options.renderHttpAccessFallbackPage(statusCode, fallbackOptions, null);
     },
     request: options.request,
     specialError,

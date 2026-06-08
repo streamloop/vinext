@@ -7,6 +7,10 @@ export function middleware(request: NextRequest) {
   // Add a custom header to all matched requests
   const response = NextResponse.next();
   response.headers.set("x-custom-middleware", "active");
+  // Expose the pathname middleware actually observed. Used by tests verifying
+  // `/_next/data/<buildId>/<page>.json` is normalized to `/page` BEFORE
+  // middleware runs (matching Next.js' `handleNextDataRequest` pipeline).
+  response.headers.set("x-mw-pathname", url.pathname);
 
   // Redirect /old-page to /about
   if (url.pathname === "/old-page") {
@@ -26,6 +30,52 @@ export function middleware(request: NextRequest) {
     return NextResponse.rewrite(new URL("/ssr", request.url));
   }
 
+  // Rewrite /mw-rewrite-query to /ssr-query — preserves the original
+  // request's query params on the rewrite target so getServerSideProps
+  // sees them. Middleware preserves query by mutating `request.nextUrl`
+  // (which carries the original search) rather than constructing a new
+  // path-only URL. Mirrors Next.js: test/e2e/middleware-rewrites/app/middleware.js.
+  if (url.pathname === "/mw-rewrite-query") {
+    const target = request.nextUrl.clone();
+    target.pathname = "/ssr-query";
+    return NextResponse.rewrite(target);
+  }
+
+  // Rewrite /mw-rewrite-dynamic-query to /posts/first — the rewrite
+  // target is dynamic, so the resulting query should contain both the
+  // dynamic param (id=first) and the original query (?hello=world).
+  if (url.pathname === "/mw-rewrite-dynamic-query") {
+    const target = request.nextUrl.clone();
+    target.pathname = "/posts/first";
+    return NextResponse.rewrite(target);
+  }
+
+  // Rewrite target carries its own query — middleware overlays its key onto
+  // the existing nextUrl search before rewriting. The resulting query is the
+  // exact final URL (not an auto-merge): keys explicitly set by middleware
+  // override, untouched keys carry over because the middleware mutated the
+  // same NextURL instance that already has them.
+  if (url.pathname === "/mw-rewrite-merge-query") {
+    const target = request.nextUrl.clone();
+    target.pathname = "/ssr-query";
+    target.searchParams.set("hello", "from-rewrite");
+    return NextResponse.rewrite(target);
+  }
+
+  // Issue #1342 / Next.js parity (test/e2e/middleware-rewrites
+  //   "should clear query parameters"):
+  // when middleware modifies `request.nextUrl.searchParams` (delete keys) and
+  // rewrites to it, the resulting query must match the modified destination
+  // exactly — vinext must NOT silently re-merge the original request's query.
+  if (url.pathname === "/mw-clear-query-params") {
+    const allowedKeys = new Set(["allowed"]);
+    for (const key of [...url.searchParams.keys()]) {
+      if (!allowedKeys.has(key)) url.searchParams.delete(key);
+    }
+    url.pathname = "/ssr-query";
+    return NextResponse.rewrite(url);
+  }
+
   if (url.pathname === "/rewrite-with-cookie") {
     const res = NextResponse.rewrite(new URL("/ssr", request.url));
     res.cookies.set("rewrite-cookie", "visible", { path: "/" });
@@ -43,6 +93,40 @@ export function middleware(request: NextRequest) {
       request.headers.get("x-middleware-test-rewrite-target") ??
       "https://api.example.com/from-middleware-status";
     return NextResponse.rewrite(target, { status: 403 });
+  }
+
+  // Ported from Next.js: test/e2e/middleware-rewrites/app/middleware.js
+  // ('/middleware-external-rewrite-body') — POST body must reach upstream.
+  if (url.pathname === "/external-middleware-rewrite-body") {
+    const target =
+      request.headers.get("x-middleware-test-rewrite-target") ??
+      "https://api.example.com/echo-body";
+    return NextResponse.rewrite(target);
+  }
+
+  // Ported from Next.js: test/e2e/middleware-rewrites/app/middleware.js
+  // ('/middleware-external-rewrite-body-headers-return-headers') — request
+  // header overrides from `NextResponse.rewrite(url, { request: { headers } })`
+  // must propagate to the proxied upstream request.
+  if (url.pathname === "/external-middleware-rewrite-with-headers") {
+    const target =
+      request.headers.get("x-middleware-test-rewrite-target") ??
+      "https://api.example.com/echo-headers";
+    const tmpHeaders = new Headers(request.headers);
+    tmpHeaders.set("x-hello-from-middleware1", "hello");
+    return NextResponse.rewrite(target, {
+      request: { headers: tmpHeaders },
+    });
+  }
+
+  // Ported from Next.js: test/e2e/middleware-rewrites/test/index.test.ts
+  // ('should rewrite to the external url for incoming data request
+  //  externally rewritten') — `_next/data/<page>.json` requests rewritten
+  // to an external host must proxy through and surface the upstream body.
+  if (url.pathname === "/data-external-rewrite") {
+    const target =
+      request.headers.get("x-middleware-test-rewrite-target") ?? "https://api.example.com/data";
+    return NextResponse.rewrite(target);
   }
 
   if (url.pathname === "/middleware-bad-content-length") {

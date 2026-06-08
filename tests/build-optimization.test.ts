@@ -9,6 +9,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, it, expect, beforeEach, afterEach } from "vite-plus/test";
+import { createBuilder, parseAst } from "vite";
 import { augmentSsrManifestFromBundle as _augmentSsrManifestFromBundle } from "../packages/vinext/src/build/ssr-manifest.js";
 import { stripServerExports as _stripServerExports } from "../packages/vinext/src/plugins/strip-server-exports.js";
 import {
@@ -784,7 +785,13 @@ describe("treeshake config integration", () => {
     const mainPlugin = plugins.find(
       (p: any) => p.name === "vinext:config" && typeof p.config === "function",
     );
+    const clientAssetsDefaultsPlugin = plugins.find(
+      (p: any) =>
+        p.name === "vinext:client-css-url-assets-defaults" &&
+        typeof p.configEnvironment === "function",
+    );
     expect(mainPlugin).toBeDefined();
+    expect(clientAssetsDefaultsPlugin).toBeDefined();
 
     const os = await import("node:os");
     const fsp = await import("node:fs/promises");
@@ -818,19 +825,85 @@ describe("treeshake config integration", () => {
 
       // Global bundler options should NOT have treeshake (would leak into RSC/SSR)
       expect(getBuildBundlerOptions(result).treeshake).toBeUndefined();
+      expect(result.build.assetsInlineLimit).toBeUndefined();
 
       // Client environment should have treeshake
       expect(getEnvBuildBundlerOptions(result.environments.client).treeshake).toEqual({
         moduleSideEffects: "no-external",
       });
+      expect(result.environments.client.build.assetsInlineLimit).toBe(0);
 
       // RSC and SSR environments should NOT have treeshake
       expect(getEnvBuildBundlerOptions(result.environments.rsc)?.treeshake).toBeUndefined();
       expect(getEnvBuildBundlerOptions(result.environments.ssr)?.treeshake).toBeUndefined();
+      expect(result.environments.rsc.build.assetsInlineLimit).toBeUndefined();
+      expect(result.environments.ssr.build.assetsInlineLimit).toBeUndefined();
+
+      expect(
+        (clientAssetsDefaultsPlugin as any).configEnvironment("client", {}, { command: "build" }),
+      ).toEqual({
+        build: { assetsInlineLimit: 0 },
+      });
+      expect(
+        (clientAssetsDefaultsPlugin as any).configEnvironment("ssr", {}, { command: "build" }),
+      ).toBeNull();
     } finally {
       await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }
   }, 15000);
+
+  it("resolves CSS URL asset inline defaults through Vite's builder lifecycle", async () => {
+    const vinext = (await import("../packages/vinext/src/index.js")).default;
+    const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-css-assets-env-"));
+    const rootNodeModules = path.resolve(import.meta.dirname, "../node_modules");
+    await fsp.symlink(rootNodeModules, path.join(tmpDir, "node_modules"), "junction");
+
+    await fsp.mkdir(path.join(tmpDir, "app"), { recursive: true });
+    await fsp.writeFile(
+      path.join(tmpDir, "app", "layout.tsx"),
+      `export default function RootLayout({ children }: { children: React.ReactNode }) { return <html><body>{children}</body></html>; }`,
+    );
+    await fsp.writeFile(
+      path.join(tmpDir, "app", "page.tsx"),
+      `export default function Home() { return <h1>Home</h1>; }`,
+    );
+
+    try {
+      const defaultBuilder = await createBuilder({
+        root: tmpDir,
+        configFile: false,
+        plugins: [vinext({ appDir: tmpDir })],
+        logLevel: "silent",
+      });
+
+      expect(defaultBuilder.environments.client.config.build.assetsInlineLimit).toBe(0);
+      expect(defaultBuilder.environments.rsc.config.build.assetsInlineLimit).not.toBe(0);
+      expect(defaultBuilder.environments.ssr.config.build.assetsInlineLimit).not.toBe(0);
+
+      const userAssetsInlineLimit = 1234;
+      const userBuilder = await createBuilder({
+        root: tmpDir,
+        configFile: false,
+        plugins: [vinext({ appDir: tmpDir })],
+        logLevel: "silent",
+        build: {
+          assetsInlineLimit: userAssetsInlineLimit,
+        },
+      });
+
+      expect(userBuilder.environments.client.config.build.assetsInlineLimit).toBe(
+        userAssetsInlineLimit,
+      );
+      expect(userBuilder.environments.rsc.config.build.assetsInlineLimit).toBe(
+        userAssetsInlineLimit,
+      );
+      expect(userBuilder.environments.ssr.config.build.assetsInlineLimit).toBe(
+        userAssetsInlineLimit,
+      );
+    } finally {
+      await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }, 30_000);
 
   it("client output config includes minimum chunk sizing", async () => {
     const vinext = (await import("../packages/vinext/src/index.js")).default;
@@ -1314,6 +1387,41 @@ describe("augmentSsrManifestFromBundle", () => {
     const augmented = _augmentSsrManifestFromBundle(ssrManifest, bundle, "/app");
 
     expect(augmented["pages/about.tsx"]).toEqual(["assets/about.js", "assets/about.css"]);
+  });
+
+  it("collapses a basePath that Vite duplicated in the SSR manifest", () => {
+    // basePath baked into fileNames + reapplied by Vite yields a doubled URL
+    // that 404s; both sources must dedupe to one single-base path here.
+    const bundle = {
+      "docs/_next/static/_slug_.js": {
+        type: "chunk" as const,
+        fileName: "docs/_next/static/_slug_.js",
+        imports: [],
+        modules: {
+          "/proj/pages/[slug].tsx": {},
+        },
+      },
+    };
+
+    const ssrManifest = {
+      "pages/[slug].tsx": ["docs/docs/_next/static/_slug_.js"],
+    };
+
+    const augmented = _augmentSsrManifestFromBundle(ssrManifest, bundle, "/proj", "/docs/");
+
+    expect(augmented["pages/[slug].tsx"]).toEqual(["docs/_next/static/_slug_.js"]);
+  });
+
+  it("leaves a single basePath prefix untouched (no over-collapse)", () => {
+    // Guards the collapse logic against rewriting a correctly single-prefixed
+    // entry (e.g. when the bundler does not bake base into fileNames).
+    const ssrManifest = {
+      "pages/index.tsx": ["docs/_next/static/index.js"],
+    };
+
+    const augmented = _augmentSsrManifestFromBundle(ssrManifest, {}, "/proj", "/docs/");
+
+    expect(augmented["pages/index.tsx"]).toEqual(["docs/_next/static/index.js"]);
   });
 
   it("normalizes existing absolute manifest keys before merging bundle metadata", () => {
@@ -1884,6 +1992,11 @@ export const getServerSideProps = async function fetchData() {
 
   it("handles export { name } re-export syntax", () => {
     // This pattern was completely unhandled by the old regex approach.
+    //
+    // Regression test for #1354: emitting `export const getServerSideProps =
+    // undefined;` here collides with the existing local `const
+    // getServerSideProps` binding and triggers a parse error under
+    // OXC/Rolldown. We must drop the specifier without adding a stub.
     const code = `
 const getServerSideProps = async () => {
   return { props: { data: 'secret' } };
@@ -1897,9 +2010,16 @@ export { getServerSideProps };
 `;
     const result = _stripServerExports(code);
     expect(result).not.toBeNull();
-    expect(result).toContain("export const getServerSideProps = undefined;");
-    // The original local declaration remains (dead code, tree-shaken later)
+    // The `export { getServerSideProps }` statement must be removed entirely
+    // — no stub declaration is added.
     expect(result).not.toContain("export { getServerSideProps }");
+    expect(result).not.toContain("export const getServerSideProps");
+    // The unused local declaration becomes dead code and is tree-shaken
+    // later. It must not be duplicated by the transform.
+    const constMatches = result!.match(/const getServerSideProps\b/g) ?? [];
+    expect(constMatches).toHaveLength(1);
+    // The transformed code must be valid JS (no redeclaration).
+    expect(() => parseAst(result!)).not.toThrow();
   });
 
   it("handles export { name } with other specifiers", () => {
@@ -1917,9 +2037,84 @@ export { getServerSideProps, config };
 `;
     const result = _stripServerExports(code);
     expect(result).not.toBeNull();
-    // config should be preserved
+    // config should be preserved, getServerSideProps specifier dropped.
     expect(result).toContain("export { config }");
-    expect(result).toContain("export const getServerSideProps = undefined;");
+    expect(result).not.toContain("export { getServerSideProps");
+    expect(result).not.toContain("export const getServerSideProps");
+    expect(() => parseAst(result!)).not.toThrow();
+  });
+
+  // Regression test for #1354: every supported declaration form must
+  // produce parseable output when combined with `export { name }`.
+  it("does not redeclare identifiers for function-declaration + named export", () => {
+    const code = `
+async function getServerSideProps() {
+  return { props: {} };
+}
+
+export default function Page() {
+  return null;
+}
+
+export { getServerSideProps };
+`;
+    const result = _stripServerExports(code);
+    expect(result).not.toBeNull();
+    expect(result).not.toContain("export const getServerSideProps");
+    expect(() => parseAst(result!)).not.toThrow();
+  });
+
+  it("does not redeclare identifiers when both getServerSideProps and getStaticProps use named export", () => {
+    const code = `
+const getServerSideProps = async () => ({ props: {} });
+const getStaticProps = async () => ({ props: {} });
+
+export default function Page() {
+  return null;
+}
+
+export { getServerSideProps, getStaticProps };
+`;
+    const result = _stripServerExports(code);
+    expect(result).not.toBeNull();
+    expect(result).not.toContain("export const getServerSideProps");
+    expect(result).not.toContain("export const getStaticProps");
+    expect(result).not.toContain("export {");
+    expect(() => parseAst(result!)).not.toThrow();
+  });
+
+  it("does not redeclare identifiers when local `let` binding is re-exported", () => {
+    const code = `
+let getStaticPaths = async () => ({ paths: [], fallback: false });
+
+export default function Page() {
+  return null;
+}
+
+export { getStaticPaths };
+`;
+    const result = _stripServerExports(code);
+    expect(result).not.toBeNull();
+    expect(result).not.toContain("export const getStaticPaths");
+    // Must not introduce a `const getStaticPaths` next to the `let`.
+    expect(result).not.toMatch(/const\s+getStaticPaths/);
+    expect(() => parseAst(result!)).not.toThrow();
+  });
+
+  it("handles aliased named export (export { local as getServerSideProps })", () => {
+    const code = `
+const fetchData = async () => ({ props: {} });
+
+export default function Page() {
+  return null;
+}
+
+export { fetchData as getServerSideProps };
+`;
+    const result = _stripServerExports(code);
+    expect(result).not.toBeNull();
+    expect(result).not.toContain("getServerSideProps");
+    expect(() => parseAst(result!)).not.toThrow();
   });
 
   it("handles strings containing braces", () => {

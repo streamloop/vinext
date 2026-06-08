@@ -3,6 +3,7 @@ import { buildClientHookErrorMessage } from "vinext/shims/client-hook-error";
 import { ErrorBoundary } from "vinext/shims/error-boundary";
 import { LayoutSegmentProvider } from "vinext/shims/layout-segment-context";
 import { MetadataHead, ViewportHead } from "vinext/shims/metadata";
+import type { NavigationContext } from "vinext/shims/navigation";
 import type { AppPageFontPreload } from "./app-page-execution.js";
 import type { AppPageMiddlewareContext } from "./app-page-response.js";
 import type { MetadataFileRoute } from "./metadata-routes.js";
@@ -10,7 +11,7 @@ import { resolveAppPageHead } from "./app-page-head.js";
 import {
   renderAppPageBoundaryResponse,
   resolveAppPageErrorBoundary,
-  resolveAppPageHttpAccessBoundaryComponent,
+  resolveAppPageHttpAccessBoundaryModule,
   wrapAppPageBoundaryElement,
   type AppPageParams,
 } from "./app-page-boundary.js";
@@ -66,8 +67,9 @@ type AppPageBoundaryRenderCommonOptions<TModule extends AppPageModule = AppPageM
   getFontLinks: () => string[];
   getFontPreloads: () => AppPageFontPreload[];
   getFontStyles: () => string[];
-  getNavigationContext: () => unknown;
+  getNavigationContext: () => NavigationContext | null;
   globalErrorModule?: TModule | null;
+  isEdgeRuntime?: boolean;
   isRscRequest: boolean;
   loadSsrHandler: () => Promise<AppPageSsrHandler>;
   makeThenableParams: (params: AppPageParams) => unknown;
@@ -91,6 +93,7 @@ type AppPageBoundaryRenderCommonOptions<TModule extends AppPageModule = AppPageM
 
 type RenderAppPageHttpAccessFallbackOptions<TModule extends AppPageModule = AppPageModule> = {
   boundaryComponent?: AppPageComponent | null;
+  boundaryModule?: TModule | null;
   layoutModules?: readonly (TModule | null | undefined)[] | null;
   matchedParams: AppPageParams;
   rootForbiddenModule?: TModule | null;
@@ -240,13 +243,16 @@ function createAppPageBoundaryRscPayload<TModule extends AppPageModule>(
 async function renderAppPageBoundaryElementResponse<TModule extends AppPageModule>(
   options: AppPageBoundaryRenderCommonOptions<TModule> & {
     element: ReactNode;
+    initialDevServerError?: unknown;
     layoutModules: readonly (TModule | null | undefined)[];
+    navigationParams?: AppPageParams;
     route?: AppPageBoundaryRoute<TModule> | null;
     routePattern?: string;
     status: number;
   },
 ): Promise<Response> {
-  const pathname = new URL(options.requestUrl).pathname;
+  const requestUrl = new URL(options.requestUrl);
+  const pathname = requestUrl.pathname;
   const payload = createAppPageBoundaryRscPayload({
     element: options.element,
     layoutModules: options.layoutModules,
@@ -266,18 +272,25 @@ async function renderAppPageBoundaryElementResponse<TModule extends AppPageModul
         clearRequestContext: options.clearRequestContext,
         fontData,
         fontLinkHeader: options.buildFontLinkHeader(fontData.preloads),
+        isEdgeRuntime: options.isEdgeRuntime,
         middlewareHeaders: options.middlewareContext.headers,
-        navigationContext: options.getNavigationContext(),
+        navigationContext: options.getNavigationContext() ?? {
+          pathname,
+          searchParams: requestUrl.searchParams,
+          params: options.navigationParams ?? options.route?.params ?? {},
+        },
         rscStream,
         scriptNonce: options.scriptNonce,
         ssrHandler,
         status: responseStatus,
+        initialDevServerError: options.initialDevServerError,
       });
     },
     createRscOnErrorHandler() {
       return options.createRscOnErrorHandler(pathname, options.routePattern ?? pathname);
     },
     element: payload,
+    isEdgeRuntime: options.isEdgeRuntime,
     isRscRequest: options.isRscRequest,
     middlewareHeaders: options.middlewareContext.headers,
     renderToReadableStream: options.renderToReadableStream,
@@ -288,18 +301,22 @@ async function renderAppPageBoundaryElementResponse<TModule extends AppPageModul
 export async function renderAppPageHttpAccessFallback<TModule extends AppPageModule>(
   options: RenderAppPageHttpAccessFallbackOptions<TModule>,
 ): Promise<Response | null> {
-  const boundaryComponent =
-    options.boundaryComponent ??
-    resolveAppPageHttpAccessBoundaryComponent({
-      getDefaultExport,
-      rootForbiddenModule: options.rootForbiddenModule,
-      rootNotFoundModule: options.rootNotFoundModule,
-      rootUnauthorizedModule: options.rootUnauthorizedModule,
-      routeForbiddenModule: options.route?.forbidden,
-      routeNotFoundModule: options.route?.notFound,
-      routeUnauthorizedModule: options.route?.unauthorized,
-      statusCode: options.statusCode,
-    });
+  const resolvedBoundaryModule = resolveAppPageHttpAccessBoundaryModule({
+    rootForbiddenModule: options.rootForbiddenModule,
+    rootNotFoundModule: options.rootNotFoundModule,
+    rootUnauthorizedModule: options.rootUnauthorizedModule,
+    routeForbiddenModule: options.route?.forbidden,
+    routeNotFoundModule: options.route?.notFound,
+    routeUnauthorizedModule: options.route?.unauthorized,
+    statusCode: options.statusCode,
+  });
+  const boundaryModule = options.boundaryModule ?? resolvedBoundaryModule;
+  // `boundaryModule` already resolves both the explicit-module and resolved
+  // (status-derived) cases, so `getDefaultExport(boundaryModule)` is the single
+  // source of truth here. A previous `resolveAppPageHttpAccessBoundaryComponent`
+  // fallback was redundant — it re-ran the same `resolveAppPageHttpAccessBoundaryModule`
+  // resolution and produced the same component for the resolved-module path.
+  const boundaryComponent = options.boundaryComponent ?? getDefaultExport(boundaryModule);
   if (!boundaryComponent) {
     return null;
   }
@@ -315,6 +332,7 @@ export async function renderAppPageHttpAccessFallback<TModule extends AppPageMod
       layoutModules,
     ),
     metadataRoutes: options.metadataRoutes,
+    pageModule: boundaryModule,
     params: options.matchedParams,
     routePath: options.route?.pattern ?? pathname,
     routeSegments,
@@ -322,7 +340,7 @@ export async function renderAppPageHttpAccessFallback<TModule extends AppPageMod
 
   const headElements: ReactNode[] = [
     createElement("meta", { charSet: "utf-8", key: "charset" }),
-    createElement("meta", { content: "noindex", key: "robots", name: "robots" }),
+    createElement("meta", { key: "robots", name: "robots", content: "noindex" }),
   ];
   if (metadata) {
     headElements.push(createElement(MetadataHead, { key: "metadata", metadata, pathname }));
@@ -351,6 +369,7 @@ export async function renderAppPageHttpAccessFallback<TModule extends AppPageMod
     // would expect a root-layout tree path that doesn't exist in the markup.
     element,
     layoutModules: skipLayoutWrapping ? [] : layoutModules,
+    navigationParams: options.matchedParams,
     route: skipLayoutWrapping ? null : options.route,
     routePattern: options.route?.pattern,
     status: options.statusCode,
@@ -428,7 +447,9 @@ export async function renderAppPageErrorBoundary<TModule extends AppPageModule>(
   return renderAppPageBoundaryElementResponse({
     ...options,
     element,
+    initialDevServerError: rawError,
     layoutModules,
+    navigationParams: matchedParams,
     route: options.route,
     routePattern: options.route?.pattern,
     status: 200,

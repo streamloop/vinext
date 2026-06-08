@@ -1,9 +1,18 @@
 import { getAndClearActionRevalidationKind, type ActionRevalidationKind } from "vinext/shims/cache";
-import type { HeadersAccessPhase } from "vinext/shims/headers";
-import { type FetchCacheMode, setCurrentFetchCacheMode } from "vinext/shims/fetch-cache";
+import {
+  headersContextFromRequest,
+  setHeadersContext,
+  type HeadersAccessPhase,
+} from "vinext/shims/headers";
+import {
+  type FetchCacheMode,
+  setCurrentFetchCacheMode,
+  setCurrentFetchSoftTags,
+} from "vinext/shims/fetch-cache";
 import type { ReactFormState } from "react-dom/client";
 import { isExternalUrl } from "../config/config-matchers.js";
-import { addBasePathToPathname, hasBasePath } from "../utils/base-path.js";
+import { splitPathSegments } from "../routing/utils.js";
+import { addBasePathToPathname, hasBasePath, stripBasePath } from "../utils/base-path.js";
 import {
   ACTION_FORWARDED_HEADER,
   ACTION_REDIRECT_HEADER,
@@ -16,8 +25,12 @@ import {
   VINEXT_RSC_VARY_HEADER,
   applyRscCompatibilityIdHeader,
 } from "./app-rsc-cache-busting.js";
+import { applyEdgeRuntimeHeader } from "./app-page-response.js";
 import { resolveAppPageActionRerenderTarget } from "./app-page-request.js";
+import { deferUntilStreamConsumed } from "./app-page-stream.js";
+import { buildPageCacheTags } from "./implicit-tags.js";
 import { mergeMiddlewareResponseHeaders } from "./middleware-response-headers.js";
+import { getSetCookieName } from "./cookie-utils.js";
 import {
   APP_RSC_RENDER_MODE_ACTION_RERENDER_PRESERVE_UI,
   type AppRscRenderMode,
@@ -73,20 +86,46 @@ type AppServerActionRedirect = {
 };
 
 type AppServerActionRoute = {
+  page?: unknown;
   pattern: string;
+  routeHandler?: unknown;
+  routeSegments?: readonly string[];
 };
 
+/**
+ * Side-effect headers captured during a progressive (no-JS) server action's
+ * non-redirect execution. The caller (app-rsc-handler) must apply these to the
+ * page render response so that `cookies().set(...)` and revalidation kinds
+ * propagate to the browser. Without this, no-JS form submissions silently
+ * lose cookie/header mutations — see issue #1483.
+ *
+ * Next.js' equivalent path mutates `res.setHeader('set-cookie', ...)` during
+ * action execution (action-handler.ts → app-render.tsx), then `sendResponse`
+ * merges those headers with the rendered Response. vinext works with Response
+ * objects directly so the cookies must ride out via the result instead.
+ */
+type ProgressiveServerActionSideEffects = {
+  /** `Set-Cookie` headers from `cookies().set(...)` / `cookies().delete(...)`. */
+  pendingCookies: string[];
+  /** `Set-Cookie` header from `draftMode().enable()/disable()` (if any). */
+  draftCookie: string | null | undefined;
+  /** Resolved revalidation kind to emit via `x-action-revalidated`. */
+  revalidationKind: ActionRevalidationKind;
+};
+
+type AppServerActionRouteRuntime = "edge" | "experimental-edge" | "nodejs" | null;
+
 type ProgressiveServerActionResult =
-  | {
+  | ({
       formState: ReactFormState | null;
       kind: "form-state";
-    }
-  | {
+    } & ProgressiveServerActionSideEffects)
+  | ({
       actionError: unknown;
       actionFailed: true;
       formState: null;
       kind: "form-state";
-    };
+    } & ProgressiveServerActionSideEffects);
 
 type AppServerActionMatch<TRoute extends AppServerActionRoute> = {
   params: AppPageParams;
@@ -181,11 +220,18 @@ export type HandleServerActionRscRequestOptions<
     body: string | FormData,
     options: DecodeServerActionReplyOptions<TTemporaryReferences>,
   ) => Promise<unknown[]> | unknown[];
+  /**
+   * Hydrate a route's lazy page/route-handler modules before reading
+   * `route.page` / `route.routeHandler` on action redirect targets and
+   * re-render targets obtained via `matchRoute`/`getSourceRoute`. Idempotent.
+   */
+  ensureRouteLoaded?: (route: TRoute) => unknown;
   findIntercept: (pathname: string) => AppServerActionIntercept<TPage> | null;
   getAndClearPendingCookies: () => string[];
   getDraftModeCookieHeader: () => string | null | undefined;
   getRouteParamNames: (route: TRoute) => readonly string[];
   getSourceRoute: (sourceRouteIndex: number) => TRoute | undefined;
+  isEdgeRuntime?: boolean;
   isRscRequest: boolean;
   loadServerAction: (actionId: string) => Promise<unknown>;
   matchRoute: (pathname: string) => AppServerActionMatch<TRoute> | null;
@@ -201,6 +247,7 @@ export type HandleServerActionRscRequestOptions<
   ) => BodyInit | null | Promise<BodyInit | null>;
   reportRequestError: AppServerActionErrorReporter;
   resolveRouteFetchCacheMode?: (route: TRoute) => FetchCacheMode | null;
+  resolveRouteRuntime?: (route: TRoute) => AppServerActionRouteRuntime;
   request: Request;
   sanitizeErrorForClient: (error: unknown) => unknown;
   searchParams: URLSearchParams;
@@ -220,6 +267,16 @@ export type HandleServerActionRscRequestOptions<
 const SERVER_ACTION_ARGS_LIMIT = 1000;
 const ACTION_DID_NOT_REVALIDATE = 0 satisfies ActionRevalidationKind;
 const ACTION_DID_REVALIDATE_STATIC_AND_DYNAMIC = 1 satisfies ActionRevalidationKind;
+const ACTION_REDIRECT_RENDER_STRIPPED_HEADERS = [
+  "accept",
+  "content-length",
+  "content-type",
+  "next-action",
+  "origin",
+  "rsc",
+  "x-action-forwarded",
+  "x-rsc-action",
+];
 
 function setActionRevalidatedHeader(headers: Headers, kind: ActionRevalidationKind): void {
   if (kind === ACTION_DID_NOT_REVALIDATE) return;
@@ -237,8 +294,146 @@ function resolveActionRevalidationKind(hasModifiedCookies: boolean): ActionReval
   return revalidationKind;
 }
 
+function cloneActionRedirectHeaders(requestHeaders: Headers): Headers {
+  const headers = new Headers(requestHeaders);
+  for (const header of ACTION_REDIRECT_RENDER_STRIPPED_HEADERS) {
+    headers.delete(header);
+  }
+  return headers;
+}
+
+function readSetCookieNameValue(setCookie: string): { name: string; value: string } | null {
+  const equalsIndex = setCookie.indexOf("=");
+  if (equalsIndex <= 0) return null;
+
+  const name = setCookie.slice(0, equalsIndex).trim();
+  const valueEnd = setCookie.indexOf(";", equalsIndex + 1);
+  const value = setCookie.slice(equalsIndex + 1, valueEnd === -1 ? undefined : valueEnd);
+
+  return { name, value };
+}
+
+function isExpiredSetCookie(setCookie: string): boolean {
+  return (
+    /(?:^|;\s*)max-age=0(?:;|$)/i.test(setCookie) ||
+    /(?:^|;\s*)expires=Thu,\s*0?1[\s-]+Jan[\s-]+1970/i.test(setCookie)
+  );
+}
+
+function applySetCookieMutationsToRequestCookieHeader(
+  cookieHeader: string | null,
+  setCookies: readonly string[],
+): string | null {
+  const cookies = new Map<string, string>();
+  if (cookieHeader) {
+    for (const part of cookieHeader.split(";")) {
+      const trimmed = part.trim();
+      if (!trimmed) continue;
+      const equalsIndex = trimmed.indexOf("=");
+      if (equalsIndex <= 0) continue;
+      cookies.set(trimmed.slice(0, equalsIndex), trimmed.slice(equalsIndex + 1));
+    }
+  }
+
+  for (const setCookie of setCookies) {
+    const entry = readSetCookieNameValue(setCookie);
+    if (!entry) continue;
+    if (isExpiredSetCookie(setCookie)) {
+      cookies.delete(entry.name);
+    } else {
+      // Cookie header values are raw (not URL-encoded), and
+      // readSetCookieNameValue extracts the value verbatim from the
+      // Set-Cookie header, so store it as-is.
+      cookies.set(entry.name, entry.value);
+    }
+  }
+
+  return cookies.size === 0
+    ? null
+    : [...cookies].map(([name, value]) => `${name}=${value}`).join("; ");
+}
+
+function createActionRedirectRenderRequest(options: {
+  pendingCookies: readonly string[];
+  request: Request;
+  url: URL;
+}): Request {
+  const headers = cloneActionRedirectHeaders(options.request.headers);
+  const cookieHeader = applySetCookieMutationsToRequestCookieHeader(
+    headers.get("cookie"),
+    options.pendingCookies,
+  );
+  if (cookieHeader === null) {
+    headers.delete("cookie");
+  } else {
+    headers.set("cookie", cookieHeader);
+  }
+
+  return new Request(options.url, {
+    headers,
+    method: "GET",
+  });
+}
+
+function withoutRscBodyHeaders(headers: Headers): Headers {
+  const nextHeaders = new Headers(headers);
+  nextHeaders.delete("Content-Type");
+  nextHeaders.delete("Vary");
+  return nextHeaders;
+}
+
+function isReadableStreamBody(body: BodyInit | null): body is ReadableStream<Uint8Array> {
+  return typeof ReadableStream !== "undefined" && body instanceof ReadableStream;
+}
+
+function createServerActionRscResponse(
+  body: BodyInit | null,
+  init: ResponseInit,
+  clearRequestContext: () => void,
+): Response {
+  if (!isReadableStreamBody(body)) {
+    clearRequestContext();
+    return new Response(body, init);
+  }
+
+  return new Response(deferUntilStreamConsumed(body, clearRequestContext), init);
+}
+
 function isRequestBodyTooLarge(error: unknown): boolean {
   return error instanceof Error && error.message === "Request body too large";
+}
+
+/**
+ * Collapse repeated `cookies().set(name, ...)` / `cookies().delete(name)`
+ * calls down to the last value per name, matching Next.js'
+ * `MutableRequestCookiesAdapter` semantics. Next.js stores response cookies in
+ * a `ResponseCookies` Map keyed by name — multiple sets for the same cookie
+ * collapse to the final value, and emit a single Set-Cookie header.
+ *
+ * Insertion order is preserved by first occurrence (Map iteration order),
+ * which mirrors how `ResponseCookies` iterates its underlying Map. See
+ * packages/next/src/server/web/spec-extension/adapters/request-cookies.ts.
+ * Issue: https://github.com/cloudflare/vinext/issues/1481
+ */
+function dedupePendingCookies(cookies: readonly string[]): string[] {
+  if (cookies.length <= 1) {
+    return cookies.slice();
+  }
+  const byName = new Map<string, string>();
+  const unkeyed: string[] = [];
+  for (const cookie of cookies) {
+    const name = getSetCookieName(cookie);
+    if (name === null) {
+      unkeyed.push(cookie);
+      continue;
+    }
+    // Map.set on an existing key replaces the value but preserves the
+    // insertion position of the original key — exactly the behaviour we need
+    // for `cookies().set("foo", "1"); cookies().set("bar", "2"); cookies().set("foo", "3")`
+    // to come out as [foo=3, bar=2].
+    byName.set(name, cookie);
+  }
+  return [...unkeyed, ...byName.values()];
 }
 
 function isAppServerActionFunction(action: unknown): action is AppServerActionFunction {
@@ -359,6 +554,97 @@ export function applyActionRedirectBasePath(url: string, basePath: string): stri
   return `${addBasePathToPathname(pathname, basePath)}${suffix}`;
 }
 
+function buildServerActionPageTags(route: AppServerActionRoute, pathname: string): string[] {
+  return buildPageCacheTags(pathname, [], [...(route.routeSegments ?? [])], "page");
+}
+
+function resolveInternalActionRedirectTarget(
+  redirectUrl: string,
+  requestUrl: string,
+  basePath: string,
+): URL | null {
+  if (isExternalUrl(redirectUrl)) {
+    const requestOrigin = new URL(requestUrl).origin;
+    const parsed = new URL(redirectUrl);
+    if (parsed.origin !== requestOrigin) return null;
+    if (basePath && !hasBasePath(parsed.pathname, basePath)) return null;
+    return parsed;
+  }
+
+  let resolvedBase = requestUrl;
+  if (!redirectUrl.startsWith("/") && !/^[a-z]+:/i.test(redirectUrl)) {
+    const parsedRequestUrl = new URL(requestUrl);
+    let pathname = parsedRequestUrl.pathname;
+    if (!pathname.endsWith("/")) {
+      pathname = pathname + "/";
+    }
+    resolvedBase = `${parsedRequestUrl.origin}${pathname}${parsedRequestUrl.search}`;
+  }
+
+  return new URL(redirectUrl, resolvedBase);
+}
+
+function isAncestorRouteRedirect(targetPathname: string, currentPathname: string): boolean {
+  return targetPathname !== "/" && currentPathname.startsWith(`${targetPathname}/`);
+}
+
+function isStaleChildSiblingRouteRedirect(
+  targetPathname: string,
+  currentPathname: string,
+): boolean {
+  const targetSegments = splitPathSegments(targetPathname);
+  const currentSegments = splitPathSegments(currentPathname);
+  // Only deeper-to-shallower redirects can be stale in the Next.js worker
+  // model (same-depth siblings share the same page worker). The depth guard
+  // ensures we don't misclassify same-level redirects.
+  if (targetSegments.length === 0 || currentSegments.length <= targetSegments.length) {
+    return false;
+  }
+
+  let commonPrefixLength = 0;
+  const maxPrefixLength = Math.min(targetSegments.length, currentSegments.length);
+  while (
+    commonPrefixLength < maxPrefixLength &&
+    targetSegments[commonPrefixLength] === currentSegments[commonPrefixLength]
+  ) {
+    commonPrefixLength++;
+  }
+
+  return commonPrefixLength > 0 && commonPrefixLength < targetSegments.length;
+}
+
+function normalizeRuntime(runtime: AppServerActionRouteRuntime): "edge" | "nodejs" {
+  if (runtime === "edge" || runtime === "experimental-edge") {
+    return "edge";
+  }
+  return "nodejs";
+}
+
+function shouldUseForwardedActionRedirectStatus<TRoute extends AppServerActionRoute>(options: {
+  actionWasForwarded: boolean;
+  currentPathname: string;
+  currentRoute: TRoute | null;
+  resolveRouteRuntime?: (route: TRoute) => AppServerActionRouteRuntime;
+  targetPathname: string;
+  targetRoute: TRoute;
+}): boolean {
+  if (options.actionWasForwarded) return true;
+  if (isAncestorRouteRedirect(options.targetPathname, options.currentPathname)) return true;
+  if (isStaleChildSiblingRouteRedirect(options.targetPathname, options.currentPathname)) {
+    return true;
+  }
+  if (!options.currentRoute || !options.resolveRouteRuntime) return false;
+
+  const currentRuntime = normalizeRuntime(options.resolveRouteRuntime(options.currentRoute));
+  const targetRuntime = normalizeRuntime(options.resolveRouteRuntime(options.targetRoute));
+  return currentRuntime !== targetRuntime;
+}
+
+function canRenderActionRedirectTarget(route: AppServerActionRoute): boolean {
+  if ("routeHandler" in route && route.routeHandler) return false;
+  return route.page !== null && route.page !== undefined;
+}
+
 function getActionHttpFallbackStatus(error: unknown): number | null {
   const digest = getNextErrorDigest(error);
   if (!digest) return null;
@@ -430,14 +716,10 @@ export async function handleProgressiveServerActionRequest(
     return null;
   }
 
-  // Defensive guard: prevent infinite forwarding loops. See handleServerActionRscRequest.
-  if (options.request.headers.get(ACTION_FORWARDED_HEADER)) {
-    return createActionNotFoundResponse(null, {
-      clearRequestContext: options.clearRequestContext,
-      getAndClearPendingCookies: options.getAndClearPendingCookies,
-    });
-  }
-
+  // Progressive form submissions (multipart form data without an actionId)
+  // don't carry a forwarded-action header. They route to the visible page
+  // directly and can't be redirected cross-runtime, so no forwarded guard is
+  // needed here.
   const csrfResponse = validateCsrfOrigin(options.request, options.allowedOrigins);
   if (csrfResponse) {
     return csrfResponse;
@@ -510,16 +792,41 @@ export async function handleProgressiveServerActionRequest(
     }
 
     if (!actionRedirect) {
-      getAndClearActionRevalidationKind();
+      // Capture cookies/headers set during action execution so the caller can
+      // apply them to the rendered page response. Mirrors Next.js'
+      // `res.setHeader('set-cookie', ...)` path in app-render.tsx, which
+      // flushes `requestStore.mutableCookies` onto the response before SSR
+      // streaming begins. Without this, no-JS server-action form POSTs lose
+      // cookies/headers — see issue #1483.
+      const actionPendingCookies = options.getAndClearPendingCookies();
+      const actionDraftCookie = options.getDraftModeCookieHeader();
+      const revalidationKind = resolveActionRevalidationKind(
+        actionPendingCookies.length > 0 || Boolean(actionDraftCookie),
+      );
+
       if (actionFailed) {
-        return { kind: "form-state", formState: null, actionError, actionFailed };
+        return {
+          kind: "form-state",
+          formState: null,
+          actionError,
+          actionFailed,
+          pendingCookies: actionPendingCookies,
+          draftCookie: actionDraftCookie,
+          revalidationKind,
+        };
       }
 
       const formState = await options.decodeFormState(actionResult, body);
-      return { kind: "form-state", formState: formState ?? null };
+      return {
+        kind: "form-state",
+        formState: formState ?? null,
+        pendingCookies: actionPendingCookies,
+        draftCookie: actionDraftCookie,
+        revalidationKind,
+      };
     }
 
-    const actionPendingCookies = options.getAndClearPendingCookies();
+    const actionPendingCookies = dedupePendingCookies(options.getAndClearPendingCookies());
     const actionDraftCookie = options.getDraftModeCookieHeader();
     const actionRevalidationKind = resolveActionRevalidationKind(
       actionPendingCookies.length > 0 || Boolean(actionDraftCookie),
@@ -596,17 +903,6 @@ export async function handleServerActionRscRequest<
     return null;
   }
 
-  // Defensive guard: if this request has already been forwarded between workers,
-  // do not attempt to process it again. Prevents infinite forwarding loops when
-  // middleware rewrites action POSTs. Matches Next.js behavior:
-  // https://github.com/vercel/next.js/commit/20892dd44e1321c13f755f051e48c3cadd75204b
-  if (options.request.headers.get(ACTION_FORWARDED_HEADER)) {
-    return createActionNotFoundResponse(options.actionId, {
-      clearRequestContext: options.clearRequestContext,
-      getAndClearPendingCookies: options.getAndClearPendingCookies,
-    });
-  }
-
   const csrfResponse = validateCsrfOrigin(options.request, options.allowedOrigins);
   if (csrfResponse) return csrfResponse;
 
@@ -662,6 +958,7 @@ export async function handleServerActionRscRequest<
     let returnValue: AppServerActionReturnValue;
     let actionRedirect: AppServerActionRedirect | null = null;
     let actionStatus = 200;
+    const actionWasForwarded = Boolean(options.request.headers.get(ACTION_FORWARDED_HEADER));
     const previousHeadersPhase = options.setHeadersAccessPhase("action");
     try {
       try {
@@ -688,26 +985,27 @@ export async function handleServerActionRscRequest<
     }
 
     if (actionRedirect) {
-      const actionPendingCookies = options.getAndClearPendingCookies();
+      const actionPendingCookies = dedupePendingCookies(options.getAndClearPendingCookies());
       const actionDraftCookie = options.getDraftModeCookieHeader();
       const actionRevalidationKind = resolveActionRevalidationKind(
         actionPendingCookies.length > 0 || Boolean(actionDraftCookie),
       );
-      options.clearRequestContext();
       const redirectHeaders = new Headers({
         "Content-Type": VINEXT_RSC_CONTENT_TYPE,
         Vary: VINEXT_RSC_VARY_HEADER,
       });
+      applyEdgeRuntimeHeader(redirectHeaders, options.isEdgeRuntime);
       mergeMiddlewareResponseHeaders(redirectHeaders, options.middlewareHeaders);
       applyRscCompatibilityIdHeader(redirectHeaders);
       // Prefix basePath onto the redirect target. The client-side handler in
       // app-browser-entry reads ACTION_REDIRECT_HEADER and calls
       // window.location.assign/replace verbatim, so the value must already
       // be a basePath-prefixed URL.
-      redirectHeaders.set(
-        ACTION_REDIRECT_HEADER,
-        applyActionRedirectBasePath(actionRedirect.url, options.basePath ?? ""),
+      const actionRedirectUrl = applyActionRedirectBasePath(
+        actionRedirect.url,
+        options.basePath ?? "",
       );
+      redirectHeaders.set(ACTION_REDIRECT_HEADER, actionRedirectUrl);
       redirectHeaders.set(ACTION_REDIRECT_TYPE_HEADER, actionRedirect.type);
       redirectHeaders.set(ACTION_REDIRECT_STATUS_HEADER, String(actionRedirect.status));
       for (const cookie of actionPendingCookies) {
@@ -715,16 +1013,105 @@ export async function handleServerActionRscRequest<
       }
       if (actionDraftCookie) redirectHeaders.append("Set-Cookie", actionDraftCookie);
       setActionRevalidatedHeader(redirectHeaders, actionRevalidationKind);
-      return new Response("", { status: 200, headers: redirectHeaders });
+
+      const redirectTarget = resolveInternalActionRedirectTarget(
+        actionRedirectUrl,
+        options.request.url,
+        options.basePath ?? "",
+      );
+      if (!redirectTarget) {
+        options.clearRequestContext();
+        return new Response(null, {
+          status: 303,
+          headers: withoutRscBodyHeaders(redirectHeaders),
+        });
+      }
+
+      const targetPathname = stripBasePath(redirectTarget.pathname, options.basePath ?? "");
+      const targetMatch = options.matchRoute(targetPathname);
+      // Hydrate the redirect target before reading its page/route-handler
+      // modules (canRenderActionRedirectTarget + fetch-cache-mode below).
+      if (targetMatch) await options.ensureRouteLoaded?.(targetMatch.route);
+      if (!targetMatch || !canRenderActionRedirectTarget(targetMatch.route)) {
+        options.clearRequestContext();
+        return new Response(null, {
+          status: 303,
+          headers: withoutRscBodyHeaders(redirectHeaders),
+        });
+      }
+      const currentMatch = options.matchRoute(options.cleanPathname);
+      // Hydrate the current route before resolving its runtime below.
+      if (currentMatch) await options.ensureRouteLoaded?.(currentMatch.route);
+
+      const redirectRenderRequest = createActionRedirectRenderRequest({
+        pendingCookies: [
+          ...actionPendingCookies,
+          ...(actionDraftCookie ? [actionDraftCookie] : []),
+        ],
+        request: options.request,
+        url: redirectTarget,
+      });
+      setHeadersContext(headersContextFromRequest(redirectRenderRequest));
+      options.setNavigationContext({
+        pathname: targetPathname,
+        searchParams: redirectTarget.searchParams,
+        params: targetMatch.params,
+      });
+      setCurrentFetchCacheMode(options.resolveRouteFetchCacheMode?.(targetMatch.route) ?? null);
+      setCurrentFetchSoftTags(buildServerActionPageTags(targetMatch.route, targetPathname));
+      const element = options.buildPageElement({
+        cleanPathname: targetPathname,
+        interceptOpts: undefined,
+        isRscRequest: true,
+        mountedSlotsHeader: null,
+        params: targetMatch.params,
+        request: redirectRenderRequest,
+        route: targetMatch.route,
+        searchParams: redirectTarget.searchParams,
+        renderMode: APP_RSC_RENDER_MODE_ACTION_RERENDER_PRESERVE_UI,
+      });
+      const onRenderError = options.createRscOnErrorHandler(
+        redirectRenderRequest,
+        targetPathname,
+        targetMatch.route.pattern,
+      );
+      const rscStream = await options.renderToReadableStream(
+        { root: element, returnValue },
+        { temporaryReferences, onError: onRenderError },
+      );
+      const redirectResponseStatus = shouldUseForwardedActionRedirectStatus({
+        actionWasForwarded,
+        currentPathname: options.cleanPathname,
+        currentRoute: currentMatch?.route ?? null,
+        resolveRouteRuntime: options.resolveRouteRuntime,
+        targetPathname,
+        targetRoute: targetMatch.route,
+      })
+        ? 200
+        : 303;
+
+      return createServerActionRscResponse(
+        rscStream,
+        { status: redirectResponseStatus, headers: redirectHeaders },
+        options.clearRequestContext,
+      );
     }
 
-    const actionPendingCookies = options.getAndClearPendingCookies();
+    const actionPendingCookies = dedupePendingCookies(options.getAndClearPendingCookies());
     const actionDraftCookie = options.getDraftModeCookieHeader();
     const actionRevalidationKind = resolveActionRevalidationKind(
       actionPendingCookies.length > 0 || Boolean(actionDraftCookie),
     );
 
-    const shouldSkipPageRendering = actionRevalidationKind === ACTION_DID_NOT_REVALIDATE;
+    // When an action returned a non-200 HTTP fallback status (e.g. 404 from
+    // notFound()), skip the early page render so the error boundary displays
+    // the fallback payload embedded in returnValue. Forwarded actions always
+    // skip rerendering regardless of status (the forwarded worker doesn't own
+    // the page's layout tree). Otherwise only skip when the action status is
+    // 200 and no revalidation side-effects occurred.
+    const shouldSkipPageRendering =
+      actionWasForwarded ||
+      (actionStatus === 200 && actionRevalidationKind === ACTION_DID_NOT_REVALIDATE);
     if (shouldSkipPageRendering) {
       const onRenderError = options.createRscOnErrorHandler(
         options.request,
@@ -736,19 +1123,27 @@ export async function handleServerActionRscRequest<
         { temporaryReferences, onError: onRenderError },
       );
 
-      options.clearRequestContext();
-
       const actionHeaders = new Headers({
         "Content-Type": VINEXT_RSC_CONTENT_TYPE,
         Vary: VINEXT_RSC_VARY_HEADER,
       });
+      applyEdgeRuntimeHeader(actionHeaders, options.isEdgeRuntime);
       mergeMiddlewareResponseHeaders(actionHeaders, options.middlewareHeaders);
       applyRscCompatibilityIdHeader(actionHeaders);
+      for (const cookie of actionPendingCookies) {
+        actionHeaders.append("Set-Cookie", cookie);
+      }
+      if (actionDraftCookie) actionHeaders.append("Set-Cookie", actionDraftCookie);
+      setActionRevalidatedHeader(actionHeaders, actionRevalidationKind);
 
-      return new Response(rscStream, {
-        status: options.middlewareStatus ?? actionStatus,
-        headers: actionHeaders,
-      });
+      return createServerActionRscResponse(
+        rscStream,
+        {
+          status: options.middlewareStatus ?? actionStatus,
+          headers: actionHeaders,
+        },
+        options.clearRequestContext,
+      );
     }
 
     const match = options.matchRoute(options.cleanPathname);
@@ -756,7 +1151,7 @@ export async function handleServerActionRscRequest<
     let errorPattern = match ? match.route.pattern : options.cleanPathname;
     if (match) {
       const { route: actionRoute, params: actionParams } = match;
-      const actionRerenderTarget = resolveAppPageActionRerenderTarget({
+      const actionRerenderTarget = await resolveAppPageActionRerenderTarget({
         cleanPathname: options.cleanPathname,
         currentParams: actionParams,
         currentRoute: actionRoute,
@@ -772,8 +1167,13 @@ export async function handleServerActionRscRequest<
         searchParams: options.searchParams,
         params: actionRerenderTarget.navigationParams,
       });
+      // Hydrate the re-render target before reading its page module.
+      await options.ensureRouteLoaded?.(actionRerenderTarget.route);
       setCurrentFetchCacheMode(
         options.resolveRouteFetchCacheMode?.(actionRerenderTarget.route) ?? null,
+      );
+      setCurrentFetchSoftTags(
+        buildServerActionPageTags(actionRerenderTarget.route, options.cleanPathname),
       );
       element = options.buildPageElement({
         cleanPathname: options.cleanPathname,
@@ -806,13 +1206,18 @@ export async function handleServerActionRscRequest<
       "Content-Type": VINEXT_RSC_CONTENT_TYPE,
       Vary: VINEXT_RSC_VARY_HEADER,
     });
+    applyEdgeRuntimeHeader(actionHeaders, options.isEdgeRuntime);
     mergeMiddlewareResponseHeaders(actionHeaders, options.middlewareHeaders);
     applyRscCompatibilityIdHeader(actionHeaders);
     setActionRevalidatedHeader(actionHeaders, actionRevalidationKind);
-    const actionResponse = new Response(rscStream, {
-      status: options.middlewareStatus ?? actionStatus,
-      headers: actionHeaders,
-    });
+    const actionResponse = createServerActionRscResponse(
+      rscStream,
+      {
+        status: options.middlewareStatus ?? actionStatus,
+        headers: actionHeaders,
+      },
+      options.clearRequestContext,
+    );
     if (actionPendingCookies.length > 0 || actionDraftCookie) {
       for (const cookie of actionPendingCookies) {
         actionResponse.headers.append("Set-Cookie", cookie);

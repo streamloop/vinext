@@ -1,9 +1,10 @@
 import { decode as decodeQueryString } from "node:querystring";
 import { parseCookies } from "../config/config-matchers.js";
 import { readStreamAsTextWithLimit } from "../utils/text-stream.js";
+import { DEFAULT_PAGES_API_BODY_SIZE_LIMIT } from "./pages-body-parser-config.js";
 import { PagesBodyParseError, getMediaType, isJsonMediaType } from "./pages-media-type.js";
 
-const MAX_PAGES_API_BODY_SIZE = 1 * 1024 * 1024;
+const MAX_PAGES_API_BODY_SIZE = DEFAULT_PAGES_API_BODY_SIZE_LIMIT;
 
 /**
  * @deprecated Use PagesBodyParseError from pages-media-type.ts instead.
@@ -20,9 +21,17 @@ export type PagesReqResRequest = {
   query: PagesRequestQuery;
   body: unknown;
   cookies: Record<string, string>;
+  /**
+   * Async-iterator hook so handlers can `for await (const chunk of req)` —
+   * matching Node's `IncomingMessage` contract. Critical for the
+   * `bodyParser: false` opt-out (webhook signature verification etc.) where
+   * `req.body` is left undefined and user code is expected to drain the raw
+   * stream off `req` itself.
+   */
+  [Symbol.asyncIterator]: () => AsyncIterator<Uint8Array>;
 };
 
-export type PagesReqResHeaders = {
+type PagesReqResHeaders = {
   [key: string]: string | number | boolean | string[];
 };
 
@@ -63,6 +72,16 @@ async function readPagesRequestBodyWithLimit(request: Request, maxBytes: number)
   });
 }
 
+/**
+ * Read and parse a Pages Router API request body for the Workers/prod path.
+ *
+ * `maxBytes` defaults to the 1 MB Next.js default but may be overridden by
+ * `export const config = { api: { bodyParser: { sizeLimit: '4mb' } } }` on
+ * the route module. Handlers that opt out entirely (`bodyParser: false`)
+ * MUST skip this function so the body stream stays intact for user code.
+ *
+ * @see https://nextjs.org/docs/pages/building-your-application/routing/api-routes#custom-config
+ */
 export async function parsePagesApiBody(
   request: Request,
   maxBytes = MAX_PAGES_API_BODY_SIZE,
@@ -112,6 +131,48 @@ export function createPagesReqRes(options: CreatePagesReqResOptions): CreatePage
     headersObj[key.toLowerCase()] = value;
   }
 
+  // Surface the raw request body as an async-iterator on `req` so handlers
+  // can do `for await (const chunk of req)`, matching Node's
+  // `IncomingMessage` contract. This is the documented escape hatch when
+  // `bodyParser: false` is set (Stripe/GitHub/Slack webhooks need the raw
+  // bytes for HMAC signature verification).
+  //
+  // Cf. Next.js test/e2e/middleware-fetches-with-body fixture
+  // `body_parser_false.js`, which calls `for await (const chunk of req)`
+  // on the `IncomingMessage`-shaped req object. See issue #1479.
+  const requestBody = options.request.body;
+  const reqAsyncIterator = (): AsyncIterator<Uint8Array> => {
+    if (!requestBody) {
+      // No body — yield nothing. Use an inert iterator so `for await` is
+      // a no-op rather than throwing.
+      return {
+        next(): Promise<IteratorResult<Uint8Array>> {
+          return Promise.resolve({ value: undefined, done: true });
+        },
+      };
+    }
+    const reader = requestBody.getReader();
+    return {
+      async next(): Promise<IteratorResult<Uint8Array>> {
+        const { value, done } = await reader.read();
+        if (done) {
+          return { value: undefined, done: true };
+        }
+        return { value, done: false };
+      },
+      async return(): Promise<IteratorResult<Uint8Array>> {
+        // `for await ... break` path — release the lock so the stream is
+        // discardable. Cancellation propagates to the underlying source.
+        try {
+          await reader.cancel();
+        } catch {
+          // Ignore errors during cancellation.
+        }
+        return { value: undefined, done: true };
+      },
+    };
+  };
+
   const req: PagesReqResRequest = {
     method: options.request.method,
     url: options.url,
@@ -119,6 +180,7 @@ export function createPagesReqRes(options: CreatePagesReqResOptions): CreatePage
     query: options.query,
     body: options.body,
     cookies: parseCookies(options.request.headers.get("cookie")),
+    [Symbol.asyncIterator]: reqAsyncIterator,
   };
 
   let resStatusCode = 200;

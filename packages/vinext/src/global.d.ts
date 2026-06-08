@@ -18,6 +18,7 @@
 
 import type { Root } from "react-dom/client";
 import type { OnRequestErrorHandler } from "./server/instrumentation";
+import type { InitialDevServerErrorPayload } from "./server/dev-initial-server-error";
 import type { CachedRscResponse, PrefetchCacheEntry } from "vinext/shims/navigation";
 
 // `window.next` is declared inline in `./client/window-next.ts` (mirroring
@@ -48,12 +49,59 @@ declare global {
     __VINEXT_HYDRATED_AT: number | undefined;
 
     /**
+     * Next.js test/runtime compatibility hydration marker.
+     */
+    __NEXT_HYDRATED: boolean | undefined;
+    __NEXT_HYDRATED_AT: number | undefined;
+    __NEXT_HYDRATED_CB: (() => void) | undefined;
+    __VINEXT_INITIAL_DEV_ERRORS__: InitialDevServerErrorPayload[] | undefined;
+
+    /**
      * The cached `_app` component for Pages Router.
      * Written and read by `shims/router.ts` to avoid re-importing on every
      * client-side navigation.
      */
     __VINEXT_APP__:
-      | React.ComponentType<{ Component: React.ComponentType<unknown>; pageProps: unknown }>
+      | React.ComponentType<{
+          Component: React.ComponentType<Record<string, unknown>>;
+          pageProps: unknown;
+        }>
+      | undefined;
+
+    /**
+     * Pages Router code-split loader map. Keys are route patterns in Next.js
+     * bracket format (e.g. `/blog/[slug]`), values are dynamic `import()`
+     * thunks that resolve to the page module. Vite code-splits each thunk
+     * into its own chunk, so this is the manifest the client uses to load
+     * the right page chunk on a client-side `_next/data` navigation.
+     *
+     * Set by the generated client entry (`entries/pages-client-entry.ts`)
+     * before `hydrate()`. Read by `shims/router.ts` `navigateClient` after a
+     * successful `/_next/data/<buildId>/<page>.json` fetch.
+     *
+     * `undefined` during SSR and on the very first hydration tick.
+     */
+    __VINEXT_PAGE_LOADERS__:
+      | Record<string, () => Promise<{ default?: unknown; [key: string]: unknown }>>
+      | undefined;
+
+    /**
+     * Pages Router pattern list. The route patterns (Next.js bracket format)
+     * keyed in `__VINEXT_PAGE_LOADERS__`, in priority order (longest specific
+     * pattern first, catch-alls last). Used by `shims/router.ts` to match an
+     * incoming URL pathname to a registered loader.
+     */
+    __VINEXT_PAGE_PATTERNS__: string[] | undefined;
+
+    /**
+     * Pages Router `_app` loader. Dynamic `import()` thunk for the user's
+     * `pages/_app.tsx` module, or `undefined` when the app has no `_app`.
+     * Set by the generated client entry; read by `shims/router.ts`
+     * `navigateClient` to lazy-load `_app` on the first client-side
+     * navigation.
+     */
+    __VINEXT_APP_LOADER__:
+      | (() => Promise<{ default?: unknown; [key: string]: unknown }>)
       | undefined;
 
     /**
@@ -181,6 +229,14 @@ declare global {
   var __VINEXT_SSR_MANIFEST__: Record<string, string[]> | undefined;
 
   /**
+   * Maps emitted CSS asset hrefs to file contents when next.config enables
+   * `experimental.inlineCss`. Injected into edge bundles at build time and
+   * populated by the Node.js production server at startup.
+   */
+  // oxlint-disable-next-line no-var
+  var __VINEXT_INLINE_CSS__: Record<string, string> | undefined;
+
+  /**
    * Array of chunk filenames that are only reachable via dynamic `import()`.
    * These chunks must NOT receive `<link rel="modulepreload">` tags because
    * they are fetched on demand (e.g. behind `React.lazy` / `next/dynamic`).
@@ -191,7 +247,7 @@ declare global {
   var __VINEXT_LAZY_CHUNKS__: string[] | undefined;
 
   /**
-   * The client entry JS filename (e.g. `"assets/entry-abc123.js"`) for Pages
+   * The client entry JS filename (e.g. `"_next/static/entry-abc123.js"`) for Pages
    * Router builds.
    * Injected into the Worker entry at build time for Pages Router only.
    * App Router uses the RSC plugin's `loadBootstrapScriptContent` mechanism
@@ -291,17 +347,20 @@ declare global {
   namespace NodeJS {
     interface ProcessEnv {
       /**
-       * UUID secret used to sign/validate the Next.js draft-mode cookie.
-       * Generated once at build time and injected via Vite `define`.
-       */
-      __VINEXT_DRAFT_SECRET?: string;
-
-      /**
        * Build ID string injected via Vite `define` at production build time.
        * Matches `next.config.js` → `buildId` (or a generated UUID when unset).
        * `undefined` in dev mode.
        */
       __VINEXT_BUILD_ID?: string;
+
+      /**
+       * Build-only coordination variable set by the `vinext build` CLI so that
+       * every vinext() plugin instance in a single build (App Router buildApp +
+       * the separate hybrid Pages Router vite.build) resolves the same build ID.
+       * Distinct from `__VINEXT_BUILD_ID` (the runtime value baked via `define`)
+       * so it never leaks into dev or standalone resolveBuildId() semantics.
+       */
+      __VINEXT_SHARED_BUILD_ID?: string;
 
       /**
        * Public App Router RSC compatibility identity injected via Vite
@@ -311,10 +370,24 @@ declare global {
       __VINEXT_RSC_COMPATIBILITY_ID?: string;
 
       /**
+       * Build-only coordination variable set by the `vinext build` CLI so that
+       * every vinext() plugin instance in a single build resolves the same RSC
+       * compatibility token (companion to `__VINEXT_SHARED_BUILD_ID`). Never read
+       * by dev or standalone createRscCompatibilityId() resolution.
+       */
+      __VINEXT_SHARED_RSC_COMPATIBILITY_ID?: string;
+
+      /**
        * Deployment ID string injected via Vite `define` when
        * `NEXT_DEPLOYMENT_ID` is present at build time.
        */
       __VINEXT_DEPLOYMENT_ID?: string;
+
+      /**
+       * `"true"` when `next.config.js` enables
+       * `experimental.prefetchInlining`.
+       */
+      __VINEXT_PREFETCH_INLINING?: string;
 
       /**
        * JSON-encoded array of `RemotePattern` objects from
@@ -378,6 +451,19 @@ declare module "node:http" {
      */
     __vinextMiddlewareStatus?: number;
   }
+}
+
+// ---------------------------------------------------------------------------
+// virtual:vinext-cache-adapters — generated cache-adapter registration module
+// ---------------------------------------------------------------------------
+//
+// Generated by vinext at build time from the `cache` option in the vinext()
+// plugin config. `registerConfiguredCacheAdapters(env)` registers the configured
+// data / CDN cache adapters on first call and is a no-op when nothing is
+// configured. See `cache/cache-adapters-virtual.ts` for the generator.
+
+declare module "virtual:vinext-cache-adapters" {
+  export function registerConfiguredCacheAdapters(env?: Record<string, unknown>): void;
 }
 
 // The `import type { Root }` at the top of this file makes it a TypeScript

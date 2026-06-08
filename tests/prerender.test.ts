@@ -478,6 +478,7 @@ describe("prerenderPages — default mode (pages-basic)", () => {
 
   it("renders 404 page", () => {
     const r = findRoute(results, "/404");
+    expect(results.filter((result) => result.route === "/404")).toHaveLength(1);
     expect(r).toMatchObject({ route: "/404", status: "rendered", revalidate: false });
     if (r?.status === "rendered") {
       expect(r.outputFiles).toContain("404.html");
@@ -927,6 +928,27 @@ describe("prerenderApp — default mode (app-basic)", () => {
     expect(r?.status).toBe("skipped");
   });
 
+  // Ported from Next.js: test/e2e/app-dir/rsc-redirect/rsc-redirect.test.ts
+  // ('should get 307 status code for document request')
+  //
+  // A speculative prerender of a route that calls `redirect()` must not
+  // follow the redirect server-side and cache the destination's HTML under
+  // the redirecting URL. Doing so makes the prod server reply with 200 and
+  // the destination's body on every document request to the redirecting
+  // route, instead of emitting an HTTP 307 with a Location header.
+  //
+  // See: https://github.com/cloudflare/vinext/issues/1530
+  it("skips /redirect-test instead of capturing the destination HTML", () => {
+    const r = findRoute(results, "/redirect-test");
+    expect(r).toBeDefined();
+    expect(r?.status).toBe("skipped");
+    // No HTML/RSC must be written for the redirecting route — otherwise the
+    // prod server serves the cached destination body with status 200 for
+    // every document request to /redirect-test.
+    expect(fs.existsSync(path.join(outDir, "redirect-test.html"))).toBe(false);
+    expect(fs.existsSync(path.join(outDir, "redirect-test.rsc"))).toBe(false);
+  });
+
   // ── API routes — always skipped ────────────────────────────────────────────
 
   it("skips all API route handlers", () => {
@@ -1047,6 +1069,102 @@ describe("runPrerender — hybrid app+pages (app-basic)", () => {
       status: "skipped",
       reason: "ssr",
     });
+  });
+});
+
+describe("prerenderApp — cacheComponents PPR fallback-shell artifacts", () => {
+  async function prerenderDynamicRootParamRoute(cacheComponents: boolean) {
+    const root = tmpDir("vinext-prerender-ppr-shell-");
+    const outDir = path.join(root, "out");
+    const appDir = path.join(root, "app");
+    const pageDir = path.join(appDir, "[locale]", "blog", "[slug]");
+    fs.mkdirSync(pageDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(appDir, "[locale]", "layout.tsx"),
+      "export default function Layout({ children }: { children: React.ReactNode }) { return children; }\n",
+    );
+    fs.writeFileSync(
+      path.join(pageDir, "page.tsx"),
+      "export default function Page() { return null; }\n",
+    );
+
+    const renderedPaths: string[] = [];
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      if (url.pathname === "/__vinext/prerender/static-params") {
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify([{ locale: "en", slug: "hello" }]));
+        return;
+      }
+      if (url.pathname === "/__vinext_nonexistent_for_404__") {
+        res.statusCode = 404;
+        res.end("<html><body>not found</body></html>");
+        return;
+      }
+
+      renderedPaths.push(url.pathname);
+      res.setHeader("content-type", "text/html");
+      res.end(
+        "<html><body>" +
+          runtimeRscChunkScript(
+            `0:["$","div",null,{"children":${JSON.stringify(url.pathname)}}]\n`,
+          ) +
+          runtimeRscDoneScript() +
+          "</body></html>",
+      );
+    });
+
+    const port = await listen(server);
+    try {
+      const { prerenderApp } = await import("../packages/vinext/src/build/prerender.js");
+      const { appRouter } = await import("../packages/vinext/src/routing/app-router.js");
+      const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
+      const routes = await appRouter(appDir);
+      const config = await resolveNextConfig({ cacheComponents });
+
+      const result = await prerenderApp({
+        mode: "default",
+        rscBundlePath: path.join(root, "dist", "server", "index.js"),
+        routes,
+        outDir,
+        config,
+        _prodServer: { server, port },
+      });
+
+      return { renderedPaths, routes: result.routes };
+    } finally {
+      await closeServer(server);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  it("queues fallback-shell artifacts when cacheComponents is enabled", async () => {
+    const { renderedPaths, routes } = await prerenderDynamicRootParamRoute(true);
+
+    expect(findRoute(routes, "/en/blog/hello")).toMatchObject({
+      route: "/:locale/blog/:slug",
+      path: "/en/blog/hello",
+      status: "rendered",
+    });
+    expect(findRoute(routes, "/en/blog/[slug]")).toMatchObject({
+      route: "/:locale/blog/:slug",
+      path: "/en/blog/[slug]",
+      status: "rendered",
+    });
+    expect(renderedPaths).toEqual(expect.arrayContaining(["/en/blog/hello", "/en/blog/[slug]"]));
+  });
+
+  it("does not queue fallback-shell artifacts when cacheComponents is disabled", async () => {
+    const { renderedPaths, routes } = await prerenderDynamicRootParamRoute(false);
+
+    expect(findRoute(routes, "/en/blog/hello")).toMatchObject({
+      route: "/:locale/blog/:slug",
+      path: "/en/blog/hello",
+      status: "rendered",
+    });
+    expect(findRoute(routes, "/en/blog/[slug]")).toBeUndefined();
+    expect(renderedPaths).toContain("/en/blog/hello");
+    expect(renderedPaths).not.toContain("/en/blog/[slug]");
   });
 });
 

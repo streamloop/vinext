@@ -83,6 +83,7 @@ describe("pages page data", () => {
       safeJsonStringify(value: unknown) {
         return JSON.stringify(value);
       },
+      vinext: { hasMiddleware: true },
     });
 
     expect(html).toContain("<div>fresh-body</div>");
@@ -90,11 +91,131 @@ describe("pages page data", () => {
     expect(html).toContain('<script src="/tail.js"></script>');
     expect(html).toContain('"page":"/posts/[slug]"');
     expect(html).toContain('"slug":"post"');
+    expect(html).toContain('"__vinext":{"hasMiddleware":true}');
   });
 
-  it("returns an HTML 404 when getStaticPaths excludes a dynamic path", async () => {
+  it("returns a notFound signal when getStaticPaths excludes a dynamic HTML path", async () => {
     const result = await resolvePagesPageData(
       createOptions({
+        pageModule: {
+          async getStaticPaths() {
+            return {
+              fallback: false,
+              paths: [{ params: { slug: "hello-world" } }],
+            };
+          },
+        },
+        params: { slug: "missing" },
+        query: { slug: "missing" },
+        route: { isDynamic: true },
+        routeUrl: "/posts/missing",
+      }),
+    );
+
+    expect(result).toEqual({ kind: "notFound" });
+  });
+
+  it("runs page getInitialProps with the original request URL and asPath", async () => {
+    const result = await resolvePagesPageData(
+      createOptions({
+        asPath: "/3",
+        createGsspReqRes() {
+          return {
+            req: { url: "/3" },
+            res: {
+              headersSent: false,
+              statusCode: 200,
+              getHeaders() {
+                return {};
+              },
+            },
+            responsePromise: Promise.resolve(new Response("short-circuit", { status: 202 })),
+          };
+        },
+        pageModule: {
+          default: Object.assign(
+            function Page() {
+              return null;
+            },
+            {
+              getInitialProps(context: { req?: { url?: string }; asPath?: string }) {
+                return {
+                  reqUrl: context.req?.url,
+                  asPath: context.asPath,
+                };
+              },
+            },
+          ),
+        },
+        routePattern: "/_error",
+        routeUrl: "/3",
+      }),
+    );
+
+    expect(result).toMatchObject({
+      kind: "render",
+      pageProps: { reqUrl: "/3", asPath: "/3" },
+    });
+  });
+
+  it("preserves getInitialProps this binding via component receiver", async () => {
+    const Page = Object.assign(
+      function Page() {
+        return null;
+      },
+      {
+        value: "ok",
+        getInitialProps(this: { value: string }) {
+          return { value: this.value };
+        },
+      },
+    );
+
+    const result = await resolvePagesPageData(
+      createOptions({
+        createGsspReqRes() {
+          return {
+            req: {},
+            res: {
+              headersSent: false,
+              statusCode: 200,
+              getHeaders() {
+                return {};
+              },
+            },
+            responsePromise: Promise.resolve(new Response("short-circuit", { status: 202 })),
+          };
+        },
+        pageModule: {
+          default: Page,
+        },
+      }),
+    );
+
+    expect(result).toMatchObject({
+      kind: "render",
+      pageProps: { value: "ok" },
+    });
+  });
+
+  it("returns a notFound signal when getServerSideProps returns notFound", async () => {
+    const result = await resolvePagesPageData(
+      createOptions({
+        pageModule: {
+          async getServerSideProps() {
+            return { notFound: true };
+          },
+        },
+      }),
+    );
+
+    expect(result).toEqual({ kind: "notFound" });
+  });
+
+  it("returns JSON 404 envelope for data requests when getStaticPaths excludes a path", async () => {
+    const result = await resolvePagesPageData(
+      createOptions({
+        isDataReq: true,
         pageModule: {
           async getStaticPaths() {
             return {
@@ -115,7 +236,50 @@ describe("pages page data", () => {
       throw new Error("expected response result");
     }
     expect(result.response.status).toBe(404);
-    await expect(result.response.text()).resolves.toContain("404 - Page not found");
+    expect(result.response.headers.get("content-type")).toBe("application/json");
+    await expect(result.response.text()).resolves.toBe("{}");
+  });
+
+  it("returns JSON 404 envelope for data requests when getStaticProps returns notFound", async () => {
+    const result = await resolvePagesPageData(
+      createOptions({
+        isDataReq: true,
+        pageModule: {
+          async getStaticProps() {
+            return { notFound: true };
+          },
+        },
+      }),
+    );
+
+    expect(result.kind).toBe("response");
+    if (result.kind !== "response") {
+      throw new Error("expected response result");
+    }
+    expect(result.response.status).toBe(404);
+    expect(result.response.headers.get("content-type")).toBe("application/json");
+    await expect(result.response.text()).resolves.toBe("{}");
+  });
+
+  it("returns JSON 404 envelope for data requests when getServerSideProps returns notFound", async () => {
+    const result = await resolvePagesPageData(
+      createOptions({
+        isDataReq: true,
+        pageModule: {
+          async getServerSideProps() {
+            return { notFound: true };
+          },
+        },
+      }),
+    );
+
+    expect(result.kind).toBe("response");
+    if (result.kind !== "response") {
+      throw new Error("expected response result");
+    }
+    expect(result.response.status).toBe(404);
+    expect(result.response.headers.get("content-type")).toBe("application/json");
+    await expect(result.response.text()).resolves.toBe("{}");
   });
 
   it("short-circuits getServerSideProps responses after res.end()", async () => {
@@ -159,10 +323,99 @@ describe("pages page data", () => {
     await expect(result.response.text()).resolves.toBe('{"ok":true}');
   });
 
+  it("short-circuits getServerSideProps responses when only writableEnded is set", async () => {
+    const responsePromise = Promise.resolve(
+      new Response('{"ok":true}', {
+        status: 202,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    const result = await resolvePagesPageData(
+      createOptions({
+        createGsspReqRes() {
+          const res = {
+            headersSent: false,
+            writableEnded: true,
+            statusCode: 202,
+            getHeaders() {
+              return { "content-type": "application/json" };
+            },
+          };
+          return {
+            req: { method: "GET" },
+            res,
+            responsePromise,
+          };
+        },
+        pageModule: {
+          async getServerSideProps() {
+            return {};
+          },
+        },
+      }),
+    );
+
+    expect(result.kind).toBe("response");
+    if (result.kind !== "response") {
+      throw new Error("expected response result");
+    }
+    expect(result.response.status).toBe(202);
+    await expect(result.response.text()).resolves.toBe('{"ok":true}');
+  });
+
+  it("short-circuits getInitialProps responses when only writableEnded is set", async () => {
+    const responsePromise = Promise.resolve(
+      new Response('{"ok":true}', {
+        status: 202,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    const result = await resolvePagesPageData(
+      createOptions({
+        createGsspReqRes() {
+          const res = {
+            headersSent: false,
+            writableEnded: true,
+            statusCode: 202,
+            getHeaders() {
+              return { "content-type": "application/json" };
+            },
+          };
+          return {
+            req: {},
+            res,
+            responsePromise,
+          };
+        },
+        pageModule: {
+          default: Object.assign(
+            function Page() {
+              return null;
+            },
+            {
+              getInitialProps() {
+                return {};
+              },
+            },
+          ),
+        },
+      }),
+    );
+
+    expect(result.kind).toBe("response");
+    if (result.kind !== "response") {
+      throw new Error("expected response result");
+    }
+    expect(result.response.status).toBe(202);
+    await expect(result.response.text()).resolves.toBe('{"ok":true}');
+  });
+
   it("serves stale ISR entries immediately and regenerates them through typed helpers", async () => {
     let regenPromise: Promise<void> | null = null;
     const applyRequestContexts = vi.fn();
-    const isrSet = vi.fn(async () => {});
+    const isrSet = vi.fn<ResolvePagesPageDataOptions["isrSet"]>(async () => {});
     const runInFreshUnifiedContext = vi.fn(
       async <T>(callback: () => Promise<T>): Promise<T> => callback(),
     ) as ResolvePagesPageDataOptions["runInFreshUnifiedContext"];
@@ -198,6 +451,7 @@ describe("pages page data", () => {
         },
         runInFreshUnifiedContext,
         triggerBackgroundRegeneration,
+        vinext: { hasMiddleware: true },
       }),
     );
 
@@ -235,6 +489,82 @@ describe("pages page data", () => {
       undefined,
       300,
     );
+    expect(isrSet).toHaveBeenCalledWith(
+      "pages:/posts/post",
+      expect.objectContaining({
+        kind: "PAGES",
+        html: expect.stringContaining('"__vinext":{"hasMiddleware":true}'),
+        pageData: { title: "fresh" },
+      }),
+      15,
+      undefined,
+      300,
+    );
+  });
+
+  it("preserves vinext module metadata during stale ISR regeneration", async () => {
+    let regenPromise: Promise<void> | null = null;
+    const isrSet = vi.fn<ResolvePagesPageDataOptions["isrSet"]>(async () => {});
+    const triggerBackgroundRegeneration = vi.fn((_key: string, renderFn: () => Promise<void>) => {
+      regenPromise = renderFn();
+    });
+
+    const result = await resolvePagesPageData(
+      createOptions({
+        isrGet: vi.fn().mockResolvedValue({
+          isStale: true,
+          value: {
+            lastModified: 1,
+            cacheState: "stale",
+            value: {
+              kind: "PAGES",
+              html: '<!DOCTYPE html><html><body><div id="__next"><main>stale 404</main></div><script>window.__NEXT_DATA__ = {"page":"/404","query":{},"props":{"pageProps":{"marker":"stale"}}}</script></body></html>',
+              pageData: { marker: "stale" },
+              headers: undefined,
+              status: 404,
+            },
+          },
+        }),
+        isrSet,
+        pageModule: {
+          async getStaticProps() {
+            return {
+              props: { marker: "fresh" },
+              revalidate: 60,
+            };
+          },
+        },
+        renderIsrPassToStringAsync: vi.fn(async () => "<main>fresh 404</main>"),
+        routePattern: "/404",
+        routeUrl: "/missing",
+        statusCode: 404,
+        triggerBackgroundRegeneration,
+        vinext: {
+          pageModuleUrl: "/assets/pages/404.js",
+          appModuleUrl: "/assets/pages/_app.js",
+        },
+      }),
+    );
+
+    expect(result.kind).toBe("response");
+    if (result.kind !== "response") {
+      throw new Error("expected response result");
+    }
+    expect(result.response.status).toBe(404);
+
+    if (!regenPromise) {
+      throw new Error("expected stale ISR regeneration to start");
+    }
+    const pendingRegen: Promise<void> = regenPromise;
+    await pendingRegen;
+
+    expect(isrSet).toHaveBeenCalledOnce();
+    const regeneratedCacheValue = isrSet.mock.calls[0]?.[1];
+    expect(regeneratedCacheValue?.html).toContain("<main>fresh 404</main>");
+    expect(regeneratedCacheValue?.html).toContain('"__vinext"');
+    expect(regeneratedCacheValue?.html).toContain('"pageModuleUrl":"/assets/pages/404.js"');
+    expect(regeneratedCacheValue?.html).toContain('"appModuleUrl":"/assets/pages/_app.js"');
+    expect(regeneratedCacheValue?.status).toBe(404);
   });
 
   it("uses stored cache-control metadata for Pages Router cached HIT responses", async () => {
@@ -271,6 +601,7 @@ describe("pages page data", () => {
       throw new Error("expected response result");
     }
     expect(result.response.headers.get("x-vinext-cache")).toBe("HIT");
+    expect(result.response.headers.get("x-nextjs-cache")).toBe("HIT");
     expect(result.response.headers.get("cache-control")).toBe(
       "s-maxage=15, stale-while-revalidate=285",
     );
@@ -295,6 +626,261 @@ describe("pages page data", () => {
       gsspRes: null,
       isrRevalidateSeconds: 30,
       pageProps: { title: "hello" },
+      isFallback: false,
     });
+  });
+
+  // Matches Next.js behavior: for non-dynamic routes, `params` in
+  // getServerSideProps context is null (not `{}`).
+  // Ported from Next.js: test/e2e/edge-pages-support/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/edge-pages-support/index.test.ts#L67-L77
+  it("passes params: null to getServerSideProps on non-dynamic routes", async () => {
+    let received: unknown = "untouched";
+    await resolvePagesPageData(
+      createOptions({
+        pageModule: {
+          async getServerSideProps(context) {
+            received = context.params;
+            return { props: {} };
+          },
+        },
+        params: {},
+        query: {},
+        route: { isDynamic: false },
+        routePattern: "/",
+        routeUrl: "/",
+      }),
+    );
+
+    expect(received).toBeNull();
+  });
+
+  it("passes the matched params object to getServerSideProps on dynamic routes", async () => {
+    let received: unknown = null;
+    await resolvePagesPageData(
+      createOptions({
+        pageModule: {
+          async getServerSideProps(context) {
+            received = context.params;
+            return { props: {} };
+          },
+        },
+        params: { id: "123" },
+        query: { id: "123" },
+        route: { isDynamic: true },
+        routePattern: "/[id]",
+        routeUrl: "/123",
+      }),
+    );
+
+    expect(received).toEqual({ id: "123" });
+  });
+
+  // `getStaticProps` receives `context.revalidateReason` describing why the
+  // function was called. Mirrors Next.js's render.tsx — see
+  // `.nextjs-ref/test/e2e/revalidate-reason/revalidate-reason.test.ts` for
+  // the authoritative tri-state assertions.
+  it("passes revalidateReason: 'build' to getStaticProps during build-time prerendering", async () => {
+    let received: unknown = "untouched";
+    await resolvePagesPageData(
+      createOptions({
+        isBuildTimePrerendering: true,
+        pageModule: {
+          async getStaticProps(context) {
+            received = context.revalidateReason;
+            return { props: {} };
+          },
+        },
+      }),
+    );
+
+    expect(received).toBe("build");
+  });
+
+  it("passes revalidateReason: 'on-demand' to getStaticProps when on-demand revalidation is signalled", async () => {
+    let received: unknown = "untouched";
+    await resolvePagesPageData(
+      createOptions({
+        isOnDemandRevalidate: true,
+        pageModule: {
+          async getStaticProps(context) {
+            received = context.revalidateReason;
+            return { props: {} };
+          },
+        },
+      }),
+    );
+
+    expect(received).toBe("on-demand");
+  });
+
+  it("passes revalidateReason: 'stale' to getStaticProps for runtime cache-miss requests", async () => {
+    let received: unknown = "untouched";
+    await resolvePagesPageData(
+      createOptions({
+        pageModule: {
+          async getStaticProps(context) {
+            received = context.revalidateReason;
+            return { props: {} };
+          },
+        },
+      }),
+    );
+
+    expect(received).toBe("stale");
+  });
+
+  it("passes revalidateReason: 'stale' to getStaticProps during stale-while-revalidate regeneration", async () => {
+    let received: unknown = "untouched";
+    let regenPromise: Promise<void> | null = null;
+    const runInFreshUnifiedContext = vi.fn(
+      async <T>(callback: () => Promise<T>): Promise<T> => callback(),
+    ) as ResolvePagesPageDataOptions["runInFreshUnifiedContext"];
+    const triggerBackgroundRegeneration = vi.fn((_key: string, renderFn: () => Promise<void>) => {
+      regenPromise = renderFn();
+    });
+
+    await resolvePagesPageData(
+      createOptions({
+        // Even when the dispatch itself is a build-time prerender, the SWR
+        // refresh path is still a stale regeneration — matches Next.js.
+        isBuildTimePrerendering: true,
+        isrGet: vi.fn().mockResolvedValue({
+          isStale: true,
+          value: {
+            lastModified: 1,
+            cacheState: "stale",
+            value: {
+              kind: "PAGES",
+              html: '<!DOCTYPE html><html><body><div id="__next"><div>stale</div></div><script>window.__NEXT_DATA__ = {}</script></body></html>',
+              pageData: {},
+              headers: undefined,
+              status: undefined,
+            },
+          },
+        }),
+        pageModule: {
+          async getStaticProps(context) {
+            received = context.revalidateReason;
+            return { props: {}, revalidate: 5 };
+          },
+        },
+        runInFreshUnifiedContext,
+        triggerBackgroundRegeneration,
+      }),
+    );
+
+    expect(triggerBackgroundRegeneration).toHaveBeenCalledOnce();
+    if (!regenPromise) {
+      throw new Error("expected stale regeneration to start");
+    }
+    const pendingRegen: Promise<void> = regenPromise;
+    await pendingRegen;
+
+    expect(received).toBe("stale");
+  });
+
+  // Mirrors Next.js's `isSerializableProps` check from render.tsx (~line 982).
+  // Without this validation vinext silently rendered an empty page for
+  // non-JSON values like `new Date()`. Tracked in vinext#1478.
+  // See .nextjs-ref/packages/next/src/lib/is-serializable-props.ts and the
+  // `non-json`/`non-json-blocking` cases in .nextjs-ref/test/e2e/prerender.test.ts.
+  it("throws a Next.js-style error when getStaticProps returns non-serializable props", async () => {
+    await expect(
+      resolvePagesPageData(
+        createOptions({
+          pageModule: {
+            async getStaticProps() {
+              return { props: { date: new Date(0) } };
+            },
+          },
+          routePattern: "/non-json",
+          routeUrl: "/non-json",
+        }),
+      ),
+    ).rejects.toThrow(
+      /Error serializing `\.date` returned from `getStaticProps` in "\/non-json"\.\s*Reason: `object` \("\[object Date\]"\) cannot be serialized as JSON/,
+    );
+  });
+
+  it("throws a Next.js-style error when getServerSideProps returns non-serializable props", async () => {
+    await expect(
+      resolvePagesPageData(
+        createOptions({
+          pageModule: {
+            async getServerSideProps() {
+              return { props: { fn: () => "nope" } };
+            },
+          },
+          routePattern: "/gssp-bad",
+          routeUrl: "/gssp-bad",
+        }),
+      ),
+    ).rejects.toThrow(
+      /Error serializing `\.fn` returned from `getServerSideProps` in "\/gssp-bad"\.\s*Reason: `function` cannot be serialized as JSON/,
+    );
+  });
+
+  // Redirect and notFound short-circuits must continue to work even if the
+  // page also returns `props` — mirrors Next.js, which only validates when
+  // !metadata.isRedirect && !metadata.isNotFound.
+  it("does not throw on getStaticProps redirect even when props would be invalid", async () => {
+    const result = await resolvePagesPageData(
+      createOptions({
+        pageModule: {
+          async getStaticProps() {
+            return { redirect: { destination: "/elsewhere", permanent: false } };
+          },
+        },
+      }),
+    );
+
+    expect(result.kind).toBe("response");
+    if (result.kind !== "response") throw new Error("expected response");
+    expect(result.response.status).toBe(307);
+    expect(result.response.headers.get("location")).toBe("/elsewhere");
+  });
+
+  // Matches Next.js behavior: for non-dynamic routes, `params` in
+  // getStaticProps context is null (not `{}`).
+  it("passes params: null to getStaticProps on non-dynamic routes", async () => {
+    let received: unknown = "untouched";
+    await resolvePagesPageData(
+      createOptions({
+        pageModule: {
+          async getStaticProps(context) {
+            received = context.params;
+            return { props: {} };
+          },
+        },
+        params: {},
+        query: {},
+        route: { isDynamic: false },
+        routePattern: "/",
+        routeUrl: "/",
+      }),
+    );
+
+    expect(received).toBeNull();
+  });
+
+  it("isResponseSent detects both headersSent and writableEnded", async () => {
+    const { isResponseSent } =
+      await import("../packages/vinext/src/server/pages-get-initial-props.js");
+
+    expect(isResponseSent({ headersSent: true })).toBe(true);
+    expect(isResponseSent({ writableEnded: true })).toBe(true);
+    expect(isResponseSent({ headersSent: true, writableEnded: true })).toBe(true);
+    expect(isResponseSent({ headersSent: false })).toBe(false);
+    expect(isResponseSent({ writableEnded: false })).toBe(false);
+    expect(isResponseSent({})).toBe(false);
+    expect(isResponseSent(undefined)).toBe(false);
+    expect(isResponseSent(null)).toBe(false);
+    // The prod PagesReqResResponse type only declares headersSent; the helper
+    // must not throw or treat the absent writableEnded as truthy.
+    const prodShaped: { headersSent: boolean } = { headersSent: false };
+    expect(isResponseSent(prodShaped)).toBe(false);
+    prodShaped.headersSent = true;
+    expect(isResponseSent(prodShaped)).toBe(true);
   });
 });

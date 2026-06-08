@@ -1,5 +1,4 @@
 import { createElement } from "react";
-import { markDynamicUsage, markRenderRequestApiUsage } from "vinext/shims/headers";
 import { makeThenableParams } from "vinext/shims/thenable-params";
 import { resolveActiveParallelRouteHeadInputs, resolveAppPageHead } from "./app-page-head.js";
 import {
@@ -10,13 +9,20 @@ import {
   type AppPageRouteWiringRoute,
   type AppPageSlotOverride,
 } from "./app-page-route-wiring.js";
-import { AppElementsWire, type AppElements, type AppElementsInterception } from "./app-elements.js";
+import { AppElementsWire, type AppElements } from "./app-elements.js";
 import type { AppPageParams } from "./app-page-boundary.js";
+import { DEFAULT_GLOBAL_ERROR_MODULE } from "./default-global-error-module.js";
 import { matchRoutePattern } from "../routing/route-pattern.js";
-import { normalizePathnameForRouteMatch } from "../routing/utils.js";
 import type { MetadataFileRoute } from "./metadata-routes.js";
-import { APP_RSC_RENDER_MODE_NAVIGATION, type AppRscRenderMode } from "./app-rsc-render-mode.js";
-import { isInterceptionMatchedUrlPath, normalizePath } from "./normalize-path.js";
+import {
+  APP_RSC_RENDER_MODE_NAVIGATION,
+  shouldSuppressLoadingBoundaries,
+  type AppRscRenderMode,
+} from "./app-rsc-render-mode.js";
+import type { AppLayoutParamAccessTracker } from "./app-layout-param-observation.js";
+import { createAppPageRenderIdentity } from "./app-page-render-identity.js";
+import { makeObservedAppPageSearchParamsThenable } from "./app-page-search-params-observation.js";
+import { shouldServeStreamingMetadata } from "./streaming-metadata.js";
 
 export type { AppPageErrorModule, AppPageRouteWiringRoute } from "./app-page-route-wiring.js";
 
@@ -78,11 +84,14 @@ export type BuildPageElementsOptions<
   rootUnauthorizedModule?: TModule | null;
   /** File-based metadata routes (favicon, manifest, sitemap, etc.). */
   metadataRoutes: readonly MetadataFileRoute[];
+  layoutParamAccess?: AppLayoutParamAccessTracker;
   /**
    * Configured next.config `basePath`. Threaded through `resolveAppPageHead`
    * so file-based metadata route URLs emitted in <head> are prefixed.
    */
   basePath?: string;
+  /** Serialized next.config `htmlLimitedBots` regexp source. */
+  htmlLimitedBots?: string;
 };
 
 /**
@@ -127,11 +136,14 @@ export async function buildPageElements<
   const pageModule: AppPageModule | null | undefined = route.page;
   const PageComponent = pageModule?.default;
   const hasPageModule = !!pageModule;
-  const interception = createAppPageInterceptionProof(routePath, opts);
+  const renderIdentity = createAppPageRenderIdentity({
+    displayPathname: routePath,
+    interceptionContext: opts?.interceptionContext ?? null,
+    interceptSourceMatchedUrl: opts?.interceptSourceMatchedUrl ?? null,
+    interceptSlotId: opts?.interceptSlotId ?? null,
+  });
 
   if (hasPageModule && !PageComponent) {
-    const interceptionContext = opts?.interceptionContext ?? null;
-    const noExportRouteId = AppElementsWire.encodeRouteId(routePath, interceptionContext);
     let noExportRootLayout: string | null = null;
     const noExportLayoutIds =
       route.ids?.layouts ??
@@ -146,18 +158,18 @@ export async function buildPageElements<
     }
     return {
       ...AppElementsWire.createMetadataEntries({
-        interception,
-        interceptionContext,
+        interception: renderIdentity.interception,
+        interceptionContext: renderIdentity.interceptionContext,
         layoutIds: noExportLayoutIds,
         rootLayoutTreePath: noExportRootLayout,
-        routeId: noExportRouteId,
+        routeId: renderIdentity.routeId,
       }),
-      [noExportRouteId]: createElement("div", null, "Page has no default export"),
+      [renderIdentity.routeId]: createElement("div", null, "Page has no default export"),
     };
   }
 
   const {
-    hasSearchParams,
+    hasDynamicMetadata,
     metadata: resolvedMetadata,
     pageSearchParams,
     viewport: resolvedViewport,
@@ -183,64 +195,55 @@ export async function buildPageElements<
   });
 
   const pageProps: Record<string, unknown> = { params: makeThenableParams(params) };
+  let pageSearchParamsThenable: unknown;
   if (searchParams) {
-    pageProps.searchParams = makeThenableParams(pageSearchParams);
-    if (hasSearchParams) {
-      markDynamicUsage();
-      markRenderRequestApiUsage("searchParams");
-    }
+    const shouldObservePageSearchParamsAccess =
+      !shouldSuppressLoadingBoundaries(renderMode) && Boolean(route.loading?.default);
+    pageSearchParamsThenable = shouldObservePageSearchParamsAccess
+      ? makeObservedAppPageSearchParamsThenable(pageSearchParams)
+      : makeThenableParams(pageSearchParams);
+    pageProps.searchParams = pageSearchParamsThenable;
   }
 
   const mountedSlotIds = mountedSlotsHeader ? new Set(mountedSlotsHeader.split(" ")) : null;
 
   const slotOverrides = buildSlotOverrides(route, params, routePath, opts);
+  const metadataPlacement =
+    hasDynamicMetadata &&
+    shouldServeStreamingMetadata(
+      pageRequest.request.headers.get("user-agent") ?? "",
+      options.htmlLimitedBots,
+    )
+      ? "body"
+      : "head";
 
   return buildAppPageElements({
     element: PageComponent ? createElement(PageComponent, pageProps) : null,
-    globalErrorModule: globalErrorModule ?? null,
+    // Fall back to vinext's built-in default global error module so that
+    // uncaught client render errors are caught by the route-level
+    // <ErrorBoundary> wrapper in app-page-route-wiring.tsx, mirroring
+    // Next.js's behavior when the user has not defined app/global-error.tsx.
+    globalErrorModule:
+      globalErrorModule ?? (DEFAULT_GLOBAL_ERROR_MODULE as unknown as TErrorModule),
     isRscRequest,
+    layoutParamAccess: options.layoutParamAccess,
     mountedSlotIds,
     makeThenableParams,
     matchedParams: params,
+    metadataPlacement,
     resolvedMetadata,
     resolvedMetadataPathname: routePath,
     resolvedViewport,
-    interceptionContext: opts?.interceptionContext ?? null,
-    interception,
+    renderIdentity,
     routePath,
     rootNotFoundModule: rootNotFoundModule ?? null,
     rootForbiddenModule: rootForbiddenModule ?? null,
     rootUnauthorizedModule: rootUnauthorizedModule ?? null,
     route,
+    searchParams: pageSearchParamsThenable,
     slotOverrides,
     renderMode,
   });
-}
-
-function createAppPageInterceptionProof<TModule extends AppPageModule>(
-  routePath: string,
-  opts?: AppPageInterceptOptions<TModule> | null,
-): AppElementsInterception | null {
-  const sourceMatchedUrl = normalizeInterceptionProofMatchedUrl(
-    opts?.interceptSourceMatchedUrl ?? null,
-  );
-  const targetMatchedUrl = normalizeInterceptionProofMatchedUrl(routePath);
-  const slotId = opts?.interceptSlotId ?? null;
-  if (sourceMatchedUrl === null || targetMatchedUrl === null || slotId === null) return null;
-
-  return {
-    sourceMatchedUrl,
-    sourceRouteId: AppElementsWire.encodeRouteId(sourceMatchedUrl, null),
-    slotId,
-    targetMatchedUrl,
-    targetRouteId: AppElementsWire.encodeRouteId(targetMatchedUrl, null),
-  };
-}
-
-function normalizeInterceptionProofMatchedUrl(value: string | null): string | null {
-  if (value === null || !isInterceptionMatchedUrlPath(value)) return null;
-
-  return normalizePath(normalizePathnameForRouteMatch(value));
 }
 
 /**

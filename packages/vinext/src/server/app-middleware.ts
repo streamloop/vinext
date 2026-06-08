@@ -20,9 +20,22 @@ export type ApplyAppMiddlewareOptions = {
   cleanPathname: string;
   context: AppMiddlewareContext;
   i18nConfig?: NextI18nConfig | null;
+  /**
+   * Whether the inbound request was a `_next/data` fetch. Captured from the
+   * raw incoming headers by the caller, because `x-nextjs-data` is in
+   * INTERNAL_HEADERS and is stripped before this function runs.
+   */
+  isDataRequest?: boolean;
   isProxy: boolean;
   module: MiddlewareModule;
   request: Request;
+  /**
+   * Forwarded to `executeMiddleware` so the NextRequest exposes a NextURL with
+   * the configured trailingSlash policy. This is what makes
+   * `NextResponse.redirect(request.nextUrl)` emit a Location that honours
+   * `trailingSlash`.
+   */
+  trailingSlash?: boolean;
 };
 
 export type ApplyAppMiddlewareResult =
@@ -224,10 +237,12 @@ export async function applyAppMiddleware(
     const result = await executeMiddleware({
       basePath: options.basePath,
       i18nConfig: options.i18nConfig,
+      isDataRequest: options.isDataRequest,
       isProxy: options.isProxy,
       module: options.module,
       normalizedPathname: cleanPathname,
       request: middlewareRequest,
+      trailingSlash: options.trailingSlash,
     });
 
     if (!result.continue) {

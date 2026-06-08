@@ -48,13 +48,17 @@ describe("app page stream helpers", () => {
       getStyles: () => [],
     });
 
-    const htmlStream = await renderAppPageHtmlStream({
+    const { htmlStream } = await renderAppPageHtmlStream({
       fontData,
-      navigationContext: { pathname: "/test" },
+      navigationContext: { pathname: "/test", searchParams: new URLSearchParams(), params: {} },
       rscStream: createStream(["flight"]),
       ssrHandler: {
         async handleSsr(_rscStream, navigationContext, receivedFontData) {
-          expect(navigationContext).toEqual({ pathname: "/test" });
+          expect(navigationContext).toEqual({
+            pathname: "/test",
+            searchParams: new URLSearchParams(),
+            params: {},
+          });
           expect(receivedFontData).toEqual(fontData);
           return createStream(["<html>ok</html>"]);
         },
@@ -67,7 +71,7 @@ describe("app page stream helpers", () => {
   it("forwards waitForAllReady to the SSR handler", async () => {
     const ssrHandler = vi.fn(async () => createStream(["<html>all-ready</html>"]));
 
-    const htmlStream = await renderAppPageHtmlStream({
+    const { htmlStream } = await renderAppPageHtmlStream({
       fontData: createAppPageFontData({
         getLinks: () => [],
         getPreloads: () => [],
@@ -93,7 +97,7 @@ describe("app page stream helpers", () => {
     const formState = ["action-result", "key-path", "reference-id", 1] as never;
     const ssrHandler = vi.fn(async () => createStream(["<html>form-state</html>"]));
 
-    const htmlStream = await renderAppPageHtmlStream({
+    const { htmlStream } = await renderAppPageHtmlStream({
       fontData: createAppPageFontData({
         getLinks: () => [],
         getPreloads: () => [],
@@ -117,7 +121,7 @@ describe("app page stream helpers", () => {
   it("forwards basePath to the SSR handler", async () => {
     const ssrHandler = vi.fn(async () => createStream(["<html>base-path</html>"]));
 
-    const htmlStream = await renderAppPageHtmlStream({
+    const { htmlStream } = await renderAppPageHtmlStream({
       basePath: "/docs",
       fontData: createAppPageFontData({
         getLinks: () => [],
@@ -380,5 +384,40 @@ describe("app page stream helpers", () => {
         hasLocalBoundary: false,
       }),
     ).toBe(false);
+  });
+
+  it("emits the `x-edge-runtime: 1` marker on HTML stream responses for edge-runtime routes", async () => {
+    const response = await renderAppPageHtmlResponse({
+      clearRequestContext: vi.fn(),
+      fontData: { links: [], preloads: [], styles: [] },
+      isEdgeRuntime: true,
+      navigationContext: null,
+      rscStream: createStream(["flight"]),
+      ssrHandler: {
+        async handleSsr() {
+          return createStream(["<html>page</html>"]);
+        },
+      },
+      status: 200,
+    });
+
+    expect(response.headers.get("x-edge-runtime")).toBe("1");
+  });
+
+  it("omits the `x-edge-runtime` marker on HTML stream responses for nodejs-runtime routes", async () => {
+    const response = await renderAppPageHtmlResponse({
+      clearRequestContext: vi.fn(),
+      fontData: { links: [], preloads: [], styles: [] },
+      navigationContext: null,
+      rscStream: createStream(["flight"]),
+      ssrHandler: {
+        async handleSsr() {
+          return createStream(["<html>page</html>"]);
+        },
+      },
+      status: 200,
+    });
+
+    expect(response.headers.get("x-edge-runtime")).toBeNull();
   });
 });

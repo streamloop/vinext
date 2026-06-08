@@ -1,5 +1,6 @@
 import type { RouteManifest, RouteManifestInterception } from "../routing/app-route-graph.js";
 import { isUnknownRecord } from "../utils/record.js";
+import type { AppRouterScrollIntent } from "vinext/shims/app-router-scroll-state";
 
 export type NavigationRuntimeSnapshot = {
   pathname: string;
@@ -15,11 +16,11 @@ export type NavigationRuntimeRscBootstrap = {
   rsc: NavigationRuntimeRscChunk[];
 };
 
-export type NavigationRuntimeKind = "navigate" | "traverse" | "refresh";
+type NavigationRuntimeKind = "navigate" | "traverse" | "refresh";
 
-export type NavigationRuntimeHistoryUpdateMode = "push" | "replace";
+type NavigationRuntimeHistoryUpdateMode = "push" | "replace";
 
-export type NavigationRuntimeTraversalIntent = {
+type NavigationRuntimeTraversalIntent = {
   direction: "back" | "forward" | "unknown";
   historyState: unknown;
   targetHistoryIndex: number | null;
@@ -33,6 +34,7 @@ export type NavigationRuntimeNavigate = (
   previousNextUrlOverride?: string | null,
   programmaticTransition?: boolean,
   traversalIntent?: NavigationRuntimeTraversalIntent,
+  scrollIntent?: AppRouterScrollIntent | null,
 ) => Promise<void>;
 
 export type NavigationRuntimeFunctions = {
@@ -42,6 +44,10 @@ export type NavigationRuntimeFunctions = {
     historyUpdateMode: NavigationRuntimeHistoryUpdateMode,
     scroll: boolean,
   ) => void;
+  navigateExternal?: (
+    href: string,
+    historyUpdateMode: NavigationRuntimeHistoryUpdateMode,
+  ) => Promise<void>;
   navigate?: NavigationRuntimeNavigate;
   pingVisibleLinks?: () => void;
 };
@@ -94,6 +100,7 @@ function isNavigationRuntimeFunctions(value: unknown): value is NavigationRuntim
   return (
     isOptionalRuntimeFunction(Reflect.get(value, "clearNavigationCaches")) &&
     isOptionalRuntimeFunction(Reflect.get(value, "commitHashNavigation")) &&
+    isOptionalRuntimeFunction(Reflect.get(value, "navigateExternal")) &&
     isOptionalRuntimeFunction(Reflect.get(value, "navigate")) &&
     isOptionalRuntimeFunction(Reflect.get(value, "pingVisibleLinks"))
   );
@@ -303,4 +310,20 @@ export function subscribeNavigationRuntimeRscChunk(
 
 export function hasAppNavigationRuntime(): boolean {
   return typeof getNavigationRuntime()?.functions.navigate === "function";
+}
+
+/**
+ * True when the App Router has installed its runtime bootstrap on `window`,
+ * which the inline runtime-metadata script does synchronously in `<head>`.
+ *
+ * This is a stronger early-life signal than `hasAppNavigationRuntime()` — the
+ * latter checks for the fully-wired `navigate` function and so returns false
+ * during the brief window between HTML parse and the bootstrap module
+ * finishing initialization. Code that needs to differentiate App Router from
+ * Pages Router *during hydration* (e.g. the Script shim deciding whether the
+ * server-side pre-head splice already emitted the inline beforeInteractive
+ * tag) should call this instead.
+ */
+export function hasAppNavigationRuntimeBootstrap(): boolean {
+  return getNavigationRuntime() !== null;
 }

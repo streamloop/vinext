@@ -5,10 +5,17 @@
  * (prod-server.ts) so both apply next.config.js rules identically.
  */
 
-import type { NextRedirect, NextRewrite, NextHeader, HasCondition } from "./next-config.js";
+import type {
+  NextI18nConfig,
+  NextRedirect,
+  NextRewrite,
+  NextHeader,
+  HasCondition,
+} from "./next-config.js";
 import {
   MIDDLEWARE_HEADER_PREFIX,
   VINEXT_MW_CTX_HEADER,
+  VINEXT_PRERENDER_ROUTE_PARAMS_HEADER,
   VINEXT_PRERENDER_SECRET_HEADER,
 } from "../server/headers.js";
 import { buildRequestHeadersFromMiddlewareResponse } from "../server/middleware-request-headers.js";
@@ -117,14 +124,26 @@ function getCachedRegex<K, V>(cache: Map<K, V | null>, key: K, compile: () => V 
  * in the array are still checked first.
  */
 
-/** Matches `/:param(alternation)?/static/suffix` — the locale-static pattern. */
-const _LOCALE_STATIC_RE = /^\/:[\w-]+\(([^)]+)\)\?\/([a-zA-Z0-9_~.%@!$&'*+,;=:/-]+)$/;
+/**
+ * Matches `/:param(alternation)?/static/suffix` — the locale-static pattern.
+ *
+ * The `?` after the capture group is itself optional so that both forms are
+ * detected:
+ *   - `/:locale(en|fr)?/foo` (locale segment optional — user-written rules)
+ *   - `/:nextInternalLocale(en|fr)/foo` (locale segment mandatory — emitted
+ *      by `applyLocaleToRoutes` for the locale-capture variant)
+ * Both forms benefit from O(1) suffix lookup; the optionality is recorded
+ * on the entry so we know whether to try the no-locale-prefix bucket.
+ */
+const _LOCALE_STATIC_RE = /^\/:[\w-]+\(([^)]+)\)(\??)\/([a-zA-Z0-9_~.%@!$&'*+,;=:/-]+)$/;
 
 type LocaleStaticEntry = {
   /** The param name extracted from the source (e.g. "locale"). */
   paramName: string;
   /** The compiled regex matching just the alternation, used at match time. */
   altRe: RegExp;
+  /** Whether the locale segment is optional (the source had `?` after the group). */
+  optional: boolean;
   /** The original redirect rule. */
   redirect: NextRedirect;
   /** Position of this rule in the original redirects array. */
@@ -163,7 +182,8 @@ function _getRedirectIndex(redirects: NextRedirect[]): RedirectIndex {
     if (m) {
       const paramName = redirect.source.slice(2, redirect.source.indexOf("("));
       const alternation = m[1];
-      const suffix = "/" + m[2]; // e.g. "/security"
+      const optional = m[2] === "?";
+      const suffix = "/" + m[3]; // e.g. "/security"
       // Build a small regex to validate the captured locale value against the
       // alternation. Using anchored match to avoid partial matches.
       // The alternation comes from user config; run it through safeRegExp to
@@ -174,7 +194,13 @@ function _getRedirectIndex(redirects: NextRedirect[]): RedirectIndex {
         linear.push([i, redirect]);
         continue;
       }
-      const entry: LocaleStaticEntry = { paramName, altRe, redirect, originalIndex: i };
+      const entry: LocaleStaticEntry = {
+        paramName,
+        altRe,
+        optional,
+        redirect,
+        originalIndex: i,
+      };
       const bucket = localeStatic.get(suffix);
       if (bucket) {
         bucket.push(entry);
@@ -454,6 +480,49 @@ export type RequestContext = {
 };
 
 /**
+ * basePath gating state passed alongside the pathname to every matcher.
+ *
+ * Rewrites/redirects/headers run with default `basePath: true` semantics in
+ * Next.js: the rule only matches when the inbound request was under the
+ * configured `basePath`. Rules with `basePath: false` opt out and match
+ * the original (un-stripped) pathname regardless of prefix.
+ *
+ * When `basePath` is empty (not configured) every rule is treated as
+ * basePath-defaulted: every request matches.
+ *
+ * @see .nextjs-ref/packages/next/src/lib/load-custom-routes.ts:198-220
+ */
+export type BasePathMatchState = {
+  /** Configured `basePath` (without trailing slash) or "" when unset. */
+  basePath: string;
+  /**
+   * True when the inbound request was originally under `basePath` (i.e.
+   * the prod-server/handler stripped the prefix before the matcher runs).
+   * Ignored when `basePath` is empty.
+   */
+  hadBasePath: boolean;
+};
+
+const _BASEPATH_DEFAULT: BasePathMatchState = { basePath: "", hadBasePath: true };
+
+/**
+ * Decide whether a rule should be evaluated at all given the current
+ * basePath-gating state.
+ *
+ * Encodes the Next.js rules:
+ *   - basePath: false rule → only when the request was NOT under basePath
+ *     (i.e. it's the explicit opt-out path). When `basePath` itself is
+ *     empty, basePath: false rules are still allowed to match — there's
+ *     just no basePath to gate them.
+ *   - default rule (basePath !== false) → only when the request WAS under
+ *     basePath (or no basePath is configured).
+ */
+function shouldEvaluateRule(ruleBasePath: false | undefined, state: BasePathMatchState): boolean {
+  if (!state.basePath) return true;
+  return ruleBasePath === false ? !state.hadBasePath : state.hadBasePath;
+}
+
+/**
  * Parse a Cookie header string into a key-value record.
  */
 export function parseCookies(cookieHeader: string | null): Record<string, string> {
@@ -679,10 +748,37 @@ function extractConstraint(str: string, re: RegExp): string | null {
  *   (regex)    - inline regex patterns in the source
  *   :param(constraint) - named param with inline regex constraint
  */
+/**
+ * Strip a single trailing slash from a pathname for config-source matching.
+ *
+ * Next.js conditionally appends `(/)?` to rewrite/redirect/header source
+ * regexes when `trailingSlash: true` (see Next.js
+ * `resolve-rewrites.ts` and `server-utils.ts:checkRewrite`). Rather than
+ * threading the trailingSlash flag through every matcher, we unconditionally
+ * strip a trailing slash from the incoming pathname. When `trailingSlash: false`
+ * the request pipeline emits a normalizing redirect (step 3) before config
+ * rewrites/redirects (step 6) ever run, so the pathname is already slash-free;
+ * the unconditional strip is defense-in-depth for that ordering. When
+ * `trailingSlash: true` it bridges the gap between the canonicalized request
+ * path (`/rewrite-1/`) and source patterns written without a trailing slash
+ * (`/rewrite-1`).
+ *
+ * The root path `"/"` is preserved as-is.
+ */
+function stripTrailingSlashForConfigMatch(pathname: string): string {
+  return pathname.length > 1 && pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
+}
+
 export function matchConfigPattern(
   pathname: string,
   pattern: string,
 ): Record<string, string> | null {
+  // See `stripTrailingSlashForConfigMatch` — the source pattern itself is left
+  // unchanged because catch-all patterns (`:param*` / `:param+`) and the root
+  // `/` already consume any trailing slash; stripping the pattern would change
+  // those semantics.
+  pathname = stripTrailingSlashForConfigMatch(pathname);
+
   // If the pattern contains regex groups like (\d+) or (.*), use regex matching.
   // Also enter this branch when a catch-all parameter (:param* or :param+) is
   // followed by a literal suffix (e.g. "/:path*.md"). Without this, the suffix
@@ -691,11 +787,23 @@ export function matchConfigPattern(
   // The last condition catches simple params with literal suffixes (e.g. "/:slug.md")
   // where the param name is followed by a dot — the simple matcher would treat
   // "slug.md" as the param name and match any single segment regardless of suffix.
+  // Enter the full regex branch when:
+  //   - the pattern uses explicit regex groups or escapes,
+  //   - a catch-all (`:foo*` / `:foo+`) is followed by a literal suffix that
+  //     the simple catch-all branch cannot express,
+  //   - a named param is followed by a dot (the simple branch would treat
+  //     "slug.md" as the whole param name),
+  //   - the pattern has multiple named params and any of them is a catch-all
+  //     (e.g. `/:locale/files/:path*`). The simple catch-all branch only
+  //     handles trailing-catch-all-with-static-prefix; mixed cases need regex.
+  const catchAllAnchor = /:[\w-]+[*+]/.test(pattern);
+  const namedParamCount = (pattern.match(/:[\w-]+/g) || []).length;
   if (
     pattern.includes("(") ||
     pattern.includes("\\") ||
     /:[\w-]+[*+][^/]/.test(pattern) ||
-    /:[\w-]+\./.test(pattern)
+    /:[\w-]+\./.test(pattern) ||
+    (catchAllAnchor && namedParamCount > 1)
   ) {
     try {
       // Look up the compiled regex in the module-level cache. Patterns come
@@ -833,8 +941,15 @@ export function matchRedirect(
   pathname: string,
   redirects: NextRedirect[],
   ctx: RequestContext,
+  basePathState: BasePathMatchState = _BASEPATH_DEFAULT,
 ): { destination: string; permanent: boolean } | null {
   if (redirects.length === 0) return null;
+
+  // Strip trailing slash so the locale-static fast path (Map.get on the
+  // pathname) matches keys derived from slash-free source patterns. The
+  // linear fallback also passes through `matchConfigPattern` which strips
+  // again, but normalizing once here keeps both paths consistent.
+  pathname = stripTrailingSlashForConfigMatch(pathname);
 
   const index = _getRedirectIndex(redirects);
 
@@ -856,11 +971,17 @@ export function matchRedirect(
 
   if (index.localeStatic.size > 0) {
     // Case 1: no locale prefix — pathname IS the suffix.
+    // Only valid for entries whose source had `?` after the alternation
+    // (the locale segment was optional). Mandatory-locale entries — emitted
+    // by `applyLocaleToRoutes` as `/:nextInternalLocale(en|fr)/foo` — must
+    // not match here because they require the locale segment to be present.
     const noLocaleBucket = index.localeStatic.get(pathname);
     if (noLocaleBucket) {
       for (const entry of noLocaleBucket) {
+        if (!entry.optional) continue; // mandatory-locale rule — skip
         if (entry.originalIndex >= localeMatchIndex) continue; // already have a better match
         const redirect = entry.redirect;
+        if (!shouldEvaluateRule(redirect.basePath, basePathState)) continue;
         const conditionParams =
           redirect.has || redirect.missing
             ? collectConditionParams(redirect.has, redirect.missing, ctx)
@@ -891,6 +1012,7 @@ export function matchRedirect(
           // Validate that `localePart` is one of the allowed alternation values.
           if (!entry.altRe.test(localePart)) continue;
           const redirect = entry.redirect;
+          if (!shouldEvaluateRule(redirect.basePath, basePathState)) continue;
           const conditionParams =
             redirect.has || redirect.missing
               ? collectConditionParams(redirect.has, redirect.missing, ctx)
@@ -918,6 +1040,7 @@ export function matchRedirect(
       // the locale-static match wins. Stop scanning.
       break;
     }
+    if (!shouldEvaluateRule(redirect.basePath, basePathState)) continue;
     const params = matchConfigPattern(pathname, redirect.source);
     if (params) {
       const conditionParams =
@@ -950,8 +1073,10 @@ export function matchRewrite(
   pathname: string,
   rewrites: NextRewrite[],
   ctx: RequestContext,
+  basePathState: BasePathMatchState = _BASEPATH_DEFAULT,
 ): string | null {
   for (const rewrite of rewrites) {
+    if (!shouldEvaluateRule(rewrite.basePath, basePathState)) continue;
     const params = matchConfigPattern(pathname, rewrite.source);
     if (params) {
       const conditionParams =
@@ -1095,6 +1220,7 @@ export async function proxyExternalRequest(
   // external rewrite destinations. It authorizes hidden production endpoints
   // used only by vinext's own prerender pipeline.
   headers.delete(VINEXT_PRERENDER_SECRET_HEADER);
+  headers.delete(VINEXT_PRERENDER_ROUTE_PARAMS_HEADER);
   // Internal App Router dev middleware context must never leave the dev server.
   headers.delete(VINEXT_MW_CTX_HEADER);
 
@@ -1166,9 +1292,16 @@ export function matchHeaders(
   pathname: string,
   headers: NextHeader[],
   ctx: RequestContext,
+  basePathState: BasePathMatchState = _BASEPATH_DEFAULT,
 ): Array<{ key: string; value: string }> {
+  // Header source regexes are compiled without a trailing-slash tolerance,
+  // so the incoming pathname must be normalized the same way config rewrites
+  // and redirects are. See `stripTrailingSlashForConfigMatch`.
+  pathname = stripTrailingSlashForConfigMatch(pathname);
+
   const result: Array<{ key: string; value: string }> = [];
   for (const rule of headers) {
+    if (!shouldEvaluateRule(rule.basePath, basePathState)) continue;
     // Cache the compiled source regex — escapeHeaderSource() + safeRegExp() are
     // pure functions of rule.source and the result never changes between requests.
     const sourceRegex = getCachedRegex(_compiledHeaderSourceCache, rule.source, () =>
@@ -1184,4 +1317,119 @@ export function matchHeaders(
     }
   }
   return result;
+}
+
+/**
+ * Escape a string for inclusion in a regex character class / alternation.
+ * Mirrors `escape-string-regexp` semantics used by Next.js's processRoutes.
+ */
+function _escapeRegexString(value: string): string {
+  return value.replace(/[|\\{}()[\]^$+*?.]/g, "\\$&");
+}
+
+/**
+ * Apply Next.js i18n locale-prefix transformation to a set of redirect or
+ * rewrite rules. Mirrors the relevant slice of Next.js's `processRoutes`
+ * (load-custom-routes.ts) with one deliberate divergence noted below.
+ *
+ * For each rule:
+ *   - If `locale === false` or no i18n is configured, the rule is emitted
+ *     untouched. This is the core of issue #1336 item 1: with `locale: false`
+ *     the user-supplied source is matched against the raw locale-prefixed
+ *     URL so a `:locale` segment in the source captures the prefix itself.
+ *   - Otherwise an internal locale-capture variant is produced whose source
+ *     starts with `/:nextInternalLocale(en|sv|nl)` so that locale-prefixed
+ *     URLs match. For redirects only, a second variant prefixed with
+ *     `/${defaultLocale}` is also emitted, matching Next.js exactly.
+ *   - **Vinext divergence**: we ALSO retain the original (unprefixed) source
+ *     so that requests for the default locale that arrive without a prefix
+ *     still match. Next.js solves this upstream by path-normalising every
+ *     incoming default-locale request to include the prefix
+ *     (`resolve-routes.ts` lines ~251-263); vinext currently does that
+ *     normalisation only inside the pages-server-entry route matcher, so
+ *     the rewrite/redirect matcher would otherwise miss unprefixed paths.
+ *     Keeping the unprefixed variant gives functionally identical behaviour
+ *     without requiring a server-wide path normalisation pass. The original
+ *     source is appended LAST so the locale-aware variants win when both
+ *     forms could match.
+ *
+ * Destinations that are local (start with `/`) are similarly rewritten with
+ * `/:nextInternalLocale` for the locale-capture variant so the locale
+ * survives the rewrite/redirect target.
+ *
+ * Mirrors the Next.js reference in
+ * packages/next/src/lib/load-custom-routes.ts — see `processRoutes`.
+ */
+export function applyLocaleToRoutes<T extends NextRedirect | NextRewrite>(
+  routes: T[],
+  i18n: NextI18nConfig | null | undefined,
+  type: "redirect" | "rewrite",
+  options: { trailingSlash?: boolean } = {},
+): T[] {
+  if (!i18n || routes.length === 0) return routes;
+
+  const trailingSlash = options.trailingSlash ?? false;
+  const localesAlternation = i18n.locales.map(_escapeRegexString).join("|");
+  const internalLocale = `/:nextInternalLocale(${localesAlternation})`;
+
+  // Mirrors Next.js: the root source `"/"` is collapsed to `""` only when
+  // `trailingSlash` is unset. With `trailingSlash: true` the source is
+  // preserved so the emitted variant is `/:nextInternalLocale(en|fr)/`
+  // rather than `/:nextInternalLocale(en|fr)`.
+  const suffixFor = (source: string): string => (source === "/" && !trailingSlash ? "" : source);
+
+  // For redirects, Next.js emits a per-default-locale literal variant
+  // (so that `/${defaultLocale}/old` redirects to the unprefixed destination
+  // and the default locale is implicitly stripped). For rewrites Next.js
+  // emits only the `:nextInternalLocale` form. We mirror that distinction.
+  //
+  // The list is a single-element array today; domain-locale support (which
+  // Next.js wires up alongside `i18n.domains`) will append each domain's
+  // `defaultLocale` here once vinext mirrors that branch — tracked as part
+  // of #1336's follow-ups.
+  const defaultLocales: string[] = type === "redirect" ? [i18n.defaultLocale] : [];
+
+  const out: T[] = [];
+  for (const r of routes) {
+    if (r.locale === false) {
+      out.push(r);
+      continue;
+    }
+
+    // Destinations may be absolute URLs (external) — Next.js skips the
+    // locale-prefix injection on external destinations.
+    const isExternal = !!r.destination && !r.destination.startsWith("/");
+
+    // For each default locale, emit a literal `/${locale}/...` variant
+    // whose destination does NOT carry a locale prefix (Next.js parity).
+    if (!isExternal) {
+      for (const locale of defaultLocales) {
+        const localizedSource = `/${locale}${suffixFor(r.source)}`;
+        out.push({
+          ...r,
+          source: localizedSource,
+        });
+      }
+    }
+
+    // Emit the `:nextInternalLocale` variant that matches all locales.
+    const internalSource = `${internalLocale}${suffixFor(r.source)}`;
+    let internalDestination = r.destination;
+    if (internalDestination && internalDestination.startsWith("/") && !isExternal) {
+      internalDestination = `/:nextInternalLocale${
+        internalDestination === "/" && !trailingSlash ? "" : internalDestination
+      }`;
+    }
+    out.push({
+      ...r,
+      source: internalSource,
+      destination: internalDestination,
+    });
+
+    // Retain the original unprefixed source as a fallback so default-locale
+    // requests that arrive without a prefix (e.g. `/old`) still match.
+    // See the docblock above for why this differs from upstream Next.js.
+    out.push(r);
+  }
+  return out;
 }

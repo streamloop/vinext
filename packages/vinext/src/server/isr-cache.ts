@@ -14,21 +14,22 @@
  */
 
 import {
-  getCacheHandler,
   type CacheHandlerValue,
   type IncrementalCacheValue,
   type CachedPagesValue,
   type CachedAppPageValue,
 } from "vinext/shims/cache";
+import { getCdnCacheAdapter } from "vinext/shims/cdn-cache";
 import { fnv1a64 } from "../utils/hash.js";
 import { getRequestExecutionContext } from "vinext/shims/request-context";
 import { reportRequestError, type OnRequestErrorContext } from "./instrumentation.js";
 import { normalizeMountedSlotsHeader } from "./app-mounted-slots-header.js";
 import {
   APP_RSC_RENDER_MODE_NAVIGATION,
-  shouldUsePreserveUiCacheVariant,
+  getRscRenderModeCacheVariant,
   type AppRscRenderMode,
 } from "./app-rsc-render-mode.js";
+import { normalizeAppPageInterceptionProofPathname } from "./app-page-render-identity.js";
 import type { RenderObservation } from "./cache-proof.js";
 export { normalizeMountedSlotsHeader };
 
@@ -45,8 +46,9 @@ export type ISRCacheEntry = {
  * or null for cache misses.
  */
 export async function isrGet(key: string): Promise<ISRCacheEntry | null> {
-  const handler = getCacheHandler();
-  const result = await handler.get(key);
+  // Page-level reads go through the CDN cache adapter. The default adapter
+  // reads the data cache; an edge adapter may return null so the CDN serves.
+  const result = await getCdnCacheAdapter().get(key);
   if (!result || !result.value) return null;
   // Built-in handlers hard-delete expired entries and return null, but custom
   // CacheHandler implementations may surface expiry explicitly.
@@ -68,8 +70,7 @@ export async function isrSet(
   tags?: string[],
   expireSeconds?: number,
 ): Promise<void> {
-  const handler = getCacheHandler();
-  await handler.set(key, data, {
+  await getCdnCacheAdapter().set(key, data, {
     cacheControl:
       expireSeconds === undefined
         ? { revalidate: revalidateSeconds }
@@ -79,6 +80,49 @@ export async function isrSet(
     revalidate: revalidateSeconds,
     tags: tags ?? [],
   });
+}
+
+export async function isrSetPrerenderedAppPage(
+  key: string,
+  data: CachedAppPageValue,
+  metadata: {
+    expireSeconds?: number;
+    revalidateSeconds?: number;
+    /**
+     * Implicit/path tags to attach to the seeded entry. Required so that
+     * `revalidatePath()` (and `revalidateTag()`) can invalidate prerender-seeded
+     * cache entries — without tags the entry is unreachable by tag-based
+     * invalidation and remains stale until natural `revalidateAt` expiry.
+     * See cloudflare/vinext#1486.
+     */
+    tags?: string[];
+  },
+): Promise<void> {
+  const revalidateSeconds = metadata.revalidateSeconds;
+  const tags = metadata.tags;
+  if (process.env.NEXT_PRIVATE_DEBUG_CACHE) {
+    console.debug("[vinext] ISR: seed", key);
+  }
+  // Route page-level seeding through the CDN cache adapter (default adapter
+  // writes the data cache; edge adapters no-op). Merge in main's tag support
+  // (cloudflare/vinext#1486) so prerender-seeded entries are reachable by
+  // revalidatePath()/revalidateTag().
+  const ctx: Record<string, unknown> = {};
+  if (revalidateSeconds !== undefined) {
+    ctx.revalidate = revalidateSeconds;
+    ctx.cacheControl =
+      metadata.expireSeconds === undefined
+        ? { revalidate: revalidateSeconds }
+        : { revalidate: revalidateSeconds, expire: metadata.expireSeconds };
+  }
+  if (tags && tags.length > 0) {
+    ctx.tags = tags;
+  }
+  await getCdnCacheAdapter().set(key, data, ctx);
+
+  if (revalidateSeconds !== undefined) {
+    setRevalidateDuration(key, revalidateSeconds);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +161,9 @@ export function triggerBackgroundRegeneration(
     routeType: OnRequestErrorContext["routeType"];
   },
 ): void {
+  // Edge-managed CDN adapters revalidate by re-requesting the origin, so the
+  // origin must not also run in-process regeneration.
+  if (!getCdnCacheAdapter().ownsBackgroundRevalidation) return;
   if (pendingRegenerations.has(key)) return;
 
   const promise = renderFn()
@@ -207,7 +254,7 @@ function buildCacheKey(prefix: string, pathname: string, suffix?: string): strin
  * Compute an ISR cache key for a given router type and pathname.
  * Long pathnames are hashed to stay within KV key-length limits (512 bytes).
  */
-export function isrCacheKey(router: "pages" | "app", pathname: string, buildId?: string): string {
+export function isrCacheKey(router: string, pathname: string, buildId?: string): string {
   const prefix = buildId ? `${router}:${buildId}` : router;
   return buildCacheKey(prefix, pathname);
 }
@@ -232,23 +279,35 @@ export function appIsrHtmlKey(pathname: string): string {
   return appIsrCacheKey(pathname, "html");
 }
 
+function normalizeInterceptionContextForCacheKey(interceptionContext: string): string | null {
+  return normalizeAppPageInterceptionProofPathname(interceptionContext);
+}
+
 /**
  * Build the ISR cache key for an RSC payload.
  *
- * Note: the key format changed from `rsc:<hash>` to `rsc:slots:<hash>` (and
- * optionally `rsc:slots:<hash>:preserve-ui`). Existing cached entries under
- * the old format will become unreachable after deployment. This is acceptable
- * because ISR entries have TTLs and will be regenerated on the next request.
+ * Variants are sequenced in order: `source:<hash>` (intercepted source context,
+ * only when an interception context is present), `slots:<hash>` (mounted parallel
+ * route slots), and optionally `<render-mode-variant>` (e.g. `preserve-ui` or
+ * `prefetch-loading-shell`). Existing cached entries under the old format will
+ * become unreachable after deployment. This is acceptable because ISR entries
+ * have TTLs and will be regenerated on the next request.
  */
 export function appIsrRscKey(
   pathname: string,
   mountedSlotsHeader?: string | null,
   renderMode: AppRscRenderMode = APP_RSC_RENDER_MODE_NAVIGATION,
+  interceptionContext?: string | null,
 ): string {
   const normalizedMountedSlotsHeader = normalizeMountedSlotsHeader(mountedSlotsHeader);
+  const sourceVariant =
+    interceptionContext === undefined || interceptionContext === null
+      ? null
+      : normalizeInterceptionContextForCacheKey(interceptionContext);
   const variant = [
+    sourceVariant ? `source:${fnv1a64(sourceVariant)}` : null,
     normalizedMountedSlotsHeader ? `slots:${fnv1a64(normalizedMountedSlotsHeader)}` : null,
-    shouldUsePreserveUiCacheVariant(renderMode) ? "preserve-ui" : null,
+    getRscRenderModeCacheVariant(renderMode),
   ]
     .filter((part) => part !== null)
     .join(":");

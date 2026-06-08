@@ -108,6 +108,36 @@ describe("pagesRouter - route discovery", () => {
     expect(patterns).not.toContain("/_error");
   });
 
+  // Ported from Next.js: test/e2e/app-dir/underscore-ignore-app-paths
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/underscore-ignore-app-paths/underscore-ignore-app-paths.test.ts
+  it("serves pages/_foo.tsx even when app/ also exists", async () => {
+    await withTempDir("vinext-pages-underscore-mixed-", async (tmpDir) => {
+      const pagesDir = path.join(tmpDir, "pages");
+      const appDir = path.join(tmpDir, "app");
+      await mkdir(pagesDir, { recursive: true });
+      await mkdir(appDir, { recursive: true });
+      await writeFile(path.join(pagesDir, "_dashboard.tsx"), EMPTY_PAGE);
+      await writeFile(path.join(pagesDir, "_hidden.tsx"), EMPTY_PAGE);
+      await writeFile(path.join(pagesDir, "index.tsx"), EMPTY_PAGE);
+      await writeFile(path.join(appDir, "page.tsx"), EMPTY_PAGE);
+
+      invalidateRouteCache(pagesDir);
+      const routes = await pagesRouter(pagesDir);
+      const patterns = routes.map((r) => r.pattern);
+
+      // Pages Router: underscore-prefixed pages SHOULD be discovered
+      expect(patterns).toContain("/_dashboard");
+      expect(patterns).toContain("/_hidden");
+      expect(patterns).toContain("/");
+
+      // App Router: underscore-prefixed folders should still be ignored
+      invalidateAppRouteCache();
+      const appRoutes = await appRouter(appDir);
+      const appPatterns = appRoutes.map((r) => r.pattern);
+      expect(appPatterns).toContain("/");
+    });
+  });
+
   it("rejects non-terminal catch-all routes during discovery", async () => {
     await withTempDir("vinext-pages-nonterminal-catchall-", async (tmpDir) => {
       const pagesDir = path.join(tmpDir, "pages");
@@ -307,6 +337,56 @@ describe("apiRouter - route discovery", () => {
       const routes = await apiRouter(pagesDir);
 
       expect(routes).toEqual([]);
+    });
+  });
+
+  // Regression for #1542: pages whose path *starts with* `/api-…` (e.g.
+  // `/api-docs/[...slug]`, `/api-info`) must be classified as PAGE routes,
+  // not API routes. Next.js only treats files under `pages/api/` (with the
+  // trailing slash) as API routes — substring matches against `api-` are a
+  // false positive. The upstream Next.js fixture at
+  // `.nextjs-ref/test/e2e/prerender/pages/api-docs/[...slug].js` is the
+  // canonical case.
+  it("does not treat pages/api-docs/* as API routes (issue #1542)", async () => {
+    await withTempDir("vinext-issue-1542-api-docs-", async (tmpDir) => {
+      const pagesDir = path.join(tmpDir, "pages");
+      await mkdir(path.join(pagesDir, "api-docs"), { recursive: true });
+      await writeFile(path.join(pagesDir, "api-docs", "[...slug].tsx"), EMPTY_PAGE);
+      await mkdir(path.join(pagesDir, "api-info"), { recursive: true });
+      await writeFile(path.join(pagesDir, "api-info", "index.tsx"), EMPTY_PAGE);
+      // A real API route co-exists so we also verify the positive case.
+      await mkdir(path.join(pagesDir, "api"), { recursive: true });
+      await writeFile(path.join(pagesDir, "api", "hello.ts"), EMPTY_ROUTE);
+
+      invalidateRouteCache(pagesDir);
+
+      const pages = await pagesRouter(pagesDir);
+      const apis = await apiRouter(pagesDir);
+
+      const pagePatterns = pages.map((r) => r.pattern);
+      const apiPatterns = apis.map((r) => r.pattern);
+
+      // `/api-docs/[...slug]` and `/api-info` are pages, not API routes.
+      expect(pagePatterns).toContain("/api-docs/:slug+");
+      expect(pagePatterns).toContain("/api-info");
+      expect(apiPatterns).not.toContain("/api-docs/:slug+");
+      expect(apiPatterns).not.toContain("/api-info");
+
+      // The real API route is still discovered correctly.
+      expect(apiPatterns).toContain("/api/hello");
+      expect(pagePatterns).not.toContain("/api/hello");
+
+      // matchRoute against the page table resolves the `/api-…` URLs to
+      // their page files. A regression would either yield null (no match)
+      // or match against the API trie instead.
+      const matchedDocs = matchRoute("/api-docs/first", pages);
+      expect(matchedDocs).not.toBeNull();
+      expect(matchedDocs!.route.pattern).toBe("/api-docs/:slug+");
+      expect(matchedDocs!.route.filePath).toBe(path.join(pagesDir, "api-docs", "[...slug].tsx"));
+
+      const matchedInfo = matchRoute("/api-info", pages);
+      expect(matchedInfo).not.toBeNull();
+      expect(matchedInfo!.route.pattern).toBe("/api-info");
     });
   });
 });

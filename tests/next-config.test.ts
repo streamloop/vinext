@@ -228,6 +228,55 @@ describe("loadNextConfig with CJS globals in next.config.ts", () => {
     expect(config?.env?.VIA).toBe("module.exports");
   });
 
+  it("does not inject __dirname when user already declares it", async () => {
+    // Regression test for https://github.com/cloudflare/vinext/issues/1345.
+    tmpDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `import { dirname } from "node:path";\n` +
+        `import { fileURLToPath } from "node:url";\n` +
+        `const __dirname = dirname(fileURLToPath(import.meta.url));\n` +
+        `export default { env: { DIR: __dirname } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    const dir = config?.env?.DIR;
+    expect(typeof dir).toBe("string");
+    expect(fs.realpathSync(dir as string)).toBe(fs.realpathSync(tmpDir));
+  });
+
+  it("does not inject __filename when user already declares it", async () => {
+    tmpDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `import { fileURLToPath } from "node:url";\n` +
+        `const __filename = fileURLToPath(import.meta.url);\n` +
+        `export default { env: { FILE: __filename } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    const file = config?.env?.FILE;
+    expect(typeof file).toBe("string");
+    expect(fs.realpathSync(file as string)).toBe(
+      fs.realpathSync(path.join(tmpDir, "next.config.ts")),
+    );
+  });
+
+  it("does not inject require when user already declares it", async () => {
+    // The createRequire polyfill commonly appears alongside the __dirname one
+    // and hits the same duplicate-`const` Rolldown crash if injected blindly.
+    tmpDir = makeTempDir();
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `import { createRequire } from "node:module";\n` +
+        `const require = createRequire(import.meta.url);\n` +
+        `export default { env: { HAS_REQUIRE: typeof require } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.HAS_REQUIRE).toBe("function");
+  });
+
   it("loads a pure-ESM next.config.ts without injecting CJS shims", async () => {
     // No __filename / __dirname / require / module / exports references —
     // the injector transform should short-circuit. We only assert
@@ -368,12 +417,38 @@ describe("loadNextConfig with tsconfig path aliases", () => {
   // Ported from Next.js: test/e2e/app-dir/next-config-ts/import-alias-paths-only/
   //   https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/next-config-ts/import-alias-paths-only/
   // and import-alias-paths-with-baseurl/.
-  // Next.js's transpile-config.ts reads compilerOptions.paths from tsconfig.json
-  // and passes them to SWC so that next.config.ts can import via tsconfig
-  // aliases. vinext mirrors this by passing tsconfig paths to Vite as
-  // resolve.alias when calling runnerImport.
+  // Next.js's transpile-config.ts reads compilerOptions.paths/baseUrl from
+  // tsconfig.json and passes them to SWC so that next.config.ts can import via
+  // tsconfig aliases and baseUrl bare specifiers. vinext mirrors this with
+  // Vite resolver settings when calling runnerImport.
 
   let tmpDir: string;
+
+  function writePackage(
+    name: string,
+    packageJson: Record<string, string>,
+    files: Record<string, string>,
+  ): void {
+    const packageDir = path.join(tmpDir, "node_modules", name);
+    fs.mkdirSync(packageDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(packageDir, "package.json"),
+      JSON.stringify({ name, version: "1.0.0", ...packageJson }),
+    );
+    for (const [filename, source] of Object.entries(files)) {
+      fs.writeFileSync(path.join(packageDir, filename), source);
+    }
+  }
+
+  function writeBarePackage(name: string, source: string): void {
+    writePackage(
+      name,
+      { type: "module", exports: "./index.js" },
+      {
+        "index.js": source,
+      },
+    );
+  }
 
   afterEach(() => {
     if (tmpDir) {
@@ -458,6 +533,232 @@ describe("loadNextConfig with tsconfig path aliases", () => {
 
     const config = await loadNextConfig(tmpDir);
     expect(config?.env?.BAZ).toBe("baz");
+  });
+
+  it("follows extended tsconfig baseUrl when resolving bare imports", async () => {
+    // Ported from Next.js: test/e2e/app-dir/next-config-ts/tsconfig-extends/
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/next-config-ts/tsconfig-extends/next-config-ts-tsconfig-extends-cjs.test.ts
+    tmpDir = makeTempDir();
+
+    fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, "src", "foo.ts"), `export const foo = "foo";\n`);
+    fs.writeFileSync(path.join(tmpDir, "bar.ts"), `export const bar = "bar";\n`);
+    fs.writeFileSync(
+      path.join(tmpDir, "package.json"),
+      JSON.stringify({
+        type: "module",
+      }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "tsconfig.base.json"),
+      JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+          paths: {
+            "@/*": ["./src/*"],
+          },
+        },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "tsconfig.json"),
+      JSON.stringify({
+        extends: "./tsconfig.base.json",
+      }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `import { foo } from "@/foo";\n` +
+        `import { bar } from "bar";\n` +
+        `export default { env: { VALUE: foo + bar } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.VALUE).toBe("foobar");
+  });
+
+  it("prefers an installed package over a baseUrl-local file of the same name", async () => {
+    // When a bare import matches both an installed package and a baseUrl-local
+    // file, the installed package wins. vinext keeps installed packages
+    // externalized so that CJS config plugins (e.g. @next/mdx) that call
+    // `require`/`require.resolve` at runtime keep working; the trade-off is
+    // that a baseUrl-local file does not shadow a package of the same name.
+    // (Pure TypeScript baseUrl semantics would prefer the local file, but that
+    // requires de-externalizing every package, which breaks CJS plugins.)
+    tmpDir = makeTempDir();
+
+    fs.writeFileSync(path.join(tmpDir, "bar.ts"), `export const bar = "local";\n`);
+    writeBarePackage("bar", `export const bar = "package";\n`);
+    fs.writeFileSync(
+      path.join(tmpDir, "tsconfig.json"),
+      JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+        },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `import { bar } from "bar";\nexport default { env: { BAR: bar } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.BAR).toBe("package");
+  });
+
+  it("loads a CJS config plugin that calls require.resolve at runtime", async () => {
+    // Regression for @next/mdx-style plugins: next.config.ts imports a CJS
+    // package whose factory calls `require.resolve(...)` when invoked. Keeping
+    // installed packages externalized (rather than forcing them through the
+    // module runner) ensures `require` is defined. Reproduces the
+    // app-router-playground deploy failure: "require is not defined".
+    tmpDir = makeTempDir();
+
+    fs.writeFileSync(path.join(tmpDir, "package.json"), JSON.stringify({ type: "module" }));
+    writePackage(
+      "fake-mdx",
+      { type: "commonjs", main: "index.js" },
+      {
+        "index.js":
+          `module.exports = (opts = {}) => (config = {}) => ({\n` +
+          `  ...config,\n` +
+          `  loaderPath: require.resolve("./loader.js"),\n` +
+          `});\n`,
+        "loader.js": `module.exports = "loader";\n`,
+      },
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "tsconfig.json"),
+      JSON.stringify({ compilerOptions: { baseUrl: "." } }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `import withMDX from "fake-mdx";\n` + `export default withMDX({})({ env: { OK: "yes" } });\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.OK).toBe("yes");
+  });
+
+  it("falls through to packages when baseUrl has no local match", async () => {
+    tmpDir = makeTempDir();
+
+    writeBarePackage("bar", `export const bar = "package";\n`);
+    fs.writeFileSync(
+      path.join(tmpDir, "tsconfig.json"),
+      JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+        },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `import { bar } from "bar";\nexport default { env: { BAR: bar } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.BAR).toBe("package");
+  });
+
+  it("does not apply tsconfig baseUrl package shadowing to next.config.mjs", async () => {
+    tmpDir = makeTempDir();
+
+    fs.writeFileSync(path.join(tmpDir, "bar.ts"), `export const bar = "local";\n`);
+    writeBarePackage("bar", `export const bar = "package";\n`);
+    fs.writeFileSync(
+      path.join(tmpDir, "tsconfig.json"),
+      JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+        },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.mjs"),
+      `import { bar } from "bar";\nexport default { env: { BAR: bar } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.BAR).toBe("package");
+  });
+
+  it("does not apply the app baseUrl to package dependency imports", async () => {
+    tmpDir = makeTempDir();
+
+    fs.writeFileSync(path.join(tmpDir, "shared.ts"), `export const shared = "app";\n`);
+    writeBarePackage(
+      "fake-plugin",
+      `import { shared } from "shared";\nexport const pluginValue = shared;\n`,
+    );
+    writeBarePackage("shared", `export const shared = "package";\n`);
+    fs.writeFileSync(
+      path.join(tmpDir, "tsconfig.json"),
+      JSON.stringify({
+        compilerOptions: {
+          baseUrl: ".",
+        },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `import { pluginValue } from "fake-plugin";\n` +
+        `export default { env: { VALUE: pluginValue } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env?.VALUE).toBe("package");
+  });
+
+  it("imports ESM and CommonJS packages from next.config.ts", async () => {
+    // Ported from Next.js: test/e2e/app-dir/next-config-ts/import-from-node-modules/
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/next-config-ts/import-from-node-modules/next.config.ts
+    tmpDir = makeTempDir();
+
+    writePackage(
+      "cjs",
+      { type: "commonjs", main: "index.cjs" },
+      {
+        "index.cjs": `module.exports = "cjs";\n`,
+      },
+    );
+    writePackage(
+      "mjs",
+      { type: "commonjs", main: "index.mjs" },
+      {
+        "index.mjs": `export default "mjs";\n`,
+      },
+    );
+    writePackage(
+      "js-cjs",
+      { type: "commonjs", main: "index.js" },
+      {
+        "index.js": `module.exports = "jsCJS";\n`,
+      },
+    );
+    writePackage(
+      "js-esm",
+      { type: "module", main: "index.js" },
+      {
+        "index.js": `export default "jsESM";\n`,
+      },
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.ts"),
+      `import cjs from "cjs";\n` +
+        `import mjs from "mjs";\n` +
+        `import jsCJS from "js-cjs";\n` +
+        `import jsESM from "js-esm";\n` +
+        `export default { env: { cjs, mjs, jsCJS, jsESM } };\n`,
+    );
+
+    const config = await loadNextConfig(tmpDir);
+    expect(config?.env).toMatchObject({
+      cjs: "cjs",
+      mjs: "mjs",
+      jsCJS: "jsCJS",
+      jsESM: "jsESM",
+    });
   });
 
   it("loads config without tsconfig.json (no aliases needed)", async () => {
@@ -598,6 +899,47 @@ module.exports = withPlugin({ basePath: "/wrapped" });`,
     expect(config.basePath).toBe("/docs");
     expect(config.env.FEATURE_FLAG).toBe("on");
     expect(config.aliases).toEqual({});
+  });
+
+  it("invokes webpack loader callbacks so build-time process.env mutations land in the Node process", async () => {
+    // Regression test for #1500.
+    // Some Next.js webpack loaders mutate `process.env.X = ...` at build
+    // time, expecting the value to be visible to other modules during the
+    // same build. vinext doesn't run the webpack loader pipeline, so the
+    // env mutation never happens. We compensate by invoking each loader's
+    // callback once during config probing with a dummy source.
+    tmpDir = makeTempDir();
+
+    const loaderPath = path.join(tmpDir, "vinext-1500-loader.cjs");
+    fs.writeFileSync(
+      loaderPath,
+      `module.exports = function (source) {\n` +
+        `  process.env.VINEXT_ISSUE_1500_LOADER_RAN = "yes";\n` +
+        `  return source;\n` +
+        `};\n`,
+    );
+
+    const previous = process.env.VINEXT_ISSUE_1500_LOADER_RAN;
+    delete process.env.VINEXT_ISSUE_1500_LOADER_RAN;
+    try {
+      const rawConfig = {
+        webpack: (webpackConfig: any) => {
+          webpackConfig.module = webpackConfig.module || { rules: [] };
+          webpackConfig.module.rules.push({
+            test: /\.svg$/,
+            use: [loaderPath],
+          });
+          return webpackConfig;
+        },
+      };
+
+      await resolveNextConfig(rawConfig, tmpDir);
+
+      expect(process.env.VINEXT_ISSUE_1500_LOADER_RAN).toBe("yes");
+    } finally {
+      if (previous === undefined) delete process.env.VINEXT_ISSUE_1500_LOADER_RAN;
+      else process.env.VINEXT_ISSUE_1500_LOADER_RAN = previous;
+    }
   });
 
   it("extracts aliases and mdx from a single async webpack probe", async () => {
@@ -783,6 +1125,40 @@ describe("resolveNextConfig serverActionsBodySizeLimit", () => {
   });
 });
 
+describe("resolveNextConfig disableOptimizedLoading", () => {
+  // Regression for #1519: `experimental.disableOptimizedLoading` defaults to
+  // `false` and is read into the resolved config. The default drives the
+  // `defer`-in-head behaviour for Pages Router scripts in production.
+  it("defaults disableOptimizedLoading to false", async () => {
+    const resolved = await resolveNextConfig({});
+    expect(resolved.disableOptimizedLoading).toBe(false);
+  });
+
+  it("reads experimental.disableOptimizedLoading from next.config", async () => {
+    const resolved = await resolveNextConfig({
+      experimental: { disableOptimizedLoading: true },
+    });
+    expect(resolved.disableOptimizedLoading).toBe(true);
+  });
+});
+
+describe("resolveNextConfig prefetchInlining", () => {
+  it("reads experimental.prefetchInlining from next.config", async () => {
+    const disabled = await resolveNextConfig({});
+    expect(disabled.prefetchInlining).toBe(false);
+
+    const enabledByBoolean = await resolveNextConfig({
+      experimental: { prefetchInlining: true },
+    });
+    expect(enabledByBoolean.prefetchInlining).toBe(true);
+
+    const enabledByThresholds = await resolveNextConfig({
+      experimental: { prefetchInlining: { maxSize: Infinity, maxBundleSize: Infinity } },
+    });
+    expect(enabledByThresholds.prefetchInlining).toBe(true);
+  });
+});
+
 describe("resolveNextConfig hashSalt", () => {
   const OLD_ENV = process.env.NEXT_HASH_SALT;
 
@@ -829,6 +1205,210 @@ describe("resolveNextConfig hashSalt", () => {
     process.env.NEXT_HASH_SALT = "onlyenv";
     const resolved = await resolveNextConfig({ env: {} });
     expect(resolved.hashSalt).toBe("onlyenv");
+  });
+});
+
+describe("resolveNextConfig instrumentationClientInject", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = makeTempDir();
+    fs.writeFileSync(path.join(tmpDir, "package.json"), `{ "type": "module" }\n`);
+  });
+
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("loads instrumentationClientInject from next.config.mjs", async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "next.config.mjs"),
+      `export default { instrumentationClientInject: ["./inject-a.js", "./inject-b.js"] };\n`,
+    );
+    const raw = await loadNextConfig(tmpDir);
+    const resolved = await resolveNextConfig(raw, tmpDir);
+    expect(resolved.instrumentationClientInject).toEqual(["./inject-a.js", "./inject-b.js"]);
+  });
+});
+
+describe("resolveNextConfig clientTraceMetadata", () => {
+  it("defaults to undefined when no config is provided", async () => {
+    const resolved = await resolveNextConfig(null);
+    expect(resolved.clientTraceMetadata).toBeUndefined();
+  });
+
+  it("defaults to undefined when experimental is not set", async () => {
+    const resolved = await resolveNextConfig({ env: {} });
+    expect(resolved.clientTraceMetadata).toBeUndefined();
+  });
+
+  it("defaults to undefined when experimental.clientTraceMetadata is omitted", async () => {
+    const resolved = await resolveNextConfig({ experimental: {} });
+    expect(resolved.clientTraceMetadata).toBeUndefined();
+  });
+
+  it("resolves a string array from experimental.clientTraceMetadata", async () => {
+    const resolved = await resolveNextConfig({
+      experimental: {
+        clientTraceMetadata: ["my-test-key-1", "my-test-key-2", "my-parent-span-id"],
+      },
+    });
+    expect(resolved.clientTraceMetadata).toEqual([
+      "my-test-key-1",
+      "my-test-key-2",
+      "my-parent-span-id",
+    ]);
+  });
+
+  it("filters out non-string entries", async () => {
+    const resolved = await resolveNextConfig({
+      // oxlint-disable-next-line typescript/no-explicit-any
+      experimental: { clientTraceMetadata: ["valid-key", 42, null, "another-key"] as any },
+    });
+    expect(resolved.clientTraceMetadata).toEqual(["valid-key", "another-key"]);
+  });
+
+  it("returns undefined for a non-array value", async () => {
+    const resolved = await resolveNextConfig({
+      // oxlint-disable-next-line typescript/no-explicit-any
+      experimental: { clientTraceMetadata: "not-an-array" as any },
+    });
+    expect(resolved.clientTraceMetadata).toBeUndefined();
+  });
+
+  it("resolves to an empty array when experimental.clientTraceMetadata is an empty array", async () => {
+    const resolved = await resolveNextConfig({
+      experimental: { clientTraceMetadata: [] },
+    });
+    expect(resolved.clientTraceMetadata).toEqual([]);
+  });
+});
+
+describe("resolveNextConfig removeConsole", () => {
+  it("resolves `compiler: { removeConsole: true }` to `true`", async () => {
+    const resolved = await resolveNextConfig({ compiler: { removeConsole: true } });
+    expect(resolved.removeConsole).toBe(true);
+  });
+
+  it("resolves `compiler: { removeConsole: { exclude: ['error'] } }` to the same shape", async () => {
+    const resolved = await resolveNextConfig({
+      compiler: { removeConsole: { exclude: ["error"] } },
+    });
+    expect(resolved.removeConsole).toEqual({ exclude: ["error"] });
+  });
+
+  it("resolves `compiler: { removeConsole: {} }` to `{ exclude: [] }`", async () => {
+    const resolved = await resolveNextConfig({ compiler: { removeConsole: {} } });
+    expect(resolved.removeConsole).toEqual({ exclude: [] });
+  });
+
+  it("resolves missing `compiler` to `false`", async () => {
+    const resolved = await resolveNextConfig({});
+    expect(resolved.removeConsole).toBe(false);
+  });
+
+  it("resolves `compiler: {}` (no removeConsole key) to `false`", async () => {
+    const resolved = await resolveNextConfig({ compiler: {} });
+    expect(resolved.removeConsole).toBe(false);
+  });
+
+  it("resolves `compiler: { removeConsole: false }` to `false`", async () => {
+    const resolved = await resolveNextConfig({ compiler: { removeConsole: false } });
+    expect(resolved.removeConsole).toBe(false);
+  });
+
+  it("coerces non-string entries in `exclude` away (sanitization)", async () => {
+    const resolved = await resolveNextConfig({
+      // oxlint-disable-next-line typescript/no-explicit-any
+      compiler: { removeConsole: { exclude: ["error", 42, null, "warn"] as any } },
+    });
+    expect(resolved.removeConsole).toEqual({ exclude: ["error", "warn"] });
+  });
+});
+
+// Ported from Next.js: test/e2e/define/define.test.ts
+// https://github.com/vercel/next.js/blob/canary/test/e2e/define/define.test.ts
+describe("resolveNextConfig compiler.define / defineServer", () => {
+  it("defaults to empty maps when `compiler` is unset", async () => {
+    const resolved = await resolveNextConfig({});
+    expect(resolved.compilerDefine).toEqual({});
+    expect(resolved.compilerDefineServer).toEqual({});
+  });
+
+  it("JSON-stringifies string, number, and boolean values for `define`", async () => {
+    const resolved = await resolveNextConfig({
+      compiler: {
+        define: {
+          MY_MAGIC_VARIABLE: "foobar",
+          "process.env.MY_MAGIC_EXPR": "barbaz",
+          MY_NUMBER_VARIABLE: 42,
+          MY_BOOLEAN_VARIABLE: true,
+        },
+      },
+    });
+    expect(resolved.compilerDefine).toEqual({
+      MY_MAGIC_VARIABLE: '"foobar"',
+      "process.env.MY_MAGIC_EXPR": '"barbaz"',
+      MY_NUMBER_VARIABLE: "42",
+      MY_BOOLEAN_VARIABLE: "true",
+    });
+    expect(resolved.compilerDefineServer).toEqual({});
+  });
+
+  it("JSON-stringifies values for `defineServer` and keeps them separate from `define`", async () => {
+    const resolved = await resolveNextConfig({
+      compiler: {
+        define: { CLIENT_SAFE: "shared" },
+        defineServer: {
+          MY_SERVER_VARIABLE: "server",
+          "process.env.MY_MAGIC_SERVER_EXPR": "serverbarbaz",
+        },
+      },
+    });
+    expect(resolved.compilerDefine).toEqual({ CLIENT_SAFE: '"shared"' });
+    expect(resolved.compilerDefineServer).toEqual({
+      MY_SERVER_VARIABLE: '"server"',
+      "process.env.MY_MAGIC_SERVER_EXPR": '"serverbarbaz"',
+    });
+  });
+
+  it("ignores entries whose values are not string/number/boolean", async () => {
+    const resolved = await resolveNextConfig({
+      compiler: {
+        // oxlint-disable-next-line typescript/no-explicit-any
+        define: { OK: "yes", BAD_OBJ: { nope: 1 } as any, BAD_NULL: null as any },
+        // oxlint-disable-next-line typescript/no-explicit-any
+        defineServer: { OK_SRV: 1, BAD_ARR: [1, 2] as any },
+      },
+    });
+    expect(resolved.compilerDefine).toEqual({ OK: '"yes"' });
+    expect(resolved.compilerDefineServer).toEqual({ OK_SRV: "1" });
+  });
+});
+
+describe("resolveNextConfig htmlLimitedBots", () => {
+  it("serializes RegExp config values to their source", async () => {
+    const resolved = await resolveNextConfig({ htmlLimitedBots: /Minibot/i });
+
+    expect(resolved.htmlLimitedBots).toBe("Minibot");
+  });
+
+  it("accepts valid serialized regex source strings", async () => {
+    const resolved = await resolveNextConfig({ htmlLimitedBots: "Minibot|Weebot" });
+
+    expect(resolved.htmlLimitedBots).toBe("Minibot|Weebot");
+  });
+
+  it("treats empty string config as unset", async () => {
+    const resolved = await resolveNextConfig({ htmlLimitedBots: "" });
+
+    expect(resolved.htmlLimitedBots).toBeUndefined();
+  });
+
+  it("throws a config error for invalid serialized regex sources", async () => {
+    await expect(resolveNextConfig({ htmlLimitedBots: "[" })).rejects.toThrow(
+      'Invalid next.config option "htmlLimitedBots"',
+    );
   });
 });
 
@@ -905,6 +1485,7 @@ describe("detectNextIntlConfig", () => {
       output: "",
       pageExtensions: ["tsx", "ts", "jsx", "js"],
       cacheComponents: false,
+      prefetchInlining: false,
       redirects: [],
       rewrites: { beforeFiles: [], afterFiles: [], fallback: [] },
       headers: [],
@@ -915,16 +1496,26 @@ describe("detectNextIntlConfig", () => {
       allowedDevOrigins: [],
       serverActionsAllowedOrigins: [],
       optimizePackageImports: [],
+      inlineCss: false,
       serverActionsBodySizeLimit: 1 * 1024 * 1024,
+      htmlLimitedBots: undefined,
       serverExternalPackages: [],
       cacheHandler: undefined,
       cacheMaxMemorySize: undefined,
       hashSalt: "",
       enablePrerenderSourceMaps: true,
+      appShells: false,
       expireTime: 31_536_000,
       buildId: "test-build-id",
       deploymentId: undefined,
       sassOptions: null,
+      removeConsole: false,
+      disableOptimizedLoading: false,
+      compilerDefine: {},
+      compilerDefineServer: {},
+      instrumentationClientInject: [],
+      clientTraceMetadata: undefined,
+      staleTimes: { dynamic: 0, static: 300 },
       ...overrides,
     };
   }
@@ -1340,6 +1931,130 @@ describe("resolveNextConfig swcEnvOptions warning", () => {
   });
 });
 
+describe("resolveNextConfig cachedNavigations warning", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("emits a warning when experimental.cachedNavigations is set without cacheComponents", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await resolveNextConfig({
+      experimental: { cachedNavigations: true },
+    });
+
+    const cachedNavigationsWarning = warn.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].includes("cachedNavigations"),
+    );
+
+    expect(cachedNavigationsWarning).toBeDefined();
+    expect(cachedNavigationsWarning![0]).toContain("experimental.cachedNavigations");
+    expect(cachedNavigationsWarning![0]).toContain("cacheComponents: true");
+  });
+
+  it("does not warn when experimental.cachedNavigations is set with cacheComponents", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await resolveNextConfig({
+      cacheComponents: true,
+      experimental: { cachedNavigations: true },
+    });
+
+    const cachedNavigationsWarning = warn.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].includes("cachedNavigations"),
+    );
+    expect(cachedNavigationsWarning).toBeUndefined();
+  });
+
+  it("does not warn when experimental.cachedNavigations is not set", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await resolveNextConfig({
+      experimental: {},
+    });
+
+    const cachedNavigationsWarning = warn.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].includes("cachedNavigations"),
+    );
+    expect(cachedNavigationsWarning).toBeUndefined();
+  });
+
+  it("does not warn when experimental.cachedNavigations is false", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await resolveNextConfig({
+      experimental: { cachedNavigations: false },
+    });
+
+    const cachedNavigationsWarning = warn.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].includes("cachedNavigations"),
+    );
+    expect(cachedNavigationsWarning).toBeUndefined();
+  });
+});
+
+describe("resolveNextConfig rootParams deprecation warning", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("emits a warning when experimental.rootParams is true", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await resolveNextConfig({
+      experimental: { rootParams: true },
+    });
+
+    const rootParamsWarning = warn.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].includes("rootParams"),
+    );
+
+    expect(rootParamsWarning).toBeDefined();
+    expect(rootParamsWarning![0]).toContain("experimental.rootParams");
+    expect(rootParamsWarning![0]).toContain("no longer needed");
+    expect(rootParamsWarning![0]).toContain("next/root-params");
+    expect(rootParamsWarning![0]).toContain("available by default");
+  });
+
+  it("emits a warning when experimental.rootParams is false", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await resolveNextConfig({
+      experimental: { rootParams: false },
+    });
+
+    const rootParamsWarning = warn.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].includes("rootParams"),
+    );
+
+    expect(rootParamsWarning).toBeDefined();
+  });
+
+  it("does not warn when experimental.rootParams is not set", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await resolveNextConfig({
+      experimental: {},
+    });
+
+    const rootParamsWarning = warn.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].includes("rootParams"),
+    );
+    expect(rootParamsWarning).toBeUndefined();
+  });
+
+  it("does not warn when experimental is not set", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await resolveNextConfig({});
+
+    const rootParamsWarning = warn.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].includes("rootParams"),
+    );
+    expect(rootParamsWarning).toBeUndefined();
+  });
+});
+
 describe("resolveNextConfig cacheHandler", () => {
   it("resolves file:// URLs to filesystem paths", async () => {
     const resolved = await resolveNextConfig({
@@ -1396,5 +2111,121 @@ describe("resolveNextConfig enablePrerenderSourceMaps", () => {
       enablePrerenderSourceMaps: false,
     });
     expect(resolved.enablePrerenderSourceMaps).toBe(false);
+  });
+});
+
+// Regression for issue #1490:
+// experimental.staleTimes should be surfaced through ResolvedNextConfig so the
+// plugin can inject the values into the client-side router cache.
+describe("resolveNextConfig staleTimes (#1490)", () => {
+  it("defaults to Next.js' { dynamic: 0, static: 300 } when no config is provided", async () => {
+    const resolved = await resolveNextConfig(null);
+    expect(resolved.staleTimes).toEqual({ dynamic: 0, static: 300 });
+  });
+
+  it("defaults to Next.js' { dynamic: 0, static: 300 } when experimental is not set", async () => {
+    const resolved = await resolveNextConfig({});
+    expect(resolved.staleTimes).toEqual({ dynamic: 0, static: 300 });
+  });
+
+  it("reads experimental.staleTimes.{dynamic,static} verbatim (in seconds)", async () => {
+    const resolved = await resolveNextConfig({
+      experimental: { staleTimes: { dynamic: 30, static: 180 } },
+    });
+    expect(resolved.staleTimes).toEqual({ dynamic: 30, static: 180 });
+  });
+
+  it("falls back to defaults for individually-omitted keys", async () => {
+    const resolvedDynOnly = await resolveNextConfig({
+      experimental: { staleTimes: { dynamic: 45 } },
+    });
+    expect(resolvedDynOnly.staleTimes).toEqual({ dynamic: 45, static: 300 });
+
+    const resolvedStaticOnly = await resolveNextConfig({
+      experimental: { staleTimes: { static: 600 } },
+    });
+    expect(resolvedStaticOnly.staleTimes).toEqual({ dynamic: 0, static: 600 });
+  });
+
+  it("falls back to defaults when staleTimes contains non-numeric values", async () => {
+    const resolved = await resolveNextConfig({
+      experimental: {
+        staleTimes: { dynamic: "oops" as unknown as number, static: undefined },
+      },
+    });
+    expect(resolved.staleTimes).toEqual({ dynamic: 0, static: 300 });
+  });
+
+  it("falls back to defaults when staleTimes contains negative values", async () => {
+    // Negative values are rejected at resolution time so we don't pass them
+    // downstream to `resolvePrefetchCacheTtl`, where they'd be re-validated.
+    // Matches the `seconds < 0` guard in `shims/navigation.ts`.
+    const resolved = await resolveNextConfig({
+      experimental: { staleTimes: { dynamic: -5, static: -1 } },
+    });
+    expect(resolved.staleTimes).toEqual({ dynamic: 0, static: 300 });
+  });
+});
+
+describe("resolveNextConfig appShells", () => {
+  it("defaults appShells to false when not set", async () => {
+    const resolved = await resolveNextConfig({});
+    expect(resolved.appShells).toBe(false);
+  });
+
+  it("defaults appShells to false for null config", async () => {
+    const resolved = await resolveNextConfig(null);
+    expect(resolved.appShells).toBe(false);
+  });
+
+  it("reads appShells: true from experimental config", async () => {
+    const resolved = await resolveNextConfig({
+      experimental: { appShells: true },
+    });
+    expect(resolved.appShells).toBe(true);
+  });
+
+  it("reads appShells: false from experimental config", async () => {
+    const resolved = await resolveNextConfig({
+      experimental: { appShells: false },
+    });
+    expect(resolved.appShells).toBe(false);
+  });
+
+  it("warns when appShells is enabled without required co-flags", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const resolved = await resolveNextConfig({
+      experimental: { appShells: true },
+    });
+    expect(resolved.appShells).toBe(true);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "experimental.appShells is enabled but requires the following co-flags",
+      ),
+    );
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("cacheComponents"));
+    warnSpy.mockRestore();
+  });
+
+  it("does not warn when appShells is enabled with all required co-flags", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const resolved = await resolveNextConfig({
+      cacheComponents: true,
+      experimental: {
+        appShells: true,
+        prefetchInlining: true,
+        varyParams: true,
+        optimisticRouting: true,
+        cachedNavigations: true,
+      },
+    });
+    expect(resolved.appShells).toBe(true);
+    // The warning should NOT contain the appShells co-flags message
+    const appShellsWarnings = warnSpy.mock.calls.filter(
+      (call) =>
+        typeof call[0] === "string" && call[0].includes("experimental.appShells is enabled"),
+    );
+    expect(appShellsWarnings).toHaveLength(0);
+    warnSpy.mockRestore();
   });
 });

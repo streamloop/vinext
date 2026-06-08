@@ -175,6 +175,113 @@ describe("App Router route graph builder", () => {
     });
   });
 
+  // Regression for https://github.com/cloudflare/vinext/issues/1339
+  // Ported from Next.js: test/e2e/app-dir/parallel-routes-layouts/
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/parallel-routes-layouts/parallel-routes-layouts.test.ts
+  //
+  // When a slot owns both a matched page and a default.tsx, the matched page
+  // must win — vinext previously fell back to default.tsx ("default page"
+  // instead of "Hello from Nested"). This locks in page-over-default priority
+  // for the children slot and for sibling @foo/@bar slots simultaneously.
+  it("prefers a matched slot page over default.tsx across sibling slots (issue #1339)", async () => {
+    await withTempApp(async (appDir) => {
+      await writeAppFile(appDir, "layout.tsx", EMPTY_LAYOUT);
+      await writeAppFile(appDir, "page.tsx", EMPTY_PAGE);
+      await writeAppFile(appDir, "nested/layout.tsx", EMPTY_LAYOUT);
+      await writeAppFile(appDir, "nested/page.tsx", EMPTY_PAGE);
+      await writeAppFile(appDir, "nested/default.tsx", EMPTY_PAGE);
+      await writeAppFile(appDir, "nested/@foo/layout.tsx", EMPTY_LAYOUT);
+      await writeAppFile(appDir, "nested/@foo/page.tsx", EMPTY_PAGE);
+      await writeAppFile(appDir, "nested/@foo/default.tsx", EMPTY_PAGE);
+      await writeAppFile(appDir, "nested/@bar/layout.tsx", EMPTY_LAYOUT);
+      await writeAppFile(appDir, "nested/@bar/page.tsx", EMPTY_PAGE);
+      await writeAppFile(appDir, "nested/@bar/default.tsx", EMPTY_PAGE);
+      await writeAppFile(appDir, "nested/@bar/subroute/page.tsx", EMPTY_PAGE);
+
+      const graph = await buildAppRouteGraph(appDir, createValidFileMatcher());
+
+      // At /nested the children slot must render nested/page.tsx, not the
+      // sibling nested/default.tsx fallback.
+      const nested = findRoute(graph.routes, "/nested");
+      expect(nested.pagePath).toBe(path.join(appDir, "nested/page.tsx"));
+
+      // Each sibling slot has its own page AND its own default — the page wins.
+      const foo = nested.parallelSlots.find((slot) => slot.name === "foo");
+      const bar = nested.parallelSlots.find((slot) => slot.name === "bar");
+      expect(foo).toMatchObject({
+        name: "foo",
+        pagePath: path.join(appDir, "nested/@foo/page.tsx"),
+        defaultPath: path.join(appDir, "nested/@foo/default.tsx"),
+        routeSegments: [],
+      });
+      expect(bar).toMatchObject({
+        name: "bar",
+        pagePath: path.join(appDir, "nested/@bar/page.tsx"),
+        defaultPath: path.join(appDir, "nested/@bar/default.tsx"),
+        routeSegments: [],
+      });
+
+      // /nested/subroute only has a match for the @bar slot. The children slot
+      // falls back to nested/default.tsx, @bar mirrors its subroute page, and
+      // @foo (no subroute page) keeps its default fallback.
+      const subroute = findRoute(graph.routes, "/nested/subroute");
+      expect(subroute.pagePath).toBe(path.join(appDir, "nested/default.tsx"));
+      const subBar = subroute.parallelSlots.find((slot) => slot.name === "bar");
+      const subFoo = subroute.parallelSlots.find((slot) => slot.name === "foo");
+      expect(subBar).toMatchObject({
+        name: "bar",
+        pagePath: path.join(appDir, "nested/@bar/subroute/page.tsx"),
+        routeSegments: ["subroute"],
+      });
+      expect(subFoo).toMatchObject({
+        name: "foo",
+        pagePath: null,
+        defaultPath: path.join(appDir, "nested/@foo/default.tsx"),
+      });
+    });
+  });
+
+  it("materializes synthetic routes from a sibling route-group's parallel slot", async () => {
+    // Two sibling route groups share the same URL pattern at the root:
+    //   (group-a) provides a layout-only route with a catch-all parallel slot
+    //   (group-b) provides the children page at the same URL pattern
+    // The (group-a) layout cannot become a route on its own (collision), but
+    // its slot's nested catch-all page must still materialize a synthetic
+    // route so that URLs not matched by (group-b) fall through to the slot.
+    await withTempApp(async (appDir) => {
+      await writeAppFile(appDir, "(group-a)/layout.tsx", EMPTY_LAYOUT);
+      await writeAppFile(appDir, "(group-a)/@parallel/default.tsx", EMPTY_PAGE);
+      await writeAppFile(appDir, "(group-a)/@parallel/[...catcher]/page.tsx", EMPTY_PAGE);
+      await writeAppFile(appDir, "(group-b)/layout.tsx", EMPTY_LAYOUT);
+      await writeAppFile(appDir, "(group-b)/page.tsx", EMPTY_PAGE);
+      await writeAppFile(appDir, "(group-b)/foo/page.tsx", EMPTY_PAGE);
+
+      const graph = await buildAppRouteGraph(appDir, createValidFileMatcher());
+      const patterns = graph.routes.map((r) => r.pattern).sort();
+      // Real page routes from (group-b)
+      expect(patterns).toContain("/");
+      expect(patterns).toContain("/foo");
+      // Synthetic catch-all from (group-a)'s @parallel slot
+      expect(patterns).toContain("/:catcher+");
+
+      const catcher = findRoute(graph.routes, "/:catcher+");
+      // The layout-only ghost parent is not added to routes, but the synthetic
+      // sub-route inherits (group-a)'s layout chain.
+      expect(catcher.layouts).toEqual([path.join(appDir, "(group-a)/layout.tsx")]);
+      expect(catcher.parallelSlots).toHaveLength(1);
+      expect(catcher.parallelSlots[0]).toMatchObject({
+        name: "parallel",
+        pagePath: path.join(appDir, "(group-a)/@parallel/[...catcher]/page.tsx"),
+        routeSegments: ["[...catcher]"],
+      });
+
+      // The real /foo route belongs to (group-b) only — it must not pick up
+      // slots from the sibling group.
+      const foo = findRoute(graph.routes, "/foo");
+      expect(foo.parallelSlots).toHaveLength(0);
+    });
+  });
+
   it("skips synthetic routes that structurally conflict with existing page routes", async () => {
     // A slot sub-page like @feed/[name]/page.tsx under /shop would create /shop/:name,
     // but if /shop/[id]/page.tsx already exists (route /shop/:id), the synthetic route
@@ -248,6 +355,61 @@ describe("App Router route graph builder", () => {
       );
       expect(conflictingSyntheticPatterns).toHaveLength(1);
       expect(patterns).toContain("/shop");
+    });
+  });
+
+  // Regression for https://github.com/cloudflare/vinext/issues/1535
+  // Ported from Next.js: test/e2e/app-dir/parallel-routes-catchall-children-slot/
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/parallel-routes-catchall-children-slot/parallel-routes-catchall-children-slot.test.ts
+  describe("@children slot priority (issue #1535)", () => {
+    it("uses @children/page.tsx as the page for '/' over a sibling [...catchAll]", async () => {
+      // app/@children/page.tsx provides the layout's `children` prop at '/'.
+      // app/[...catchAll]/page.tsx is a catch-all that should NOT win for '/'.
+      // Next.js parity: see normalize-catchall-routes.ts (@children is not
+      // a "matchable slot" so the catchall does not displace it).
+      await withTempApp(async (appDir) => {
+        await writeAppFile(appDir, "layout.tsx", EMPTY_LAYOUT);
+        await writeAppFile(appDir, "@children/page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "@slot/page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "@slot/default.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "[...catchAll]/page.tsx", EMPTY_PAGE);
+
+        const graph = await buildAppRouteGraph(appDir, createValidFileMatcher());
+        const patterns = graph.routes.map((r) => r.pattern).sort();
+
+        // The root URL must resolve as a real page, sourced from @children/page.tsx.
+        expect(patterns).toContain("/");
+        const root = findRoute(graph.routes, "/");
+        expect(root.pagePath).toBe(path.join(appDir, "@children/page.tsx"));
+
+        // The catch-all must still cover deeper paths.
+        expect(patterns).toContain("/:catchAll+");
+
+        // The @slot slot is attached to '/', not consumed as a top-level route.
+        const slotNames = root.parallelSlots.map((s) => s.name).sort();
+        expect(slotNames).toContain("slot");
+      });
+    });
+
+    it("resolves '/nested' to @children/page when only the @children slot exists (no default)", async () => {
+      // The nested directory has a layout and a @children slot with a page,
+      // but no default.tsx for the children slot. The route '/nested' must
+      // still materialize and the page must come from @children/page.tsx.
+      await withTempApp(async (appDir) => {
+        await writeAppFile(appDir, "layout.tsx", EMPTY_LAYOUT);
+        await writeAppFile(appDir, "@slot/page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "@slot/default.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "[...catchAll]/page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "nested/layout.tsx", EMPTY_LAYOUT);
+        await writeAppFile(appDir, "nested/@children/page.tsx", EMPTY_PAGE);
+
+        const graph = await buildAppRouteGraph(appDir, createValidFileMatcher());
+        const patterns = graph.routes.map((r) => r.pattern).sort();
+
+        expect(patterns).toContain("/nested");
+        const nested = findRoute(graph.routes, "/nested");
+        expect(nested.pagePath).toBe(path.join(appDir, "nested/@children/page.tsx"));
+      });
     });
   });
 
@@ -881,6 +1043,7 @@ describe("App Router route graph builder", () => {
         targetPattern: string;
         sourceMatchPattern: string;
         convention: string;
+        params: string[];
       }> = [];
       for (const route of routes) {
         for (const slot of route.parallelSlots) {
@@ -891,6 +1054,7 @@ describe("App Router route graph builder", () => {
               targetPattern: ir.targetPattern,
               sourceMatchPattern: ir.sourceMatchPattern,
               convention: ir.convention,
+              params: ir.params,
             });
           }
         }
@@ -914,6 +1078,63 @@ describe("App Router route graph builder", () => {
           expect.objectContaining({
             targetPattern: "/nested",
             sourceMatchPattern: "/",
+            convention: ".",
+          }),
+        );
+      });
+    });
+
+    it("computes target with subdirectory prefix for (.) slot nested in a slot subdirectory", async () => {
+      // Regression test for issue #1364 Part A.
+      // When the (.) marker lives inside a subdirectory of the @slot dir, baseParts
+      // must include the visible segments between appDir and the marker's parent dir,
+      // not just the routeDir-relative segments (which omit the subdirectory).
+      //
+      // Layout:
+      //   app/@modal/sub/(.)target/[id]/page.tsx
+      //   routeDir = app/ (root), but marker parent is app/@modal/sub
+      //   expected targetPattern = /sub/target/:id  (not /:id)
+      await withTempApp(async (appDir) => {
+        await writeAppFile(appDir, "layout.tsx", EMPTY_LAYOUT);
+        await writeAppFile(appDir, "page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "sub/target/[id]/page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "@modal/default.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "@modal/sub/(.)target/[id]/page.tsx", EMPTY_PAGE);
+
+        const graph = await buildAppRouteGraph(appDir, createValidFileMatcher());
+        const intercepts = collectIntercepts(graph.routes);
+
+        // sourceMatchPattern derives from interceptParentDir (app/@modal/sub),
+        // stripping the invisible @modal → remaining visible segment "sub" → "/sub".
+        expect(intercepts).toContainEqual(
+          expect.objectContaining({
+            targetPattern: "/sub/target/:id",
+            sourceMatchPattern: "/sub",
+            convention: ".",
+          }),
+        );
+      });
+    });
+
+    it("includes dynamic ancestor params for (.) slot with a dynamic ancestor segment", async () => {
+      // Regression for the double-conversion bug: raw filesystem segments must be
+      // passed as baseParts so that [locale] is not converted to :locale before
+      // the final convertSegmentsToRouteParts call (which would then treat :locale
+      // as static and drop it from params).
+      await withTempApp(async (appDir) => {
+        await writeAppFile(appDir, "layout.tsx", EMPTY_LAYOUT);
+        await writeAppFile(appDir, "[locale]/page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "[locale]/photos/[id]/page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "[locale]/@modal/default.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "[locale]/@modal/(.)photos/[id]/page.tsx", EMPTY_PAGE);
+
+        const graph = await buildAppRouteGraph(appDir, createValidFileMatcher());
+        const intercepts = collectIntercepts(graph.routes);
+
+        expect(intercepts).toContainEqual(
+          expect.objectContaining({
+            targetPattern: "/:locale/photos/:id",
+            params: ["locale", "id"],
             convention: ".",
           }),
         );
@@ -1032,6 +1253,91 @@ describe("App Router route graph builder", () => {
           },
         ]);
         expect(interceptionsBySlotId).toEqual([["slot:modal:/[locale]/feed", interceptions]]);
+      });
+    });
+
+    it("ignores interception marker directories that live outside a parallel slot", async () => {
+      // Ported from Next.js: test/e2e/app-dir/interception-routes-multiple-catchall
+      // and test/e2e/app-dir/interception-segments-two-levels-above. Next.js
+      // allows interception marker directories anywhere — they should not be
+      // treated as standalone routes (the marker is not a real URL segment),
+      // so the build must not register `/templates/(..)showcase` as a page
+      // and must not throw while validating its pattern.
+      await withTempApp(async (appDir) => {
+        await writeAppFile(appDir, "layout.tsx", EMPTY_LAYOUT);
+        await writeAppFile(appDir, "page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "showcase/page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "templates/layout.tsx", EMPTY_LAYOUT);
+        await writeAppFile(appDir, "templates/[...catchAll]/page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "templates/(..)showcase/page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "templates/(..)showcase/[...catchAll]/page.tsx", EMPTY_PAGE);
+
+        const graph = await buildAppRouteGraph(appDir, createValidFileMatcher());
+        const patterns = graph.routes.map((route) => route.pattern);
+
+        // The marker directory itself is not a route — it must never surface
+        // as `/templates/(..)showcase` or similar.
+        for (const pattern of patterns) {
+          expect(pattern).not.toMatch(/\(\.{1,3}\)/);
+        }
+      });
+    });
+
+    it("ignores `(..)(..)` interception marker outside a parallel slot", async () => {
+      // Ported from Next.js: test/e2e/app-dir/interception-segments-two-levels-above
+      // app/foo/bar/(..)(..)hoge/page.tsx is a sibling-style interception
+      // marker (no @slot). Build must not throw and must not register a
+      // route with the literal marker in its pattern.
+      await withTempApp(async (appDir) => {
+        await writeAppFile(appDir, "layout.tsx", EMPTY_LAYOUT);
+        await writeAppFile(appDir, "page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "hoge/page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "foo/bar/page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "foo/bar/(..)(..)hoge/page.tsx", EMPTY_PAGE);
+
+        const graph = await buildAppRouteGraph(appDir, createValidFileMatcher());
+        const patterns = graph.routes.map((route) => route.pattern);
+
+        for (const pattern of patterns) {
+          expect(pattern).not.toMatch(/\(\.{1,3}\)/);
+        }
+      });
+    });
+
+    it("ignores `(.)` same-level interception marker outside a parallel slot", async () => {
+      // Coverage for the same-level marker — sibling of a regular route,
+      // not inside a `@slot`. Must not register `/gallery/(.)photo` as a page.
+      await withTempApp(async (appDir) => {
+        await writeAppFile(appDir, "layout.tsx", EMPTY_LAYOUT);
+        await writeAppFile(appDir, "page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "gallery/photo/page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "gallery/(.)photo/page.tsx", EMPTY_PAGE);
+
+        const graph = await buildAppRouteGraph(appDir, createValidFileMatcher());
+        const patterns = graph.routes.map((route) => route.pattern);
+
+        for (const pattern of patterns) {
+          expect(pattern).not.toMatch(/\(\.{1,3}\)/);
+        }
+      });
+    });
+
+    it("ignores `(...)` root interception marker outside a parallel slot", async () => {
+      // Coverage for the root marker — `(...)` always resolves against the
+      // app root, so the marker must be stripped even when buried deep in
+      // the filesystem tree.
+      await withTempApp(async (appDir) => {
+        await writeAppFile(appDir, "layout.tsx", EMPTY_LAYOUT);
+        await writeAppFile(appDir, "page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "target/page.tsx", EMPTY_PAGE);
+        await writeAppFile(appDir, "deep/path/(...)target/page.tsx", EMPTY_PAGE);
+
+        const graph = await buildAppRouteGraph(appDir, createValidFileMatcher());
+        const patterns = graph.routes.map((route) => route.pattern);
+
+        for (const pattern of patterns) {
+          expect(pattern).not.toMatch(/\(\.{1,3}\)/);
+        }
       });
     });
   });

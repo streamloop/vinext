@@ -33,15 +33,61 @@ export function isServerActionNotFoundError(error: unknown, actionId: string | n
     return false;
   }
 
-  if (!actionId) {
-    return message.startsWith("Failed to find Server Action");
-  }
-
-  if (message.startsWith(getServerActionNotFoundPrefix(actionId))) {
+  if (actionId && message.startsWith(getServerActionNotFoundPrefix(actionId))) {
     return true;
   }
 
-  return Boolean(actionId && message.includes(`[vite-rsc] invalid server reference '${actionId}'`));
+  if (!actionId && message.startsWith("Failed to find Server Action")) {
+    return true;
+  }
+
+  // `@vitejs/plugin-rsc` raises two different "no such server reference"
+  // errors depending on the build mode. Both mean the same thing — the
+  // referenced server action id isn't in the runtime manifest — and must
+  // surface as Next.js' 404 + action-not-found header rather than a generic
+  // 500. The progressive (no-JS) path also hits this in `decodeAction(body)`
+  // before it has any actionId in hand, so match these patterns whether or
+  // not the caller has resolved an action id from request headers.
+  //
+  //  - dev:  `[vite-rsc] invalid server reference '<id>'` (from the reference
+  //          validation virtual module loaded ahead of dynamic import)
+  //  - prod: `server reference not found '<id>'`         (from the built
+  //          `virtual:vite-rsc/server-references` lookup, including the case
+  //          where the build has no server actions at all)
+  //
+  // See: @vitejs/plugin-rsc dist/rsc.js (`server reference not found`) and
+  // dist/plugin-*.js (`[vite-rsc] invalid <type> reference`).
+  //
+  // Action ids resolved from request headers carry the `#<exportName>` suffix
+  // (e.g. `/app/foo.ts#bar`), but `loadServerAction(id)` strips that suffix
+  // before calling `requireModule(file)`. The dev-mode validator therefore
+  // emits the module path WITHOUT the `#<exportName>` — so we also check the
+  // pre-`#` portion to match either shape (#1340).
+  if (actionId) {
+    const moduleId = actionId.split("#")[0];
+    if (
+      message.includes(`[vite-rsc] invalid server reference '${actionId}'`) ||
+      (moduleId &&
+        moduleId !== actionId &&
+        message.includes(`[vite-rsc] invalid server reference '${moduleId}'`))
+    ) {
+      return true;
+    }
+    if (
+      message.includes(`server reference not found '${actionId}'`) ||
+      (moduleId &&
+        moduleId !== actionId &&
+        message.includes(`server reference not found '${moduleId}'`))
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  return (
+    /\[vite-rsc] invalid server reference '/.test(message) ||
+    /server reference not found '/.test(message)
+  );
 }
 
 export function createServerActionNotFoundResponse(): Response {

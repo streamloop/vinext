@@ -2,8 +2,11 @@ import { Fragment, createElement, isValidElement, type ReactElement, type ReactN
 import { describe, expect, it } from "vite-plus/test";
 import { useSelectedLayoutSegments } from "../packages/vinext/src/shims/navigation.js";
 import {
+  APP_PREFETCH_LOADING_SHELL_MARKER_KEY,
   APP_SLOT_BINDINGS_KEY,
   APP_UNMATCHED_SLOT_WIRE_VALUE,
+  buildOutgoingAppPayload,
+  isAppElementsRecord,
   type AppElements,
 } from "../packages/vinext/src/server/app-elements.js";
 import type { AppPageParams } from "../packages/vinext/src/server/app-page-boundary.js";
@@ -12,9 +15,21 @@ import {
   type AppPageSlotOverride,
   buildAppPageElements,
   createAppPageLayoutEntries,
+  probeAppPageLayoutWithTracking,
   resolveAppPageChildSegments,
 } from "../packages/vinext/src/server/app-page-route-wiring.js";
-import { APP_RSC_RENDER_MODE_REFRESH_PRESERVE_UI } from "../packages/vinext/src/server/app-rsc-render-mode.js";
+import { createAppLayoutParamAccessTracker } from "../packages/vinext/src/server/app-layout-param-observation.js";
+import {
+  APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
+  APP_RSC_RENDER_MODE_REFRESH_PRESERVE_UI,
+} from "../packages/vinext/src/server/app-rsc-render-mode.js";
+import { makeThenableParams } from "../packages/vinext/src/shims/thenable-params.js";
+import {
+  createRequestContext,
+  getRequestContext,
+  runWithRequestContext,
+} from "../packages/vinext/src/shims/unified-request-context.js";
+import { buildPageElements as buildResolvedPageElements } from "../packages/vinext/src/server/app-page-element-builder.js";
 
 function readNode(value: unknown): string {
   return typeof value === "string" ? value : "";
@@ -266,6 +281,49 @@ function PageProbe() {
   return createElement("main", { "data-page-segments": segments.join("|") }, "Page");
 }
 
+async function buildGeneratedMetadataRouteHtml(
+  userAgent: string,
+  htmlLimitedBots?: string,
+): Promise<string> {
+  const elements = await buildResolvedPageElements({
+    route: {
+      error: null,
+      errors: [null],
+      layoutTreePositions: [0],
+      layouts: [{ default: RootLayout }],
+      loading: null,
+      notFound: null,
+      notFounds: [null],
+      page: {
+        default: PageProbe,
+        async generateMetadata() {
+          return { title: "generated page" };
+        },
+      },
+      params: [],
+      pattern: "/generated",
+      routeSegments: ["generated"],
+      slots: {},
+      templateTreePositions: [],
+      templates: [],
+    },
+    params: {},
+    routePath: "/generated",
+    pageRequest: {
+      isRscRequest: false,
+      mountedSlotsHeader: null,
+      request: new Request("http://localhost/generated", {
+        headers: { "user-agent": userAgent },
+      }),
+      searchParams: null,
+    },
+    metadataRoutes: [],
+    htmlLimitedBots,
+  });
+
+  return renderRouteEntry(elements, "route:/generated");
+}
+
 function RouteLoadingProbe() {
   return createElement("p", null, "Route loading");
 }
@@ -279,6 +337,117 @@ function LayoutWithoutChildren() {
 }
 
 describe("app page route wiring helpers", () => {
+  it("probes returned layout children with param and revalidate tracking", async () => {
+    const calls: string[] = [];
+    const layoutParamAccess = createAppLayoutParamAccessTracker();
+
+    function Child() {
+      calls.push("child");
+      return null;
+    }
+
+    function Layout() {
+      calls.push("layout");
+      return createElement("section", null, createElement(Child));
+    }
+
+    await probeAppPageLayoutWithTracking({
+      layoutIndex: 0,
+      layoutParamAccess,
+      makeThenableParams,
+      matchedParams: {},
+      route: {
+        layoutTreePositions: [0],
+        layouts: [{ default: Layout, revalidate: 60 }],
+        routeSegments: ["dashboard"],
+      },
+    });
+
+    expect(calls).toEqual(["layout", "child"]);
+    expect(layoutParamAccess.getLayoutObservation("layout:/")).toMatchObject({
+      completeness: "complete",
+      finiteRevalidateSeconds: 60,
+    });
+  });
+
+  it("probes layout branches that render only when children are present", async () => {
+    const calls: string[] = [];
+    const layoutParamAccess = createAppLayoutParamAccessTracker();
+
+    function ChromeThatUsesTaggedData() {
+      calls.push("chrome");
+      getRequestContext().currentRequestTags.push("tag:dashboard-chrome");
+      return null;
+    }
+
+    function Layout(props: { children?: ReactNode }) {
+      calls.push("layout");
+      if (!props.children) return null;
+      return createElement(
+        "section",
+        null,
+        createElement(ChromeThatUsesTaggedData),
+        props.children,
+      );
+    }
+
+    await runWithRequestContext(createRequestContext(), () =>
+      probeAppPageLayoutWithTracking({
+        layoutIndex: 0,
+        layoutParamAccess,
+        makeThenableParams,
+        matchedParams: {},
+        route: {
+          layoutTreePositions: [0],
+          layouts: [{ default: Layout }],
+          routeSegments: ["dashboard"],
+        },
+      }),
+    );
+
+    expect(calls).toEqual(["layout", "chrome"]);
+    expect(layoutParamAccess.getLayoutObservation("layout:/")).toMatchObject({
+      cacheTags: ["tag:dashboard-chrome"],
+      completeness: "complete",
+    });
+  });
+
+  it("renders generated metadata in a hidden body outlet for streaming-capable requests", async () => {
+    // Ported from Next.js: test/e2e/app-dir/metadata-streaming/metadata-streaming.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/metadata-streaming/metadata-streaming.test.ts
+    const html = await buildGeneratedMetadataRouteHtml("HeadlessChrome");
+
+    expect(html).not.toContain("<title>generated page</title><div");
+    expect(html).toContain('<div hidden=""><title>generated page</title></div>');
+  });
+
+  it("renders generated metadata in the head for configured html-limited bots", async () => {
+    // Ported from Next.js: test/e2e/app-dir/metadata-streaming/metadata-streaming-customized-rule.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/metadata-streaming/metadata-streaming-customized-rule.test.ts
+    const html = await buildGeneratedMetadataRouteHtml("Minibot", "Minibot");
+
+    expect(html).toContain("<title>generated page</title>");
+    expect(html).not.toContain('<div hidden=""><title>generated page</title></div>');
+  });
+
+  it("renders generated metadata in the head for default html-limited bots", async () => {
+    // Ported from Next.js: test/e2e/app-dir/metadata-streaming/metadata-streaming.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/metadata-streaming/metadata-streaming.test.ts
+    const html = await buildGeneratedMetadataRouteHtml("Twitterbot");
+
+    expect(html).toContain("<title>generated page</title>");
+    expect(html).not.toContain('<div hidden=""><title>generated page</title></div>');
+  });
+
+  it("falls back to the default html-limited bot list for an empty config string", async () => {
+    // Next.js normalizes a falsy htmlLimitedBots config to the default bot regex.
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/lib/streaming-metadata.ts
+    const html = await buildGeneratedMetadataRouteHtml("HeadlessChrome", "");
+
+    expect(html).not.toContain("<title>generated page</title><div");
+    expect(html).toContain('<div hidden=""><title>generated page</title></div>');
+  });
+
   it("resolves child segments from tree positions and preserves route groups", () => {
     expect(
       resolveAppPageChildSegments(["(marketing)", "blog", "[slug]", "[...parts]"], 1, {
@@ -447,6 +616,73 @@ describe("app page route wiring helpers", () => {
 
     expect(containsElementType(elements["route:/dashboard"], RouteLoadingProbe)).toBe(false);
     expect(containsElementType(elements["slot:sidebar:/"], SlotLoadingProbe)).toBe(false);
+  });
+
+  it("serializes route loading UI instead of page content for loading-shell prefetches", async () => {
+    const elements = buildAppPageElements({
+      element: createElement(PageProbe),
+      makeThenableParams(params) {
+        return Promise.resolve(params);
+      },
+      matchedParams: {},
+      resolvedMetadata: null,
+      resolvedViewport: {},
+      route: {
+        error: null,
+        errors: [null],
+        layoutTreePositions: [0],
+        layouts: [{ default: RootLayout }],
+        loading: { default: RouteLoadingProbe },
+        notFound: null,
+        notFounds: [null],
+        routeSegments: ["dashboard"],
+        templateTreePositions: [],
+        templates: [],
+      },
+      routePath: "/dashboard",
+      rootNotFoundModule: null,
+      renderMode: APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
+    });
+
+    expect(elements["page:/dashboard"]).toBeNull();
+    expect(elements[APP_PREFETCH_LOADING_SHELL_MARKER_KEY]).toBe("LoadingBoundary");
+    const html = await renderRouteEntry(elements, "route:/dashboard");
+
+    expect(html).toContain("Route loading");
+    expect(html).not.toContain("Page");
+  });
+
+  it("does not render page content for loading-shell prefetches without a route loading boundary", async () => {
+    const elements = buildAppPageElements({
+      element: createElement(PageProbe),
+      makeThenableParams(params) {
+        return Promise.resolve(params);
+      },
+      matchedParams: {},
+      resolvedMetadata: null,
+      resolvedViewport: {},
+      route: {
+        error: null,
+        errors: [null],
+        layoutTreePositions: [0],
+        layouts: [{ default: RootLayout }],
+        loading: null,
+        notFound: null,
+        notFounds: [null],
+        routeSegments: ["dashboard"],
+        templateTreePositions: [],
+        templates: [],
+      },
+      routePath: "/dashboard",
+      rootNotFoundModule: null,
+      renderMode: APP_RSC_RENDER_MODE_PREFETCH_LOADING_SHELL,
+    });
+
+    expect(elements["page:/dashboard"]).toBeNull();
+    expect(elements[APP_PREFETCH_LOADING_SHELL_MARKER_KEY]).toBeUndefined();
+    const html = await renderRouteEntry(elements, "route:/dashboard");
+
+    expect(html).not.toContain("Page");
   });
 
   it("uses override params for slot segment maps when an override page is active", async () => {
@@ -994,6 +1230,64 @@ describe("app page route wiring helpers", () => {
 
     expect(body).toContain("page:de");
     expect(body).not.toContain("page:en");
+  });
+
+  it("releases skipped layout dependencies before serializing retained child entries", async () => {
+    let activeLocale = "en";
+
+    async function StaticLayout(props: Record<string, unknown>) {
+      await Promise.resolve();
+      activeLocale = "de";
+      return createElement("div", { "data-layout": "static" }, readChildren(props.children));
+    }
+
+    function LocalePage() {
+      return createElement("main", null, `page:${activeLocale}`);
+    }
+
+    const elements = buildAppPageElements({
+      element: createElement(LocalePage),
+      makeThenableParams(params) {
+        return Promise.resolve(params);
+      },
+      matchedParams: {},
+      resolvedMetadata: null,
+      resolvedViewport: {},
+      route: {
+        error: null,
+        errors: [null],
+        layoutTreePositions: [0],
+        layouts: [{ default: StaticLayout }],
+        loading: null,
+        notFound: null,
+        notFounds: [null],
+        routeSegments: ["skip-layout"],
+        slots: null,
+        templateTreePositions: [],
+        templates: [],
+      },
+      routePath: "/skip-layout",
+      rootNotFoundModule: null,
+    });
+
+    const payload = buildOutgoingAppPayload({
+      element: elements,
+      layoutFlags: { "layout:/": "s" },
+      skipDisposition: {
+        code: "SKIP_STATIC_LAYOUT_VERIFIED",
+        enabled: true,
+        mode: "skipStaticLayout",
+        skippedEntryIds: ["layout:/"],
+      },
+    });
+
+    expect(isAppElementsRecord(payload)).toBe(true);
+    if (!isAppElementsRecord(payload)) return;
+    expect(Object.hasOwn(payload, "layout:/")).toBe(false);
+
+    const body = await withTimeout(renderHtml(readChildren(payload["page:/skip-layout"])), 1_000);
+
+    expect(body).toContain("page:en");
   });
 
   it("renders template-only segments in the route entry even without a matching layout", async () => {

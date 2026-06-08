@@ -1,11 +1,9 @@
 import { existsSync } from "node:fs";
 import { glob } from "node:fs/promises";
+import path from "node:path";
+import { escapeRegExp } from "../utils/regex.js";
 
 const DEFAULT_PAGE_EXTENSIONS = ["tsx", "ts", "jsx", "js"] as const;
-
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
 
 export function normalizePageExtensions(pageExtensions?: readonly string[] | null): string[] {
   if (!Array.isArray(pageExtensions) || pageExtensions.length === 0) {
@@ -47,7 +45,7 @@ export function createValidFileMatcher(
 ): ValidFileMatcher {
   const extensions = normalizePageExtensions(pageExtensions);
   const dottedExtensions = extensions.map((ext) => `.${ext}`);
-  const extPattern = `(?:${extensions.map((ext) => escapeRegex(ext)).join("|")})`;
+  const extPattern = `(?:${extensions.map((ext) => escapeRegExp(ext)).join("|")})`;
 
   const extensionRegex = new RegExp(`\\.${extPattern}$`);
   const createLeafPattern = (fileNames: readonly string[]): RegExp => {
@@ -88,6 +86,57 @@ export function createValidFileMatcher(
 /** Check if a file exists with any configured page extension. */
 export function findFileWithExtensions(basePath: string, matcher: ValidFileMatcher): boolean {
   return matcher.dottedExtensions.some((ext) => existsSync(basePath + ext));
+}
+
+/**
+ * Find a file by basename and configured page extension in a directory.
+ * Returns the first matching absolute path, or null if not found.
+ */
+export function findFileWithExts(
+  dir: string,
+  name: string,
+  matcher: ValidFileMatcher,
+): string | null {
+  for (const ext of matcher.dottedExtensions) {
+    const filePath = path.join(dir, name + ext);
+    if (existsSync(filePath)) return filePath;
+  }
+  return null;
+}
+
+/**
+ * Vite's default `resolve.extensions` covers `.tsx/.ts/.jsx/.js/.json` (and
+ * `.mjs/.mts`). When the user configures `pageExtensions` with values Vite
+ * does not know about — e.g. `["platform.tsx", "tsx", "mdx"]` from the
+ * Next.js `resolve-extensions` fixture — extensionless imports of those
+ * files fail to resolve, and the build crashes with "Custom deploy script
+ * failed: undefined (1)".
+ *
+ * Build the merged extension list that Vite should use:
+ *
+ *  1. User-configured pageExtensions go first (each prefixed with `.`) so
+ *     the user's priority wins. e.g. `.platform.tsx` resolves before `.tsx`.
+ *  2. Vite's defaults follow, with duplicates removed.
+ *
+ * The user's pageExtensions retain their relative order, which is what
+ * Next.js / Turbopack do via the `resolveExtensions` config option.
+ *
+ * See: cloudflare/vinext#1502
+ */
+export function buildViteResolveExtensions(
+  pageExtensions?: readonly string[] | null,
+  viteDefaults: readonly string[] = [".mjs", ".js", ".mts", ".ts", ".jsx", ".tsx", ".json"],
+): string[] {
+  const normalized = normalizePageExtensions(pageExtensions);
+  const dotted = normalized.map((ext) => `.${ext}`);
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const ext of [...dotted, ...viteDefaults]) {
+    if (seen.has(ext)) continue;
+    seen.add(ext);
+    result.push(ext);
+  }
+  return result;
 }
 
 /**

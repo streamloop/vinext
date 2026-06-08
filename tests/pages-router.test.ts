@@ -31,6 +31,99 @@ function getBuildBundlerOptions(result: any) {
   return result.build?.rolldownOptions ?? result.build?.rollupOptions;
 }
 
+/**
+ * Fixture: a Pages Router app with both `pages/index.tsx` (static) and
+ * `pages/[id].tsx` (dynamic root catch). Models the
+ * `test/e2e/middleware-trailing-slash` Next.js fixture: a static `ssr-page`
+ * route, a `[id]` dynamic root, plus next.config.js afterFiles rewrites
+ * (`/rewrite-1` → `/ssr-page?from=config`) and a middleware that rewrites
+ * `/rewrite-me` to `/`. After any rewrite the rewrite target must go
+ * through full route resolution — static routes must beat the `[id]`
+ * dynamic root.
+ */
+function writeMiddlewareRewritePriorityFixture(rootDir: string): void {
+  fs.mkdirSync(path.join(rootDir, "pages"), { recursive: true });
+  const nmLink = path.join(rootDir, "node_modules");
+  if (!fs.existsSync(nmLink)) {
+    fs.symlinkSync(path.join(process.cwd(), "node_modules"), nmLink);
+  }
+  fs.writeFileSync(path.join(rootDir, "pages", "_app.tsx"), PAGES_APP_COMPONENT);
+  fs.writeFileSync(
+    path.join(rootDir, "pages", "index.tsx"),
+    `export default function Home() {
+  return <p id="home">Hello World</p>;
+}
+`,
+  );
+  fs.writeFileSync(
+    path.join(rootDir, "pages", "[id].tsx"),
+    `export const getServerSideProps = ({ params, query }) => ({
+  props: { id: params.id ?? null, q: query.id ?? null },
+});
+export default function Dynamic({ id, q }: { id: string | null; q: string | null }) {
+  return (
+    <div>
+      <p id="dynamic">Dynamic route</p>
+      <p id="id">{id}</p>
+      <p id="q">{q}</p>
+    </div>
+  );
+}
+`,
+  );
+  fs.writeFileSync(
+    path.join(rootDir, "pages", "about.tsx"),
+    `export default function About() {
+  return <p id="about">About Page</p>;
+}
+`,
+  );
+  fs.writeFileSync(
+    path.join(rootDir, "pages", "ssr-page.tsx"),
+    `export const getServerSideProps = ({ query }) => ({
+  props: { from: query.from ?? null },
+});
+export default function SsrPage({ from }: { from: string | null }) {
+  return (
+    <div>
+      <p id="ssr">Hello World</p>
+      <p id="from">{from ?? ""}</p>
+    </div>
+  );
+}
+`,
+  );
+  fs.writeFileSync(
+    path.join(rootDir, "next.config.js"),
+    `module.exports = {
+  trailingSlash: true,
+  rewrites() {
+    return [
+      { source: "/rewrite-1", destination: "/ssr-page?from=config" },
+    ];
+  },
+};
+`,
+  );
+  fs.writeFileSync(
+    path.join(rootDir, "middleware.ts"),
+    `import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
+
+export default function middleware(request: NextRequest) {
+  const url = new URL(request.url);
+  if (url.pathname === "/rewrite-me" || url.pathname === "/rewrite-me/") {
+    return NextResponse.rewrite(new URL("/", request.url));
+  }
+  if (url.pathname === "/rewrite-to-about" || url.pathname === "/rewrite-to-about/") {
+    return NextResponse.rewrite(new URL("/about", request.url));
+  }
+  return NextResponse.next();
+}
+`,
+  );
+}
+
 function writeEncodedSlashPagesFixture(rootDir: string): void {
   fs.mkdirSync(path.join(rootDir, "pages", "a"), { recursive: true });
   const nmLink = path.join(rootDir, "node_modules");
@@ -264,6 +357,67 @@ describe("Pages Router integration", () => {
     expect(html).toContain("This is the about page.");
   });
 
+  // Refs #1463: Pages Router should reject non-GET/HEAD methods to static
+  // (no `getServerSideProps`) pages with a 405 + `Allow: GET, HEAD`.
+  // Ported from Next.js: test/e2e/prerender.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/prerender.test.ts
+  // ('should respond with 405 for POST to static page').
+  it("returns 405 with Allow: GET, HEAD on POST to a static Pages page", async () => {
+    const res = await fetch(`${baseUrl}/about`, { method: "POST" });
+    expect(res.status).toBe(405);
+    expect(res.headers.get("allow")).toBe("GET, HEAD");
+    expect(await res.text()).toContain("Method Not Allowed");
+  });
+
+  // Refs #1463: GSP (getStaticProps) pages are also "static" from the
+  // routing perspective; POST should produce 405. Mirrors the Next.js
+  // condition `(typeof components.Component === 'string' || isSSG)` in
+  // `.nextjs-ref/packages/next/src/server/base-server.ts` around L2287.
+  it("returns 405 with Allow: GET, HEAD on POST to a GSP page", async () => {
+    const res = await fetch(`${baseUrl}/isr-test`, { method: "POST" });
+    expect(res.status).toBe(405);
+    expect(res.headers.get("allow")).toBe("GET, HEAD");
+  });
+
+  // GET/HEAD must continue to work — guards against an over-broad fix.
+  it("HEAD on a static Pages page still returns 200", async () => {
+    const res = await fetch(`${baseUrl}/about`, { method: "HEAD" });
+    expect(res.status).toBe(200);
+  });
+
+  // SSR pages (those with getServerSideProps) must NOT be blocked: the
+  // page may legitimately read req.method inside getServerSideProps.
+  // Next.js gates 405 on `(typeof components.Component === 'string' || isSSG)`
+  // — gSSP routes are neither.
+  it("does not return 405 on POST to a getServerSideProps page", async () => {
+    const res = await fetch(`${baseUrl}/ssr`, { method: "POST" });
+    expect(res.status).not.toBe(405);
+  });
+
+  // Tests that React 19 SSR preserves literal string action attributes.
+  // Note: This is NOT testing server action invocation (unlike the upstream
+  // Next.js test action-in-pages-router.test.ts which tests "use server" functions).
+  // Regression test for issue #1476.
+  it("preserves literal action:foo in form action attribute", async () => {
+    const res = await fetch(`${baseUrl}/action-string-test`);
+    expect(res.status).toBe(200);
+
+    const html = await res.text();
+    // React 19 may strip action: strings if it mistakes them for server action IDs.
+    expect(html).toContain('action="action:foo"');
+  });
+
+  // Ported from Next.js: test/e2e/async-modules/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/async-modules/index.test.ts
+  it("renders pages that use top-level await (async modules)", async () => {
+    const res = await fetch(`${baseUrl}/async-modules-test`);
+    expect(res.status).toBe(200);
+
+    const html = await res.text();
+    expect(html).toContain('<div id="app-value">hello</div>');
+    expect(html).toContain('<div id="page-value">42</div>');
+  });
+
   it("adds middleware CSP nonces to Pages Router next data", async () => {
     const res = await fetch(`${baseUrl}/dynamic-page?mw-csp-nonce=pages-response`);
     expect(res.status).toBe(200);
@@ -279,8 +433,15 @@ describe("Pages Router integration", () => {
     const first = await fetch(`${baseUrl}/isr-test`);
     expect(first.status).toBe(200);
     expect(first.headers.get("x-vinext-cache")).toBe("MISS");
+    expect(first.headers.get("x-nextjs-cache")).toBe("MISS");
     const firstHtml = await first.text();
     expect(firstHtml).not.toContain("nonce=");
+
+    const cached = await fetch(`${baseUrl}/isr-test`);
+    expect(cached.status).toBe(200);
+    expect(cached.headers.get("x-vinext-cache")).toBe("HIT");
+    expect(cached.headers.get("x-nextjs-cache")).toBe("HIT");
+    await cached.text();
 
     const second = await fetch(`${baseUrl}/isr-test?mw-csp-nonce=pages-isr`);
     expect(second.status).toBe(200);
@@ -304,6 +465,37 @@ describe("Pages Router integration", () => {
     expect(html).toContain("Rendered at:");
   });
 
+  // Regression test for #1459: Next.js explicitly supports a Promise value
+  // for `getServerSideProps` `props`. vinext must `await` the value before
+  // serialising — otherwise pageProps end up as a Promise and the rendered
+  // page shows empty values.
+  it("awaits Promise-shaped getServerSideProps props", async () => {
+    const res = await fetch(`${baseUrl}/ssr-promise-props`);
+    expect(res.status).toBe(200);
+
+    const html = await res.text();
+    expect(html).toContain("SSR Promise Props");
+    expect(html).toContain("world");
+    // React SSR inserts a `<!-- -->` comment between text and expressions.
+    expect(html).toMatch(/count:\s*(<!--\s*-->)?\s*42/);
+    // The serialized __NEXT_DATA__ payload must contain the resolved values
+    // (not an empty pageProps object).
+    expect(html).toMatch(/"pageProps":\s*\{[^}]*"hello":\s*"world"/);
+  });
+
+  // Regression test for #1354: when a page declares `getServerSideProps` as
+  // a local `const` and exports it via `export { getServerSideProps }`, the
+  // client-bundle transform must strip the export specifier without
+  // redeclaring the identifier. Prior to the fix, the build failed with
+  // `Identifier 'getServerSideProps' has already been declared` under OXC.
+  it("renders a page that exports gSSP via `export { ... }` named re-export", async () => {
+    const res = await fetch(`${baseUrl}/gssp-named-export`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("gSSP via named export");
+    expect(html).toContain("Hello from named-export gSSP");
+  });
+
   it("getServerSideProps headers and status are applied to the response", async () => {
     const res = await fetch(`${baseUrl}/ssr-headers`);
     // gSSP sets statusCode = 201
@@ -315,6 +507,26 @@ describe("Pages Router integration", () => {
     // Cookie set via res.setHeader("set-cookie", ...)
     const setCookie = res.headers.get("set-cookie");
     expect(setCookie).toContain("gssp_token=abc123");
+  });
+
+  // Regression for #1461: gSSP responses must carry the default Cache-Control
+  // header that Next.js applies for getServerSideProps pages so CDNs and
+  // browsers do not cache the per-request payload.
+  it("sets the default Cache-Control header on getServerSideProps responses", async () => {
+    const res = await fetch(`${baseUrl}/ssr`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe(
+      "private, no-cache, no-store, max-age=0, must-revalidate",
+    );
+  });
+
+  // Regression for #1461: when getServerSideProps overrides Cache-Control via
+  // res.setHeader, the user-provided value must reach the final HTTP response
+  // instead of being clobbered by the default.
+  it("preserves res.setHeader Cache-Control overrides set in getServerSideProps", async () => {
+    const res = await fetch(`${baseUrl}/ssr-cache-control`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("public, max-age=42");
   });
 
   it("getServerSideProps calling res.end() short-circuits the response", async () => {
@@ -335,6 +547,67 @@ describe("Pages Router integration", () => {
     expect(html).toContain("Page Not Found");
     // Should be wrapped in the _app layout
     expect(html).toContain("app-wrapper");
+  });
+
+  // Regression for #1465: a getServerSideProps `{ redirect }` on an HTML
+  // request emits a real HTTP redirect (so a hard navigation lands on the
+  // destination).
+  it("getServerSideProps returning redirect emits an HTTP redirect on HTML requests", async () => {
+    const res = await fetch(`${baseUrl}/gssp-redirect`, { redirect: "manual" });
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toBe("/gssp-redirect-target");
+  });
+
+  // Regression for #1465: a getServerSideProps `{ redirect }` on a `_next/data`
+  // request must NOT emit an HTTP redirect (fetch would follow it to non-JSON
+  // HTML). Instead Next.js returns a 200 JSON envelope carrying `__N_REDIRECT`
+  // / `__N_REDIRECT_STATUS` in pageProps, which the client router uses to
+  // re-dispatch a fresh navigation (superseding the in-flight one). See
+  // packages/next/src/server/render.tsx (`__N_REDIRECT`).
+  it("getServerSideProps redirect returns __N_REDIRECT JSON on _next/data requests", async () => {
+    // The dev `_next/data` endpoint matches the build id
+    // `nextConfig.buildId ?? __VINEXT_BUILD_ID ?? "development"`; this fixture's
+    // next.config.mjs sets `generateBuildId: () => "test-build-id"` (see
+    // index.ts `_next/data` normalization).
+    const res = await fetch(`${baseUrl}/_next/data/test-build-id/gssp-redirect.json`, {
+      headers: { Accept: "application/json", "x-nextjs-data": "1" },
+      redirect: "manual",
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    expect(res.headers.get("location")).toBeNull();
+
+    const body = (await res.json()) as { pageProps?: Record<string, unknown> };
+    expect(body.pageProps?.__N_REDIRECT).toBe("/gssp-redirect-target");
+    expect(body.pageProps?.__N_REDIRECT_STATUS).toBe(307);
+  });
+
+  // The data envelope must carry an EXTERNAL redirect destination verbatim so
+  // the client router hard-navigates to the right place (the client must not
+  // fall back to the originating page URL — that would loop). See
+  // handleDataRedirect() in shims/router.ts.
+  it("preserves an external destination in __N_REDIRECT on _next/data requests", async () => {
+    const res = await fetch(`${baseUrl}/_next/data/test-build-id/gssp-redirect-external.json`, {
+      headers: { Accept: "application/json", "x-nextjs-data": "1" },
+      redirect: "manual",
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { pageProps?: Record<string, unknown> };
+    expect(body.pageProps?.__N_REDIRECT).toBe("https://example.com/landing");
+  });
+
+  // Regression for #1458: when getServerSideProps throws, dev (and prod) must
+  // render the user's custom pages/500.tsx with status 500 rather than the
+  // plain "Internal Server Error" text. Mirrors Next.js test/e2e/getserversideprops
+  // "should handle throw ENOENT correctly".
+  it("getServerSideProps throwing renders custom 500 page (dev)", async () => {
+    const res = await fetch(`${baseUrl}/gssp-throw`);
+    expect(res.status).toBe(500);
+    const html = await res.text();
+    expect(html).toContain("custom pages/500");
+    expect(html).not.toBe("Internal Server Error");
   });
 
   it("renders dynamic routes with params", async () => {
@@ -473,6 +746,26 @@ describe("Pages Router integration", () => {
     expect(html).toContain("@vite/client");
   });
 
+  it("installs the vinext dev error overlay in the hydration script", async () => {
+    const res = await fetch(`${baseUrl}/`);
+    const html = await res.text();
+    const hydrationProxyPath = html.match(
+      /<script type="module" src="([^"]*html-proxy[^"]*)"><\/script>/,
+    )?.[1];
+    expect(hydrationProxyPath).toBeDefined();
+
+    const hydrationProxy = await fetch(new URL(hydrationProxyPath!, baseUrl)).then((response) =>
+      response.text(),
+    );
+    expect(hydrationProxy).toContain("dev-error-overlay");
+    expect(hydrationProxy).toContain("overlay.installDevErrorOverlay()");
+    expect(hydrationProxy).toContain("overlay.installViteHmrErrorHandler(import.meta.hot)");
+    expect(hydrationProxy).toContain("overlay.reportInitialDevServerErrors()");
+    expect(hydrationProxy).toContain(
+      'hydrateRoot(document.getElementById("__next"), element, hydrateRootOptions)',
+    );
+  });
+
   it("wraps pages with custom _app.tsx", async () => {
     const res = await fetch(`${baseUrl}/`);
     const html = await res.text();
@@ -597,6 +890,38 @@ describe("Pages Router integration", () => {
   it("returns 404 for non-existent API routes", async () => {
     const res = await fetch(`${baseUrl}/api/nonexistent`);
     expect(res.status).toBe(404);
+  });
+
+  // Regression coverage for cloudflare/vinext#1338 — Pages Router edge
+  // runtime API routes (`export const config = { runtime: 'edge' }`) must
+  // execute and return the user's Web Response (200), not 500.
+  //
+  // Ported from Next.js: test/e2e/edge-pages-support/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/edge-pages-support/index.test.ts
+  it("serves Pages Router edge runtime API routes (export const config = { runtime: 'edge' })", async () => {
+    const res = await fetch(`${baseUrl}/api/edge-hello?a=b`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+
+    const data = await res.json();
+    expect(data).toEqual({
+      hello: "world",
+      query: { a: "b" },
+    });
+  });
+
+  // Regression coverage for cloudflare/vinext#1338 — Pages Router OG image
+  // routes using `next/og` ImageResponse with `runtime: 'edge'` must execute
+  // and return image/png, not 404.
+  //
+  // Ported from Next.js: test/e2e/og-api/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/og-api/index.test.ts
+  it("serves Pages Router OG image routes (next/og + edge runtime)", async () => {
+    const res = await fetch(`${baseUrl}/api/og`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("image/png");
+    const body = await res.blob();
+    expect(body.size).toBeGreaterThan(0);
   });
 
   // --- Client Hydration ---
@@ -880,12 +1205,185 @@ describe("Pages Router integration", () => {
     expect(res.headers.get("location")).toContain("/about");
   });
 
+  // Regression for #1331: after a middleware rewrite, the rewrite target
+  // must go through full route resolution where static routes win over
+  // dynamic catch-alls. Without the fix the `[id]` dynamic page captures
+  // the rewrite target and renders "Dynamic route" with id="rewrite-me".
+  it("middleware rewrite to / resolves to static index over [id] dynamic route (dev)", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-mw-rewrite-priority-dev-"));
+    writeMiddlewareRewritePriorityFixture(tmpDir);
+
+    let tempServer: ViteDevServer | undefined;
+    try {
+      const started = await startFixtureServer(tmpDir);
+      tempServer = started.server;
+
+      const res = await fetch(`${started.baseUrl}/rewrite-me/`);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // `id="home"` is unique to `pages/index.tsx`; ssr-page also says
+      // "Hello World" so this disambiguates that the index rendered.
+      expect(html).toContain('id="home"');
+      expect(html).toContain("Hello World");
+      expect(html).not.toContain("Dynamic route");
+    } finally {
+      await tempServer?.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("middleware rewrite to /about resolves to static about over [id] dynamic route (dev)", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-mw-rewrite-priority-dev-about-"));
+    writeMiddlewareRewritePriorityFixture(tmpDir);
+
+    let tempServer: ViteDevServer | undefined;
+    try {
+      const started = await startFixtureServer(tmpDir);
+      tempServer = started.server;
+
+      const res = await fetch(`${started.baseUrl}/rewrite-to-about/`);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("About Page");
+      expect(html).not.toContain("Dynamic route");
+    } finally {
+      await tempServer?.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  // Regression for #1331: next.config.js rewrites with `trailingSlash: true`
+  // and a `[id].tsx` dynamic root catch — the `[id]` route is also matched
+  // by the rewrite source, so afterFiles rewrites must still be considered
+  // (the matched route is dynamic), and the rewrite target must resolve to
+  // the static page, not back into `[id]`.
+  it("config afterFiles rewrite target resolves static page over [id] dynamic root (dev)", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-mw-rewrite-priority-dev-cfg-"));
+    writeMiddlewareRewritePriorityFixture(tmpDir);
+
+    let tempServer: ViteDevServer | undefined;
+    try {
+      const started = await startFixtureServer(tmpDir);
+      tempServer = started.server;
+
+      const res = await fetch(`${started.baseUrl}/rewrite-1/`);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // `id="ssr"` only lives on the rewrite target (`pages/ssr-page.tsx`) —
+      // `pages/index.tsx` also says "Hello World" so this disambiguates that
+      // the rewrite target is what rendered.
+      expect(html).toContain('id="ssr"');
+      expect(html).toContain("Hello World");
+      expect(html).not.toContain("Dynamic route");
+    } finally {
+      await tempServer?.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it("middleware rewrites /rewritten to /ssr", async () => {
     const res = await fetch(`${baseUrl}/rewritten`);
     expect(res.status).toBe(200);
     const html = await res.text();
     // Should get the SSR page content (rewritten from /rewritten to /ssr)
     expect(html).toContain("Server-Side Rendered");
+  });
+
+  // Regression for cloudflare/vinext#1471: when a query value itself contains
+  // a query string (e.g. `?href=/about?hello=world`), the embedded `?hello=world`
+  // is part of the `href` value per RFC 3986 — only the first `?` separates the
+  // path from the query string. `getServerSideProps({ query })` must surface
+  // the full value so `<Link href={query.href}>` renders the complete target.
+  // Mirrors `test/e2e/trailing-slashes/pages/linker.js` from the Next.js suite.
+  it("Pages Router Link preserves an embedded query string in the href prop", async () => {
+    const res = await fetch(`${baseUrl}/linker?href=/about?hello=world`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The rendered link target must include the embedded `?hello=world`. The
+    // anchor uses `id="link"` to match Next.js's linker fixture; the literal
+    // anchor href is what `<Link>` resolves through normalizePathTrailingSlash
+    // and withBasePath. With trailingSlash:false and no basePath this is the
+    // exact source string.
+    expect(html).toContain('href="/about?hello=world"');
+  });
+
+  it("Pages Router Link strips trailing slash before an embedded query string", async () => {
+    const res = await fetch(`${baseUrl}/linker?href=/about/?hello=world`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // trailingSlash defaults to false — `/about/?hello=world` collapses to
+    // `/about?hello=world` while preserving the query.
+    expect(html).toContain('href="/about?hello=world"');
+  });
+
+  // Ported from Next.js: test/e2e/edge-pages-support/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/edge-pages-support/index.test.ts
+  // Closes cloudflare/vinext#1342: original query params must survive a
+  // middleware rewrite. Next.js merges via
+  // Object.assign(parsedUrl.query, rewrittenParsedUrl.query) — original first,
+  // rewrite-target overrides on key conflicts.
+  it("middleware rewrite preserves original query params to getServerSideProps", async () => {
+    const res = await fetch(`${baseUrl}/mw-rewrite-query?hello=world`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("SSR Query");
+    const nextDataMatch = html.match(/<script>window\.__NEXT_DATA__\s*=\s*({.*?})<\/script>/);
+    expect(nextDataMatch).toBeTruthy();
+    const nextData = JSON.parse(nextDataMatch![1]!);
+    expect(nextData.props.pageProps.query).toMatchObject({ hello: "world" });
+  });
+
+  it("middleware rewrite to a dynamic route merges original query with route params", async () => {
+    const res = await fetch(`${baseUrl}/mw-rewrite-dynamic-query?hello=world`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toMatch(/Post:\s*(<!--\s*-->)?\s*first/);
+    const nextDataMatch = html.match(/<script>window\.__NEXT_DATA__\s*=\s*({.*?})<\/script>/);
+    expect(nextDataMatch).toBeTruthy();
+    const nextData = JSON.parse(nextDataMatch![1]!);
+    expect(nextData.props.pageProps.query).toMatchObject({ id: "first", hello: "world" });
+  });
+
+  it("middleware rewrite with target-side query lets rewrite-target win on key conflicts", async () => {
+    // Original ?hello=world, rewrite target is /ssr-query?hello=from-rewrite —
+    // rewrite-target query should win, matching Next.js Object.assign semantics.
+    const res = await fetch(`${baseUrl}/mw-rewrite-merge-query?hello=world&other=keep`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const nextDataMatch = html.match(/<script>window\.__NEXT_DATA__\s*=\s*({.*?})<\/script>/);
+    expect(nextDataMatch).toBeTruthy();
+    const nextData = JSON.parse(nextDataMatch![1]!);
+    expect(nextData.props.pageProps.query).toMatchObject({
+      hello: "from-rewrite",
+      other: "keep",
+    });
+  });
+
+  it("middleware rewrite without any original query still renders correctly", async () => {
+    const res = await fetch(`${baseUrl}/mw-rewrite-query`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("SSR Query");
+    const nextDataMatch = html.match(/<script>window\.__NEXT_DATA__\s*=\s*({.*?})<\/script>/);
+    expect(nextDataMatch).toBeTruthy();
+    const nextData = JSON.parse(nextDataMatch![1]!);
+    expect(nextData.props.pageProps.query).toEqual({});
+  });
+
+  // Regression for cloudflare/vinext#1342: middleware that explicitly deletes
+  // search params from `request.nextUrl` and rewrites to it must observe only
+  // the keys it kept — vinext must NOT silently re-merge the original query.
+  // Ported from Next.js: test/e2e/middleware-rewrites/test/index.test.ts
+  // ("should clear query parameters")
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/middleware-rewrites/test/index.test.ts
+  it("middleware rewrite respects searchParams.delete on the rewrite-target URL", async () => {
+    const res = await fetch(`${baseUrl}/mw-clear-query-params?a=1&b=2&foo=bar&allowed=kept`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const nextDataMatch = html.match(/<script>window\.__NEXT_DATA__\s*=\s*({.*?})<\/script>/);
+    expect(nextDataMatch).toBeTruthy();
+    const nextData = JSON.parse(nextDataMatch![1]!);
+    expect(nextData.props.pageProps.query).toEqual({ allowed: "kept" });
   });
 
   it("middleware blocks /blocked with 403", async () => {
@@ -1026,16 +1524,35 @@ describe("Pages Router integration", () => {
     expect(html).toMatch(/isFallback:.*false/);
   });
 
-  it("SSR renders unlisted path with getStaticPaths fallback: true (on-demand)", async () => {
-    // In dev/SSR mode, fallback: true still renders fully (same as blocking)
-    // because data is always available via on-demand SSR.
+  it("renders fallback shell for unlisted path with getStaticPaths fallback: true", async () => {
+    // Next.js parity: when `fallback: true` and the path isn't pre-rendered,
+    // skip getStaticProps, render with `useRouter().isFallback === true`, and
+    // ship a loading shell that the client later swaps for the full data.
+    // See: .nextjs-ref/packages/next/src/server/render.tsx — `if (isSSG && !isFallback)`.
     const res = await fetch(`${baseUrl}/products/unknown`);
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toMatch(/Product\s*(<!-- -->)?\s*unknown/);
-    expect(html).toMatch(/Product ID:.*unknown/);
-    // isFallback should be false since we always SSR fully
-    expect(html).toMatch(/isFallback:.*false/);
+    expect(html).toContain("Loading product...");
+    // The full-content branch must NOT render — getStaticProps was skipped.
+    expect(html).not.toMatch(/Product ID:.*unknown/);
+    const match = html.match(/__NEXT_DATA__\s*=\s*(\{.*?\})\s*[;<]/);
+    expect(match).toBeTruthy();
+    const nextData = JSON.parse(match![1]);
+    expect(nextData.isFallback).toBe(true);
+    // Empty pageProps on the fallback shell — client fetches them later.
+    expect(nextData.props).toEqual({ pageProps: {} });
+  });
+
+  it("resolves real props for the data URL of an unlisted fallback: true path", async () => {
+    // Counterpart to the fallback-shell test: the page HTML ships empty props,
+    // but the client follows up with `/_next/data/<buildId>/products/unknown.json`
+    // to fetch the actual props. That request must invoke getStaticProps.
+    const res = await fetch(`${baseUrl}/_next/data/test-build-id/products/unknown.json`, {
+      headers: { "x-nextjs-data": "1" },
+    });
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.pageProps).toMatchObject({ pid: "unknown" });
   });
 
   it("includes isFallback: false in __NEXT_DATA__", async () => {
@@ -1109,6 +1626,80 @@ describe("Pages Router integration", () => {
     const res = await fetch(`${baseUrl}/`);
     expect(res.status).toBe(200);
   });
+
+  // ── /_next/data JSON endpoint (issue #1330) ──────────────────────
+  // Ported from Next.js: test/e2e/middleware-general/test/index.test.ts
+  // ("should trigger middleware for data requests").
+  describe("/_next/data JSON endpoint", () => {
+    // pages-basic's next.config.mjs pins the build id to "test-build-id".
+    // In dev the plugin now reads this from the resolved config so the
+    // value matches the prod-server's embedded buildId.
+    const BUILD_ID = "test-build-id";
+
+    it("returns { pageProps } JSON for a getServerSideProps page", async () => {
+      const res = await fetch(`${baseUrl}/_next/data/${BUILD_ID}/ssr.json`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      const json = (await res.json()) as { pageProps: { message: string } };
+      expect(json.pageProps.message).toBe("Hello from getServerSideProps");
+    });
+
+    it("returns { pageProps } JSON for a getStaticProps page", async () => {
+      // /isr-test uses getStaticProps with revalidate; the data endpoint
+      // must bypass the HTML ISR cache and surface the props as JSON
+      // (mirroring Next.js' `isNextDataRequest` cache-bypass path).
+      const res = await fetch(`${baseUrl}/_next/data/${BUILD_ID}/isr-test.json`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      const json = (await res.json()) as { pageProps: Record<string, unknown> };
+      expect(json).toHaveProperty("pageProps");
+      expect(typeof json.pageProps).toBe("object");
+    });
+
+    it("normalizes the URL to /<page> BEFORE middleware runs", async () => {
+      const res = await fetch(`${baseUrl}/_next/data/${BUILD_ID}/ssr.json`);
+      expect(res.status).toBe(200);
+      // Middleware exposes the pathname it observed via `x-mw-pathname`.
+      // The raw `/_next/data/...` should never reach the middleware function —
+      // Next.js normalizes it to `/ssr` first.
+      expect(res.headers.get("x-mw-pathname")).toBe("/ssr");
+      // The middleware also sets `x-custom-middleware: active` on every match,
+      // proving the middleware actually executed for this request.
+      expect(res.headers.get("x-custom-middleware")).toBe("active");
+    });
+
+    it("returns 404 JSON for an unknown page", async () => {
+      const res = await fetch(`${baseUrl}/_next/data/${BUILD_ID}/totally-missing-page.json`);
+      expect(res.status).toBe(404);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      // Body must still be valid JSON so naive clients calling `.json()` do
+      // not throw before checking the status code.
+      expect(await res.json()).toEqual({});
+    });
+
+    it("returns JSON 404 when getStaticPaths fallback:false rejects the path", async () => {
+      // /blog/[slug] has `fallback: false` and only allows the slugs listed
+      // in getStaticPaths. An unlisted slug must produce a JSON 404 for
+      // data requests (not the HTML 404 page) so the client router can
+      // hard-navigate instead of failing to parse HTML as JSON.
+      const res = await fetch(
+        `${baseUrl}/_next/data/${BUILD_ID}/blog/this-slug-does-not-exist.json`,
+      );
+      expect(res.status).toBe(404);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(await res.json()).toEqual({});
+    });
+
+    it("returns JSON 404 for a stale buildId (dev)", async () => {
+      // Mirrors the prod-server path: when the buildId in the URL doesn't
+      // match the resolved buildId we surface a JSON 404 right away so the
+      // client can hard-navigate (instead of parsing Vite's HTML 404).
+      const res = await fetch(`${baseUrl}/_next/data/wrong-build-id/ssr.json`);
+      expect(res.status).toBe(404);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(await res.json()).toEqual({});
+    });
+  });
 });
 
 describe("Pages Router dev server origin check", () => {
@@ -1171,14 +1762,14 @@ describe("Pages Router dev server origin check", () => {
   });
 
   it("blocks image endpoint redirect to /@* internal paths", async () => {
-    const res = await fetch(`${baseUrl}/_vinext/image?url=/@fs/etc/passwd&w=100&q=75`, {
+    const res = await fetch(`${baseUrl}/_next/image?url=/@fs/etc/passwd&w=100&q=75`, {
       redirect: "manual",
     });
     expect(res.status).toBe(400);
   });
 
   it("blocks image endpoint redirect to /__vite internal paths", async () => {
-    const res = await fetch(`${baseUrl}/_vinext/image?url=/__vite_hmr&w=100&q=75`, {
+    const res = await fetch(`${baseUrl}/_next/image?url=/__vite_hmr&w=100&q=75`, {
       redirect: "manual",
     });
     expect(res.status).toBe(400);
@@ -1186,7 +1777,7 @@ describe("Pages Router dev server origin check", () => {
 
   it("blocks image endpoint redirect to /node_modules paths", async () => {
     const res = await fetch(
-      `${baseUrl}/_vinext/image?url=/node_modules/.vite/manifest.json&w=100&q=75`,
+      `${baseUrl}/_next/image?url=/node_modules/.vite/manifest.json&w=100&q=75`,
       {
         redirect: "manual",
       },
@@ -1314,6 +1905,44 @@ describe("Virtual server entry generation", () => {
       expect(code).not.toMatch(/["']\/(posts|blog|articles|docs|products)\/:[\w]+["']/);
       expect(code).not.toContain(":slug+");
       expect(code).not.toContain(":slug*");
+    } finally {
+      await testServer.close();
+    }
+  });
+
+  // Issue #1329 — `window.next = { version, router, ... }` must be exposed
+  // before the Next.js deploy test suite can run `next.router.push(...)`
+  // via `browser.eval()`. The installer (shims/router.ts → installWindowNext)
+  // only runs once next/router is imported, so the client entry must
+  // statically import next/router at the top, not lazily inside hydrate().
+  //
+  // Mirrors Next.js: .nextjs-ref/packages/next/src/client/next.ts (line 5),
+  // which statically imports the router from './' before initialize/hydrate.
+  it("client entry statically imports next/router so window.next.router is set before hydration", async () => {
+    const testServer = await createServer({
+      root: FIXTURE_DIR,
+      configFile: false,
+      plugins: [vinext()],
+      server: { port: 0 },
+      logLevel: "silent",
+    });
+
+    try {
+      const resolved = await testServer.pluginContainer.resolveId("virtual:vinext-client-entry");
+      expect(resolved).toBeTruthy();
+      const loaded = await testServer.pluginContainer.load(resolved!.id);
+      expect(loaded).toBeTruthy();
+      const code = typeof loaded === "string" ? loaded : ((loaded as any)?.code ?? "");
+
+      // Static import — module-level side effect installs window.next.router.
+      expect(code).toMatch(
+        /^import\s+\{[^}]*\bwrapWithRouterContext\b[^}]*\}\s+from\s+["']next\/router["']/m,
+      );
+
+      // Defense-in-depth: the original lazy `await import("next/router")`
+      // inside hydrate() must NOT remain, otherwise the static import is
+      // dead-code and the side effect can be tree-shaken or deferred.
+      expect(code).not.toMatch(/await\s+import\(\s*["']next\/router["']\s*\)/);
     } finally {
       await testServer.close();
     }
@@ -2022,8 +2651,9 @@ export const config = { matcher: ["/protected"] };
       },
     });
 
-    // Verify client output exists
-    const assetsDir = path.join(outDir, "client", "assets");
+    // Verify client output exists under Next.js's canonical `_next/static/`
+    // directory (matches `resolveAssetsDir("")`).
+    const assetsDir = path.join(outDir, "client", "_next", "static");
     expect(fs.existsSync(assetsDir)).toBe(true);
 
     // Verify SSR manifest was produced
@@ -2210,6 +2840,505 @@ export default function CounterPage() {
           const assetRes = await fetch(`${baseUrl}${url}`);
           expect(assetRes.status, `expected 200 for ${url}`).toBe(200);
         }
+      } finally {
+        await new Promise<void>((resolve) => prodServer.close(() => resolve()));
+      }
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("renders pages/404 for basePath route misses after stripping one basePath segment", async () => {
+    const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-pages-basepath-404-"));
+    const rootNodeModules = path.resolve(import.meta.dirname, "../node_modules");
+    const fixtureOutDir = path.join(tmpRoot, "dist");
+
+    try {
+      await fsp.symlink(rootNodeModules, path.join(tmpRoot, "node_modules"), "junction");
+      await fsp.mkdir(path.join(tmpRoot, "pages"), { recursive: true });
+      await fsp.writeFile(path.join(tmpRoot, "package.json"), JSON.stringify({ type: "module" }));
+      await fsp.writeFile(
+        path.join(tmpRoot, "next.config.mjs"),
+        `export default { basePath: "/docs" };\n`,
+      );
+      await fsp.writeFile(path.join(tmpRoot, "pages", "_app.tsx"), PAGES_APP_COMPONENT);
+      await fsp.writeFile(
+        path.join(tmpRoot, "pages", "404.tsx"),
+        `export default function Custom404() {
+  return <main id="custom-404">This page could not be found</main>;
+}
+`,
+      );
+      await fsp.writeFile(
+        path.join(tmpRoot, "pages", "hello.tsx"),
+        `export default function Hello() {
+  return <main id="hello">Hello World</main>;
+}
+`,
+      );
+
+      await buildPagesFixtureToOutDir(tmpRoot, fixtureOutDir);
+
+      const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
+      const prodServer = unwrapStartedProdServer(
+        await startProdServer({
+          port: 0,
+          host: "127.0.0.1",
+          outDir: fixtureOutDir,
+        }),
+      );
+
+      try {
+        const addr = prodServer.address() as { port: number };
+        const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+        const res = await fetch(`${baseUrl}/docs/docs/other-page`);
+        expect(res.status).toBe(404);
+        const html = await res.text();
+        expect(html).toContain('id="custom-404"');
+        expect(html).toContain("This page could not be found");
+        expect(html).toContain('"page":"/404"');
+      } finally {
+        await new Promise<void>((resolve) => prodServer.close(() => resolve()));
+      }
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("applies fallback rewrites before rendering custom 404 pages", async () => {
+    const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-pages-fallback-before-404-"));
+    const rootNodeModules = path.resolve(import.meta.dirname, "../node_modules");
+    const fixtureOutDir = path.join(tmpRoot, "dist");
+
+    try {
+      await fsp.symlink(rootNodeModules, path.join(tmpRoot, "node_modules"), "junction");
+      await fsp.mkdir(path.join(tmpRoot, "pages"), { recursive: true });
+      await fsp.writeFile(path.join(tmpRoot, "package.json"), JSON.stringify({ type: "module" }));
+      await fsp.writeFile(
+        path.join(tmpRoot, "next.config.mjs"),
+        `export default {
+  basePath: "/docs",
+  async rewrites() {
+    return {
+      fallback: [{ source: "/:path*", destination: "/fallback" }],
+    };
+  },
+};
+`,
+      );
+      await fsp.writeFile(path.join(tmpRoot, "pages", "_app.tsx"), PAGES_APP_COMPONENT);
+      await fsp.writeFile(
+        path.join(tmpRoot, "pages", "404.tsx"),
+        `export default function Custom404() {
+  const shouldThrow = Boolean(
+    (globalThis as { __VINEXT_FALLBACK_REWRITE_TEST_RUNTIME?: boolean })
+      .__VINEXT_FALLBACK_REWRITE_TEST_RUNTIME,
+  );
+  if (shouldThrow) {
+    throw new Error("pages/404 should not execute before fallback rewrites");
+  }
+  return <main id="custom-404">This page could not be found</main>;
+}
+`,
+      );
+      await fsp.writeFile(
+        path.join(tmpRoot, "pages", "fallback.tsx"),
+        `export default function Fallback() {
+  return <main id="fallback">Fallback rewrite</main>;
+}
+`,
+      );
+
+      await buildPagesFixtureToOutDir(tmpRoot, fixtureOutDir);
+
+      const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
+      const prodServer = unwrapStartedProdServer(
+        await startProdServer({
+          port: 0,
+          host: "127.0.0.1",
+          outDir: fixtureOutDir,
+        }),
+      );
+
+      try {
+        const addr = prodServer.address() as { port: number };
+        const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+        const explicitNotFoundRes = await fetch(`${baseUrl}/docs/404`);
+        expect(explicitNotFoundRes.status).toBe(404);
+        const explicitNotFoundHtml = await explicitNotFoundRes.text();
+        expect(explicitNotFoundHtml).toContain('id="custom-404"');
+        expect(explicitNotFoundHtml).toContain("This page could not be found");
+        expect(explicitNotFoundHtml).toContain('"page":"/404"');
+        expect(explicitNotFoundHtml).not.toContain('id="fallback"');
+
+        (
+          globalThis as { __VINEXT_FALLBACK_REWRITE_TEST_RUNTIME?: boolean }
+        ).__VINEXT_FALLBACK_REWRITE_TEST_RUNTIME = true;
+        const res = await fetch(`${baseUrl}/docs/missing`);
+        expect(res.status).toBe(200);
+        const html = await res.text();
+        expect(html).toContain('id="fallback"');
+        expect(html).toContain("Fallback rewrite");
+        expect(html).toContain('"page":"/fallback"');
+        expect(html).not.toContain("pages/404 should not execute before fallback rewrites");
+      } finally {
+        delete (globalThis as { __VINEXT_FALLBACK_REWRITE_TEST_RUNTIME?: boolean })
+          .__VINEXT_FALLBACK_REWRITE_TEST_RUNTIME;
+        await new Promise<void>((resolve) => prodServer.close(() => resolve()));
+      }
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to pages/_error for route misses when pages/404 is absent", async () => {
+    const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-pages-basepath-error-"));
+    const rootNodeModules = path.resolve(import.meta.dirname, "../node_modules");
+    const fixtureOutDir = path.join(tmpRoot, "dist");
+
+    try {
+      await fsp.symlink(rootNodeModules, path.join(tmpRoot, "node_modules"), "junction");
+      await fsp.mkdir(path.join(tmpRoot, "pages"), { recursive: true });
+      await fsp.writeFile(path.join(tmpRoot, "package.json"), JSON.stringify({ type: "module" }));
+      await fsp.writeFile(
+        path.join(tmpRoot, "next.config.mjs"),
+        `export default { basePath: "/docs" };\n`,
+      );
+      await fsp.writeFile(path.join(tmpRoot, "pages", "_app.tsx"), PAGES_APP_COMPONENT);
+      await fsp.writeFile(
+        path.join(tmpRoot, "pages", "_error.tsx"),
+        `export default function ErrorPage({ statusCode }: { statusCode?: number }) {
+  return <main id="custom-error">Error status: {statusCode}</main>;
+}
+`,
+      );
+      await fsp.writeFile(
+        path.join(tmpRoot, "pages", "hello.tsx"),
+        `export default function Hello() {
+  return <main id="hello">Hello World</main>;
+}
+`,
+      );
+
+      await buildPagesFixtureToOutDir(tmpRoot, fixtureOutDir);
+
+      const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
+      const prodServer = unwrapStartedProdServer(
+        await startProdServer({
+          port: 0,
+          host: "127.0.0.1",
+          outDir: fixtureOutDir,
+        }),
+      );
+
+      try {
+        const addr = prodServer.address() as { port: number };
+        const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+        const res = await fetch(`${baseUrl}/docs/docs/other-page`);
+        expect(res.status).toBe(404);
+        const html = await res.text();
+        expect(html).toContain('id="custom-error"');
+        expect(html).toContain("Error status:");
+        expect(html).toContain("404</main>");
+        expect(html).toContain('"page":"/_error"');
+      } finally {
+        await new Promise<void>((resolve) => prodServer.close(() => resolve()));
+      }
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  // Ported from Next.js: test/e2e/error-handler-not-found-req-url/error-handler-not-found-req-url.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/error-handler-not-found-req-url/error-handler-not-found-req-url.test.ts
+  it("passes the original request URL and asPath to _error.getInitialProps for getStaticProps notFound", async () => {
+    const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-pages-gsp-notfound-error-"));
+    const rootNodeModules = path.resolve(import.meta.dirname, "../node_modules");
+    const fixtureOutDir = path.join(tmpRoot, "dist");
+
+    try {
+      await fsp.symlink(rootNodeModules, path.join(tmpRoot, "node_modules"), "junction");
+      await fsp.mkdir(path.join(tmpRoot, "pages"), { recursive: true });
+      await fsp.writeFile(path.join(tmpRoot, "package.json"), JSON.stringify({ type: "module" }));
+      await fsp.writeFile(path.join(tmpRoot, "next.config.mjs"), `export default {};\n`);
+      await fsp.writeFile(path.join(tmpRoot, "pages", "_app.tsx"), PAGES_APP_COMPONENT);
+      await fsp.writeFile(
+        path.join(tmpRoot, "pages", "_error.tsx"),
+        `import type { NextPageContext } from "next";
+
+type ErrorProps = { reqUrl?: string; asPath?: string };
+
+ErrorPage.getInitialProps = (ctx: NextPageContext): ErrorProps => {
+  return {
+    reqUrl: ctx.req?.url,
+    asPath: ctx.asPath,
+  };
+};
+
+export default function ErrorPage({ reqUrl, asPath }: ErrorProps) {
+  return <p>reqUrl: {reqUrl}, asPath: {asPath}</p>;
+}
+`,
+      );
+      await fsp.writeFile(
+        path.join(tmpRoot, "pages", "[slug].tsx"),
+        `export default function Page() {
+  return <p>hello world</p>;
+}
+
+export async function getStaticProps() {
+  return {
+    notFound: true,
+  };
+}
+
+export async function getStaticPaths() {
+  return {
+    paths: [],
+    fallback: "blocking",
+  };
+}
+`,
+      );
+
+      await buildPagesFixtureToOutDir(tmpRoot, fixtureOutDir);
+
+      const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
+      const prodServer = unwrapStartedProdServer(
+        await startProdServer({
+          port: 0,
+          host: "127.0.0.1",
+          outDir: fixtureOutDir,
+        }),
+      );
+
+      try {
+        const addr = prodServer.address() as { port: number };
+        const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+        const res = await fetch(`${baseUrl}/3`);
+        expect(res.status).toBe(404);
+        const html = await res.text();
+        const visibleText = html
+          .replace(/<!--[\s\S]*?-->/g, "")
+          .replace(/<[^>]*>/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+
+        expect(visibleText).toContain("reqUrl: /3, asPath: /3");
+        expect(html).toContain('"page":"/_error"');
+      } finally {
+        await new Promise<void>((resolve) => prodServer.close(() => resolve()));
+      }
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("renders explicit pages/404 over pages/_error when getStaticProps returns notFound", async () => {
+    const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-pages-gsp-notfound-404-"));
+    const rootNodeModules = path.resolve(import.meta.dirname, "../node_modules");
+    const fixtureOutDir = path.join(tmpRoot, "dist");
+
+    try {
+      await fsp.symlink(rootNodeModules, path.join(tmpRoot, "node_modules"), "junction");
+      await fsp.mkdir(path.join(tmpRoot, "pages"), { recursive: true });
+      await fsp.writeFile(path.join(tmpRoot, "package.json"), JSON.stringify({ type: "module" }));
+      await fsp.writeFile(path.join(tmpRoot, "next.config.mjs"), `export default {};\n`);
+      await fsp.writeFile(path.join(tmpRoot, "pages", "_app.tsx"), PAGES_APP_COMPONENT);
+      await fsp.writeFile(
+        path.join(tmpRoot, "pages", "_error.tsx"),
+        `export default function ErrorPage() {
+  return <p id="error">_error page</p>;
+}
+`,
+      );
+      await fsp.writeFile(
+        path.join(tmpRoot, "pages", "404.tsx"),
+        `export default function Custom404() {
+  return <p id="custom-404">custom 404</p>;
+}
+`,
+      );
+      await fsp.writeFile(
+        path.join(tmpRoot, "pages", "[slug].tsx"),
+        `export default function Page() {
+  return <p>hello world</p>;
+}
+
+export async function getStaticProps() {
+  return {
+    notFound: true,
+  };
+}
+
+export async function getStaticPaths() {
+  return {
+    paths: [],
+    fallback: "blocking",
+  };
+}
+`,
+      );
+
+      await buildPagesFixtureToOutDir(tmpRoot, fixtureOutDir);
+
+      const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
+      const prodServer = unwrapStartedProdServer(
+        await startProdServer({
+          port: 0,
+          host: "127.0.0.1",
+          outDir: fixtureOutDir,
+        }),
+      );
+
+      try {
+        const addr = prodServer.address() as { port: number };
+        const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+        const res = await fetch(`${baseUrl}/3`);
+        expect(res.status).toBe(404);
+        const html = await res.text();
+        expect(html).toContain('id="custom-404"');
+        expect(html).toContain("custom 404");
+        expect(html).not.toContain('id="error"');
+        expect(html).toContain('"page":"/404"');
+      } finally {
+        await new Promise<void>((resolve) => prodServer.close(() => resolve()));
+      }
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("passes the original error to _error.getInitialProps when getServerSideProps throws", async () => {
+    const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-pages-gssp-throw-error-"));
+    const rootNodeModules = path.resolve(import.meta.dirname, "../node_modules");
+    const fixtureOutDir = path.join(tmpRoot, "dist");
+
+    try {
+      await fsp.symlink(rootNodeModules, path.join(tmpRoot, "node_modules"), "junction");
+      await fsp.mkdir(path.join(tmpRoot, "pages"), { recursive: true });
+      await fsp.writeFile(path.join(tmpRoot, "package.json"), JSON.stringify({ type: "module" }));
+      await fsp.writeFile(path.join(tmpRoot, "next.config.mjs"), `export default {};\n`);
+      await fsp.writeFile(path.join(tmpRoot, "pages", "_app.tsx"), PAGES_APP_COMPONENT);
+      await fsp.writeFile(
+        path.join(tmpRoot, "pages", "_error.tsx"),
+        `import type { NextPageContext } from "next";
+
+type ErrorProps = { errMessage?: string };
+
+ErrorPage.getInitialProps = (ctx: NextPageContext): ErrorProps => {
+  return {
+    errMessage: ctx.err instanceof Error ? ctx.err.message : String(ctx.err),
+  };
+};
+
+export default function ErrorPage({ errMessage }: ErrorProps) {
+  return <p>errMessage: {errMessage}</p>;
+}
+`,
+      );
+      await fsp.writeFile(
+        path.join(tmpRoot, "pages", "index.tsx"),
+        `export default function Page() {
+  return <p>hello world</p>;
+}
+
+export async function getServerSideProps() {
+  throw new Error("intentional gssp throw");
+}
+`,
+      );
+
+      await buildPagesFixtureToOutDir(tmpRoot, fixtureOutDir);
+
+      const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
+      const prodServer = unwrapStartedProdServer(
+        await startProdServer({
+          port: 0,
+          host: "127.0.0.1",
+          outDir: fixtureOutDir,
+        }),
+      );
+
+      try {
+        const addr = prodServer.address() as { port: number };
+        const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+        const res = await fetch(`${baseUrl}/`);
+        expect(res.status).toBe(500);
+        const html = await res.text();
+        const visibleText = html
+          .replace(/<!--[\s\S]*?-->/g, "")
+          .replace(/<[^>]*>/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+
+        expect(visibleText).toContain("errMessage: intentional gssp throw");
+      } finally {
+        await new Promise<void>((resolve) => prodServer.close(() => resolve()));
+      }
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves 404 status for cached ISR custom 404 route misses", async () => {
+    const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-pages-isr-404-"));
+    const rootNodeModules = path.resolve(import.meta.dirname, "../node_modules");
+    const fixtureOutDir = path.join(tmpRoot, "dist");
+
+    try {
+      await fsp.symlink(rootNodeModules, path.join(tmpRoot, "node_modules"), "junction");
+      await fsp.mkdir(path.join(tmpRoot, "pages"), { recursive: true });
+      await fsp.writeFile(path.join(tmpRoot, "package.json"), JSON.stringify({ type: "module" }));
+      await fsp.writeFile(path.join(tmpRoot, "next.config.mjs"), `export default {};\n`);
+      await fsp.writeFile(path.join(tmpRoot, "pages", "_app.tsx"), PAGES_APP_COMPONENT);
+      await fsp.writeFile(
+        path.join(tmpRoot, "pages", "404.tsx"),
+        `export async function getStaticProps() {
+  return { props: { marker: "custom ISR 404" }, revalidate: 60 };
+}
+
+export default function Custom404({ marker }: { marker: string }) {
+  return <main id="custom-404">{marker}</main>;
+}
+`,
+      );
+
+      await buildPagesFixtureToOutDir(tmpRoot, fixtureOutDir);
+
+      const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
+      const prodServer = unwrapStartedProdServer(
+        await startProdServer({
+          port: 0,
+          host: "127.0.0.1",
+          outDir: fixtureOutDir,
+        }),
+      );
+
+      try {
+        const addr = prodServer.address() as { port: number };
+        const baseUrl = `http://127.0.0.1:${addr.port}`;
+        const missingUrl = `${baseUrl}/cached-custom-404-miss`;
+
+        const first = await fetch(missingUrl);
+        expect(first.status).toBe(404);
+        expect(first.headers.get("x-vinext-cache")).toBe("MISS");
+        const firstHtml = await first.text();
+        expect(firstHtml).toContain('id="custom-404"');
+        expect(firstHtml).toContain("custom ISR 404");
+
+        const second = await fetch(missingUrl);
+        expect(second.status).toBe(404);
+        expect(second.headers.get("x-vinext-cache")).toBe("HIT");
+        const secondHtml = await second.text();
+        expect(secondHtml).toContain('id="custom-404"');
+        expect(secondHtml).toContain("custom ISR 404");
       } finally {
         await new Promise<void>((resolve) => prodServer.close(() => resolve()));
       }
@@ -2461,8 +3590,30 @@ export default function CounterPage() {
       // Test: SSR page with getServerSideProps
       const ssrRes = await fetch(`${prodUrl}/ssr`);
       expect(ssrRes.status).toBe(200);
+      // Regression for #1461: gssp pages get the default Cache-Control header.
+      expect(ssrRes.headers.get("cache-control")).toBe(
+        "private, no-cache, no-store, max-age=0, must-revalidate",
+      );
       const ssrHtml = await ssrRes.text();
       expect(ssrHtml).toContain("Server-Side Rendered");
+
+      // Regression for #1461: user-set Cache-Control via res.setHeader sticks.
+      const ssrCcRes = await fetch(`${prodUrl}/ssr-cache-control`);
+      expect(ssrCcRes.status).toBe(200);
+      expect(ssrCcRes.headers.get("cache-control")).toBe("public, max-age=42");
+      await ssrCcRes.text();
+
+      // Regression test for #1354: a page that exports `getServerSideProps`
+      // via a separate `export { getServerSideProps }` re-export must build
+      // and render in production. Previously, the client bundle transform
+      // emitted a stub `export const getServerSideProps = undefined;` that
+      // collided with the user's local `const getServerSideProps = ...`
+      // binding and broke the Rolldown/OXC parse step.
+      const gsspNamedRes = await fetch(`${prodUrl}/gssp-named-export`);
+      expect(gsspNamedRes.status).toBe(200);
+      const gsspNamedHtml = await gsspNamedRes.text();
+      expect(gsspNamedHtml).toContain("gSSP via named export");
+      expect(gsspNamedHtml).toContain("Hello from named-export gSSP");
 
       // Test: API route
       const apiRes = await fetch(`${prodUrl}/api/hello`);
@@ -2503,9 +3654,46 @@ export default function CounterPage() {
       expect(ldJsonRes.status).toBe(200);
       expect(await ldJsonRes.json()).toEqual({ title: "doc" });
 
+      // Test: Pages Router edge runtime API route. Regression coverage for
+      // cloudflare/vinext#1338 — edge runtime API routes were reported as
+      // returning 500 against the Next.js deploy suite. Verifies the
+      // production server entry correctly dispatches edge handlers.
+      const edgeApiRes = await fetch(`${prodUrl}/api/edge-hello?a=b`);
+      expect(edgeApiRes.status).toBe(200);
+      expect(edgeApiRes.headers.get("content-type")).toContain("application/json");
+      expect(await edgeApiRes.json()).toEqual({ hello: "world", query: { a: "b" } });
+
+      // Test: Pages Router edge runtime OG image route. Regression coverage
+      // for cloudflare/vinext#1338 — OG routes were reported as returning
+      // 404 against the Next.js deploy suite.
+      const ogRes = await fetch(`${prodUrl}/api/og`);
+      expect(ogRes.status).toBe(200);
+      expect(ogRes.headers.get("content-type")).toContain("image/png");
+      expect((await ogRes.blob()).size).toBeGreaterThan(0);
+
       // Test: 404 for unknown route
       const notFoundRes = await fetch(`${prodUrl}/nonexistent`);
       expect(notFoundRes.status).toBe(404);
+
+      // Test: page using top-level await (async module).
+      // Ported from Next.js: test/e2e/async-modules/index.test.ts
+      // https://github.com/vercel/next.js/blob/canary/test/e2e/async-modules/index.test.ts
+      const asyncModRes = await fetch(`${prodUrl}/async-modules-test`);
+      expect(asyncModRes.status).toBe(200);
+      const asyncModHtml = await asyncModRes.text();
+      expect(asyncModHtml).toContain('<div id="app-value">hello</div>');
+      expect(asyncModHtml).toContain('<div id="page-value">42</div>');
+
+      // Regression for #1458: when getServerSideProps throws, the production
+      // server must render the user's custom pages/500.tsx with status 500
+      // instead of returning a plain "Internal Server Error" text response.
+      // Mirrors Next.js test/e2e/getserversideprops "should handle throw
+      // ENOENT correctly" (.nextjs-ref/test/e2e/getserversideprops/test/index.test.ts:377).
+      const gsspThrowRes = await fetch(`${prodUrl}/gssp-throw`);
+      expect(gsspThrowRes.status).toBe(500);
+      const gsspThrowHtml = await gsspThrowRes.text();
+      expect(gsspThrowHtml).toContain("custom pages/500");
+      expect(gsspThrowHtml).not.toBe("Internal Server Error");
     } finally {
       httpServer.close();
     }
@@ -2729,6 +3917,97 @@ describe("Production server middleware (Pages Router)", () => {
     expect(res.headers.get("location")).toContain("/about");
   });
 
+  // Refs #1463: prod-server parity for the dev-server 405 check. POST to a
+  // static Pages Router page must return 405 + Allow: GET, HEAD.
+  // Ported from Next.js: test/e2e/prerender.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/prerender.test.ts
+  // ('should respond with 405 for POST to static page').
+  it("returns 405 with Allow: GET, HEAD on POST to a static Pages page (prod)", async () => {
+    const res = await fetch(`${prodUrl}/about`, { method: "POST" });
+    expect(res.status).toBe(405);
+    expect(res.headers.get("allow")).toBe("GET, HEAD");
+    expect(await res.text()).toContain("Method Not Allowed");
+  });
+
+  // Regression for #1331: after a middleware rewrite, the rewrite target
+  // must go through full route resolution where static routes win over
+  // dynamic catch-alls. Without the fix the `[id]` dynamic page captures
+  // the rewrite target and renders "Dynamic route" with id="rewrite-me".
+  it("middleware rewrite resolves static index over [id] dynamic route in production", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-mw-rewrite-priority-prod-"));
+    writeMiddlewareRewritePriorityFixture(tmpDir);
+
+    let prodServer: import("node:http").Server | undefined;
+    try {
+      await build({
+        root: tmpDir,
+        configFile: false,
+        plugins: [vinext()],
+        logLevel: "silent",
+        build: {
+          outDir: path.join(tmpDir, "dist", "server"),
+          ssr: "virtual:vinext-server-entry",
+          rollupOptions: { output: { entryFileNames: "entry.js" } },
+        },
+      });
+      await build({
+        root: tmpDir,
+        configFile: false,
+        plugins: [vinext()],
+        logLevel: "silent",
+        build: {
+          outDir: path.join(tmpDir, "dist", "client"),
+          manifest: true,
+          ssrManifest: true,
+          rollupOptions: { input: "virtual:vinext-client-entry" },
+        },
+      });
+
+      const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
+      prodServer = unwrapStartedProdServer(
+        await startProdServer({
+          port: 0,
+          host: "127.0.0.1",
+          outDir: path.join(tmpDir, "dist"),
+        }),
+      );
+      const addr = prodServer.address() as { port: number };
+      const tempProdUrl = `http://127.0.0.1:${addr.port}`;
+
+      const indexRes = await fetch(`${tempProdUrl}/rewrite-me/`);
+      expect(indexRes.status).toBe(200);
+      const indexHtml = await indexRes.text();
+      // `id="home"` is unique to `pages/index.tsx`; ssr-page also says
+      // "Hello World" so this disambiguates that the index rendered.
+      expect(indexHtml).toContain('id="home"');
+      expect(indexHtml).toContain("Hello World");
+      expect(indexHtml).not.toContain("Dynamic route");
+
+      const aboutRes = await fetch(`${tempProdUrl}/rewrite-to-about/`);
+      expect(aboutRes.status).toBe(200);
+      const aboutHtml = await aboutRes.text();
+      expect(aboutHtml).toContain("About Page");
+      expect(aboutHtml).not.toContain("Dynamic route");
+
+      // Next.js parity: with trailingSlash: true and a [id] dynamic root,
+      // `/rewrite-1/` matches `[id]` but afterFiles config rewrites must
+      // still rewrite it to /ssr-page, and the rewrite target must resolve
+      // to the static ssr-page rather than back into [id].
+      const cfgRes = await fetch(`${tempProdUrl}/rewrite-1/`);
+      expect(cfgRes.status).toBe(200);
+      const cfgHtml = await cfgRes.text();
+      // `id="ssr"` is unique to `pages/ssr-page.tsx`; `pages/index.tsx`
+      // also says "Hello World" so this disambiguates that the rewrite
+      // target rendered (not the index, not the dynamic [id]).
+      expect(cfgHtml).toContain('id="ssr"');
+      expect(cfgHtml).toContain("Hello World");
+      expect(cfgHtml).not.toContain("Dynamic route");
+    } finally {
+      await new Promise<void>((resolve) => prodServer?.close(() => resolve()) ?? resolve());
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it("does not collapse encoded slashes onto nested routes in production", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-pages-encoded-prod-"));
     writeEncodedSlashPagesFixture(tmpDir);
@@ -2805,8 +4084,34 @@ describe("Production server middleware (Pages Router)", () => {
 
     const html = await res.text();
     expect(html).toContain('<script nonce="pages-prod">window.__NEXT_DATA__ = ');
-    expect(html).toMatch(/<script type="module" nonce="pages-prod" src="\/[^"]+"/);
+    expect(html).toMatch(/<script type="module" defer nonce="pages-prod" src="\/[^"]+"/);
     expect(html).toMatch(/<link rel="modulepreload" nonce="pages-prod" href="\/[^"]+"/);
+  });
+
+  // Ported from Next.js: test/e2e/optimized-loading/test/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/optimized-loading/test/index.test.ts
+  //
+  // Regression for #1519: optimized loading is enabled by default in Next.js
+  // (`experimental.disableOptimizedLoading: false`). Page scripts must be
+  // emitted with `defer` in <head>, not as plain scripts at the end of <body>
+  // (and never as `async`). The Next.js E2E asserts both `script[async]
+  // .length === 0` and `head script[defer].length > 0`.
+  it("emits page scripts with defer in <head> by default (optimized loading)", async () => {
+    const res = await fetch(`${prodUrl}/`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+
+    // No async script tags (matches `script[async].length === 0` upstream).
+    expect(html).not.toMatch(/<script[^>]*\sasync(\s|>|=)/);
+
+    // Locate the head so we can search just that slice for defer scripts.
+    const headEnd = html.indexOf("</head>");
+    expect(headEnd).toBeGreaterThan(-1);
+    const head = html.slice(0, headEnd);
+
+    // Matches `head script[defer].length > 0` upstream.
+    const deferInHead = head.match(/<script[^>]*\sdefer(\s|>|=)[^>]*>/g) ?? [];
+    expect(deferInHead.length).toBeGreaterThan(0);
   });
 
   it("does not serve cached production Pages ISR HTML to CSP nonce requests", async () => {
@@ -2833,6 +4138,120 @@ describe("Production server middleware (Pages Router)", () => {
     const html = await res.text();
     // /rewritten should serve the content of /ssr page
     expect(html).toContain("Server-Side Rendered");
+  });
+
+  // Ported from Next.js: test/e2e/middleware-rewrites/test/index.test.ts
+  // ('should rewrite to fallback: true page successfully').
+  // Refs #1331: post-rewrite fallback: true must render the loading shell.
+  it("renders the loading shell when middleware/route targets an unlisted fallback: true path", async () => {
+    const res = await fetch(`${prodUrl}/products/never-built`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // Page renders its fallback branch (the slug is not in getStaticPaths).
+    expect(html).toContain("Loading product...");
+    // Full-data branch must not have rendered — getStaticProps was skipped.
+    expect(html).not.toMatch(/Product ID:.*never-built/);
+    const match = html.match(/__NEXT_DATA__\s*=\s*(\{.*?\})\s*[;<]/);
+    expect(match).toBeTruthy();
+    const nextData = JSON.parse(match![1]);
+    expect(nextData.isFallback).toBe(true);
+    expect(nextData.props).toEqual({ pageProps: {} });
+  });
+
+  // Ported from Next.js: test/e2e/middleware-rewrites/test/index.test.ts
+  // ('should handle middleware rewrite with body correctly').
+  // Refs #1331: POST bodies must reach the upstream when middleware
+  // externally rewrites the request.
+  it("forwards the POST body to the upstream on external middleware rewrites", async () => {
+    const { createServer: createHttpServer } = await import("node:http");
+    const upstream = createHttpServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        const received = Buffer.concat(chunks);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(received);
+      });
+    });
+
+    try {
+      await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+      const addr = upstream.address();
+      if (typeof addr === "string" || addr === null) throw new Error("Expected upstream port");
+
+      const body = JSON.stringify({ hello: "world" });
+      const res = await fetch(`${prodUrl}/external-middleware-rewrite-body`, {
+        method: "POST",
+        body,
+        headers: {
+          "content-type": "application/json",
+          "x-middleware-test-rewrite-target": `http://127.0.0.1:${addr.port}/echo-body`,
+        },
+      });
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe(body);
+    } finally {
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    }
+  });
+
+  // Ported from Next.js: test/e2e/middleware-rewrites/test/index.test.ts
+  // ('should handle middleware rewrite with body and headers correctly').
+  // Refs #1331: `NextResponse.rewrite(url, { request: { headers } })` request
+  // header overrides must propagate to the proxied upstream request.
+  it("forwards middleware-overridden request headers on external middleware rewrites", async () => {
+    const { createServer: createHttpServer } = await import("node:http");
+    const upstream = createHttpServer((req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ headers: req.headers }));
+    });
+
+    try {
+      await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+      const addr = upstream.address();
+      if (typeof addr === "string" || addr === null) throw new Error("Expected upstream port");
+
+      const res = await fetch(`${prodUrl}/external-middleware-rewrite-with-headers`, {
+        headers: {
+          "x-middleware-test-rewrite-target": `http://127.0.0.1:${addr.port}/echo-headers`,
+        },
+      });
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as { headers: Record<string, string> };
+      expect(json.headers["x-hello-from-middleware1"]).toBe("hello");
+    } finally {
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    }
+  });
+
+  // Ported from Next.js: test/e2e/middleware-rewrites/test/index.test.ts
+  // ('should rewrite to the external url for incoming data request
+  //  externally rewritten'). Refs #1331: a `_next/data/<buildId>/<page>.json`
+  // request whose middleware rewrites to an external URL must proxy through
+  // — the data-request path is not allowed to short-circuit external rewrites.
+  it("proxies through to upstream when an external middleware rewrite hits a data request", async () => {
+    const { createServer: createHttpServer } = await import("node:http");
+    const upstream = createHttpServer((_, res) => {
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end("<!doctype html><html><body>External Domain</body></html>");
+    });
+
+    try {
+      await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+      const addr = upstream.address();
+      if (typeof addr === "string" || addr === null) throw new Error("Expected upstream port");
+
+      const res = await fetch(`${prodUrl}/_next/data/test-build-id/data-external-rewrite.json`, {
+        headers: {
+          "x-nextjs-data": "1",
+          "x-middleware-test-rewrite-target": `http://127.0.0.1:${addr.port}/data`,
+        },
+      });
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain("External Domain");
+    } finally {
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    }
   });
 
   // Ported from Next.js: test/e2e/middleware-rewrites/test/index.test.ts
@@ -2873,6 +4292,65 @@ describe("Production server middleware (Pages Router)", () => {
     expect(res.headers.get("x-rewrite-source-header")).toBe("1");
     const html = await res.text();
     expect(html).toContain("Server-Side Rendered");
+  });
+
+  // Regression for cloudflare/vinext#1342: original request query params must
+  // survive a middleware rewrite into the rewrite target's getServerSideProps.
+  // Mirrors the dev-server coverage so the production prod-server is exercised.
+  // Ported from Next.js: test/e2e/edge-pages-support/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/edge-pages-support/index.test.ts
+  it("middleware rewrite preserves original query params into getServerSideProps in production", async () => {
+    const res = await fetch(`${prodUrl}/mw-rewrite-query?hello=world`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const nextDataMatch = html.match(/<script>window\.__NEXT_DATA__\s*=\s*({.*?})<\/script>/);
+    expect(nextDataMatch).toBeTruthy();
+    const nextData = JSON.parse(nextDataMatch![1]!);
+    expect(nextData.props.pageProps.query).toMatchObject({ hello: "world" });
+  });
+
+  it("middleware rewrite to a dynamic route merges original query with route params in production", async () => {
+    const res = await fetch(`${prodUrl}/mw-rewrite-dynamic-query?hello=world`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const nextDataMatch = html.match(/<script>window\.__NEXT_DATA__\s*=\s*({.*?})<\/script>/);
+    expect(nextDataMatch).toBeTruthy();
+    const nextData = JSON.parse(nextDataMatch![1]!);
+    expect(nextData.props.pageProps.query).toMatchObject({ id: "first", hello: "world" });
+  });
+
+  // Regression for cloudflare/vinext#1342 (production): middleware that
+  // explicitly deletes search params from `request.nextUrl` and rewrites to
+  // it must observe only the keys it kept. Dev coverage of the same shared
+  // code path exists in the integration describe above; this proves the
+  // prod-server path agrees.
+  // Ported from Next.js: test/e2e/middleware-rewrites/test/index.test.ts
+  // ("should clear query parameters")
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/middleware-rewrites/test/index.test.ts
+  it("middleware rewrite respects searchParams.delete on the rewrite-target URL in production", async () => {
+    const res = await fetch(`${prodUrl}/mw-clear-query-params?a=1&b=2&foo=bar&allowed=kept`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const nextDataMatch = html.match(/<script>window\.__NEXT_DATA__\s*=\s*({.*?})<\/script>/);
+    expect(nextDataMatch).toBeTruthy();
+    const nextData = JSON.parse(nextDataMatch![1]!);
+    expect(nextData.props.pageProps.query).toEqual({ allowed: "kept" });
+  });
+
+  // /_next/data fetch for a middleware-rewritten page must also surface the
+  // original request query params in the JSON props envelope. Client-side
+  // navigations go through this code path, so a regression here would silently
+  // break query state after a rewrite even when the HTML render is correct.
+  it("middleware rewrite preserves original query params on _next/data JSON in production", async () => {
+    const res = await fetch(
+      `${prodUrl}/_next/data/test-build-id/mw-rewrite-query.json?hello=world`,
+      { headers: { "x-nextjs-data": "1" } },
+    );
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as {
+      pageProps: { query: Record<string, string | string[]> };
+    };
+    expect(data.pageProps.query).toMatchObject({ hello: "world" });
   });
 
   // Ported from Next.js:
@@ -3092,6 +4570,20 @@ describe("Production server middleware (Pages Router)", () => {
     expect(await res.json()).toEqual({ ok: true, source: "gssp-res-end" });
   });
 
+  // Regression test for #1459: Next.js supports a Promise value for `props`
+  // returned from getServerSideProps. The prod worker entry must await it
+  // before serialising into __NEXT_DATA__ / pageProps.
+  it("awaits Promise-shaped getServerSideProps props in production", async () => {
+    const res = await fetch(`${prodUrl}/ssr-promise-props`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("SSR Promise Props");
+    expect(html).toContain("world");
+    // React SSR inserts a `<!-- -->` comment between text and expressions.
+    expect(html).toMatch(/count:\s*(<!--\s*-->)?\s*42/);
+    expect(html).toMatch(/"pageProps":\s*\{[^}]*"hello":\s*"world"/);
+  });
+
   it("returns 400 for malformed percent-encoded path (not crash)", async () => {
     const res = await fetch(`${prodUrl}/%E0%A4%A`);
     expect(res.status).toBe(400);
@@ -3117,6 +4609,62 @@ describe("Production server middleware (Pages Router)", () => {
     // Ensure encoded variants like /%2Evite/ are also blocked
     const res = await fetch(`${prodUrl}/%2Evite/ssr-manifest.json`);
     expect(res.status).toBe(404);
+  });
+
+  // ── /_next/data JSON endpoint in production (issue #1330) ─────────
+  // Ported from Next.js: test/e2e/middleware-general/test/index.test.ts
+  // ("should trigger middleware for data requests", "should normalize data
+  // requests into page requests").
+  describe("/_next/data JSON endpoint", () => {
+    // pages-basic's next.config.mjs pins the build id to "test-build-id".
+    const BUILD_ID = "test-build-id";
+
+    it("returns { pageProps } JSON for a getServerSideProps page", async () => {
+      const res = await fetch(`${prodUrl}/_next/data/${BUILD_ID}/ssr.json`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      const json = (await res.json()) as { pageProps: { message: string } };
+      expect(json.pageProps.message).toBe("Hello from getServerSideProps");
+    });
+
+    it("returns { pageProps } JSON for a getStaticProps page (bypasses HTML cache)", async () => {
+      // /isr-test uses getStaticProps with revalidate. The data endpoint
+      // must bypass the cached HTML body and surface pageProps as JSON —
+      // mirrors Next.js' `isNextDataRequest` cache-bypass logic in
+      // base-server.ts.
+      const res = await fetch(`${prodUrl}/_next/data/${BUILD_ID}/isr-test.json`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      const json = (await res.json()) as { pageProps: Record<string, unknown> };
+      expect(json).toHaveProperty("pageProps");
+      expect(typeof json.pageProps).toBe("object");
+    });
+
+    it("normalizes the URL to /<page> BEFORE middleware runs", async () => {
+      const res = await fetch(`${prodUrl}/_next/data/${BUILD_ID}/ssr.json`);
+      expect(res.status).toBe(200);
+      // The middleware fixture sets `x-mw-pathname` to whatever pathname it
+      // observed. If `_next/data` is not normalized first, middleware sees
+      // the raw `/_next/data/.../ssr.json` URL — which is the failure mode
+      // tracked in issue #1330 and surfaced by `middleware-general` tests
+      // in the deploy suite.
+      expect(res.headers.get("x-mw-pathname")).toBe("/ssr");
+      expect(res.headers.get("x-custom-middleware")).toBe("active");
+    });
+
+    it("returns JSON 404 for an unknown page", async () => {
+      const res = await fetch(`${prodUrl}/_next/data/${BUILD_ID}/totally-missing-page.json`);
+      expect(res.status).toBe(404);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(await res.json()).toEqual({});
+    });
+
+    it("returns JSON 404 for a stale buildId", async () => {
+      const res = await fetch(`${prodUrl}/_next/data/wrong-build-id/ssr.json`);
+      expect(res.status).toBe(404);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(await res.json()).toEqual({});
+    });
   });
 });
 
@@ -3880,6 +5428,307 @@ export function middleware(request) {
   }
 });
 
+// Ported from Next.js: test/e2e/async-modules/index.test.ts
+// https://github.com/vercel/next.js/blob/canary/test/e2e/async-modules/index.test.ts
+//
+// Verifies that page modules using top-level await (async modules) render
+// their resolved data, not empty content. This covers the Pages Router
+// production build path where `_app.tsx` and the page module each contain
+// `await` at the module top level. Vite/Rolldown must propagate TLA through
+// the generated SSR entry's static imports so the entry awaits these modules
+// before reading their default exports.
+describe("Pages Router top-level await (async modules) in production", () => {
+  let tmpRoot: string;
+  let outDir: string;
+  let prodServer: import("node:http").Server;
+  let prodUrl: string;
+
+  beforeAll(async () => {
+    tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-pages-async-modules-"));
+    outDir = path.join(tmpRoot, "dist");
+    await fsp.symlink(
+      path.resolve(import.meta.dirname, "../node_modules"),
+      path.join(tmpRoot, "node_modules"),
+      "junction",
+    );
+    await fsp.writeFile(path.join(tmpRoot, "package.json"), JSON.stringify({ type: "module" }));
+    await fsp.mkdir(path.join(tmpRoot, "pages", "api"), { recursive: true });
+
+    await fsp.writeFile(
+      path.join(tmpRoot, "pages", "_app.tsx"),
+      `const appValue = await Promise.resolve("hello");
+export default function MyApp({ Component, pageProps }: any) {
+  return <Component {...pageProps} appValue={appValue} />;
+}
+`,
+    );
+
+    await fsp.writeFile(
+      path.join(tmpRoot, "pages", "index.tsx"),
+      `const value = await Promise.resolve(42);
+export default function Index({ appValue }: any) {
+  return (
+    <main>
+      <div id="app-value">{appValue}</div>
+      <div id="page-value">{value}</div>
+    </main>
+  );
+}
+`,
+    );
+
+    await fsp.writeFile(
+      path.join(tmpRoot, "pages", "gssp.tsx"),
+      `const gsspValue = await Promise.resolve(42);
+export async function getServerSideProps() {
+  return { props: { gsspValue } };
+}
+export default function Page({ gsspValue }: any) {
+  return <div id="gssp-value">{gsspValue}</div>;
+}
+`,
+    );
+
+    await fsp.writeFile(
+      path.join(tmpRoot, "pages", "gsp.tsx"),
+      `const gspValue = await Promise.resolve(42);
+export async function getStaticProps() {
+  return { props: { gspValue } };
+}
+export default function Page({ gspValue }: any) {
+  return <div id="gsp-value">{gspValue}</div>;
+}
+`,
+    );
+
+    await fsp.writeFile(
+      path.join(tmpRoot, "pages", "api", "hello.ts"),
+      `const value = await Promise.resolve(42);
+export default function handler(_req: any, res: any) {
+  res.status(200).json({ value });
+}
+`,
+    );
+
+    // Class-based Document. Mirrors the original Next.js async-modules
+    // fixture (pages/_document.jsx) which uses `class MyDocument extends
+    // Document` and provides `docValue` through a `static async
+    // getInitialProps()` override that itself uses top-level `await`. This
+    // requires (a) the `next/document` default export to be a class, not a
+    // function — otherwise React refuses to construct MyDocument and throws
+    // "Class constructor cannot be invoked without 'new'", and (b) the SSR
+    // pipeline to invoke `Document.getInitialProps()` and pass the resolved
+    // props to the Document element, so `this.props.docValue` is defined at
+    // render time (Next.js's render.tsx does this in `documentElement`).
+    await fsp.writeFile(
+      path.join(tmpRoot, "pages", "_document.tsx"),
+      `import Document, { Html, Head, Main, NextScript } from "next/document";
+const docValue = await Promise.resolve("doc value");
+export default class MyDocument extends Document<{ docValue: string }> {
+  static async getInitialProps(ctx: any) {
+    const initialProps = await Document.getInitialProps(ctx);
+    return { ...initialProps, docValue };
+  }
+  render() {
+    return (
+      <Html>
+        <Head />
+        <body>
+          <div id="doc-value">{(this.props as any).docValue}</div>
+          <Main />
+          <NextScript />
+        </body>
+      </Html>
+    );
+  }
+}
+`,
+    );
+
+    // Custom 404 page using top-level await. Mirrors Next.js async-modules
+    // pages/404.jsx — the page module must resolve its top-level await before
+    // the 404 handler renders it.
+    await fsp.writeFile(
+      path.join(tmpRoot, "pages", "404.tsx"),
+      `const content = await Promise.resolve("hi y'all");
+export default function Custom404() {
+  return <h1 id="content-404">{content}</h1>;
+}
+`,
+    );
+
+    await buildPagesFixtureToOutDir(tmpRoot, outDir);
+    const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
+    prodServer = unwrapStartedProdServer(
+      await startProdServer({
+        port: 0,
+        host: "127.0.0.1",
+        outDir,
+      }),
+    );
+    const addr = prodServer.address() as { port: number };
+    prodUrl = `http://127.0.0.1:${addr.port}`;
+  }, 120000);
+
+  afterAll(async () => {
+    if (prodServer) {
+      await new Promise<void>((resolve) => prodServer.close(() => resolve()));
+    }
+    if (tmpRoot) {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("renders an index page whose _app and page both use top-level await", async () => {
+    const res = await fetch(`${prodUrl}/`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<div id="app-value">hello</div>');
+    expect(html).toContain('<div id="page-value">42</div>');
+  });
+
+  it("renders a page whose module-level await runs before getServerSideProps", async () => {
+    const res = await fetch(`${prodUrl}/gssp`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<div id="gssp-value">42</div>');
+  });
+
+  it("renders a page whose module-level await runs before getStaticProps", async () => {
+    const res = await fetch(`${prodUrl}/gsp`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<div id="gsp-value">42</div>');
+  });
+
+  it("serves an API route whose module uses top-level await", async () => {
+    const res = await fetch(`${prodUrl}/api/hello`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ value: 42 });
+  });
+
+  it("renders an async class-based _document.tsx with resolved TLA values", async () => {
+    const res = await fetch(`${prodUrl}/`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('<div id="doc-value">doc value</div>');
+  });
+
+  // Ported from Next.js: test/e2e/async-modules/index.test.ts
+  //   ('can render async 404 pages')
+  // The 404 page module uses top-level `await`. When the prod server falls
+  // through to the custom 404 it must render that module's resolved content.
+  it("renders a custom 404.tsx whose module uses top-level await", async () => {
+    const res = await fetch(`${prodUrl}/dhiuhefoiahjeoij`);
+    expect(res.status).toBe(404);
+    const html = await res.text();
+    expect(html).toContain(`<h1 id="content-404">hi y&#x27;all</h1>`);
+  });
+});
+
+// Ported from Next.js: test/e2e/import-meta/import-meta.test.ts
+// https://github.com/vercel/next.js/blob/v16.2.6/test/e2e/import-meta/import-meta.test.ts
+describe("Pages Router import.meta.url in production", () => {
+  let tmpRoot: string;
+  let outDir: string;
+  let prodServer: import("node:http").Server;
+  let prodUrl: string;
+
+  function decodeHtmlText(text: string): string {
+    return text.replace(/&amp;/g, "&").replace(/&quot;/g, '"');
+  }
+
+  function collectJavaScriptFiles(dir: string): string[] {
+    const files: string[] = [];
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        files.push(...collectJavaScriptFiles(fullPath));
+      } else if (entry.isFile() && entry.name.endsWith(".js")) {
+        files.push(fullPath);
+      }
+    }
+    return files;
+  }
+
+  beforeAll(async () => {
+    tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-pages-import-meta-url-"));
+    outDir = path.join(tmpRoot, "dist");
+
+    await fsp.symlink(
+      path.resolve(import.meta.dirname, "../node_modules"),
+      path.join(tmpRoot, "node_modules"),
+      "junction",
+    );
+    await fsp.writeFile(path.join(tmpRoot, "package.json"), JSON.stringify({ type: "module" }));
+    await fsp.mkdir(path.join(tmpRoot, "pages"), { recursive: true });
+    await fsp.writeFile(
+      path.join(tmpRoot, "pages", "_app.tsx"),
+      `export default function MyApp({ Component, pageProps }: any) {
+  return <Component {...pageProps} />;
+}
+`,
+    );
+    await fsp.writeFile(
+      path.join(tmpRoot, "pages", "index.tsx"),
+      `export default function Page() {
+  const data = { url: import.meta.url };
+  return <div id="test-data">{JSON.stringify(data)}</div>;
+}
+`,
+    );
+
+    await buildPagesFixtureToOutDir(tmpRoot, outDir);
+    const { runPrerender } = await import("../packages/vinext/src/build/run-prerender.js");
+    await runPrerender({
+      root: tmpRoot,
+      pagesBundlePath: path.join(outDir, "server", "entry.js"),
+      concurrency: 1,
+    });
+
+    const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
+    prodServer = unwrapStartedProdServer(
+      await startProdServer({
+        port: 0,
+        host: "127.0.0.1",
+        outDir,
+      }),
+    );
+    const addr = prodServer.address() as { port: number };
+    prodUrl = `http://127.0.0.1:${addr.port}`;
+  }, 120000);
+
+  afterAll(async () => {
+    if (prodServer) {
+      await new Promise<void>((resolve) => prodServer.close(() => resolve()));
+    }
+    if (tmpRoot) {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves the page module file URL during server rendering", async () => {
+    const res = await fetch(`${prodUrl}/`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const match = html.match(/<div id="test-data">([^<]*)<\/div>/);
+    expect(match).not.toBeNull();
+    const data = JSON.parse(decodeHtmlText(match![1])) as { url: string };
+
+    expect(data.url).toMatch(/^file:\/\/\//);
+    expect(data.url).toMatch(/\/pages\/index\.tsx$/);
+    expect(data.url).not.toContain("/dist/server/entry.js");
+  });
+
+  it("normalizes the page module file URL in the client page chunk", () => {
+    const jsFiles = collectJavaScriptFiles(path.join(outDir, "client"));
+    const clientCode = jsFiles.map((file) => fs.readFileSync(file, "utf8")).join("\n");
+
+    expect(clientCode).toContain("file:///ROOT/pages/index.tsx");
+    expect(clientCode).not.toContain("/dist/server/entry.js");
+  });
+});
+
 describe("router __NEXT_DATA__ correctness (Pages Router)", () => {
   let routerServer: ViteDevServer;
   let routerBaseUrl: string;
@@ -4162,6 +6011,7 @@ describe("Pages Router dev ISR regeneration", () => {
         200,
         expect.objectContaining({
           "X-Vinext-Cache": "STALE",
+          "x-nextjs-cache": "STALE",
         }),
       );
 

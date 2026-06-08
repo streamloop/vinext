@@ -1,7 +1,21 @@
-import { test, expect } from "@playwright/test";
-import { waitForAppRouterHydration } from "../helpers";
+import { test, expect, type Page } from "@playwright/test";
+import { isAppRouterRscRequestForPath, waitForAppRouterHydration } from "../helpers";
 
 const BASE = "http://localhost:4174";
+const FEED_DRAFT_VALUE = "source draft survives";
+
+async function fillFeedSourceState(page: Page, value: string = FEED_DRAFT_VALUE): Promise<void> {
+  await expect(page.getByTestId("feed-draft-input")).toBeVisible();
+  await page.getByTestId("feed-draft-input").fill(value);
+}
+
+async function expectFeedSourceState(
+  page: Page,
+  options: { draft?: string; tab?: string } = {},
+): Promise<void> {
+  await expect(page.getByTestId("feed-draft-input")).toHaveValue(options.draft ?? FEED_DRAFT_VALUE);
+  await expect(page.getByTestId("feed-tab-state")).toHaveText(`tab:${options.tab ?? "default"}`);
+}
 
 test.describe("Parallel Routes", () => {
   test("dashboard renders all parallel slot content", async ({ page }) => {
@@ -71,6 +85,13 @@ test.describe("Parallel Routes", () => {
 });
 
 test.describe("Intercepting Routes", () => {
+  // Ported and strengthened from Next.js intercepted route coverage:
+  // - test/e2e/app-dir/parallel-routes-revalidation/parallel-routes-revalidation.test.ts
+  //   https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/parallel-routes-revalidation/parallel-routes-revalidation.test.ts
+  // - test/e2e/app-dir/interception-dynamic-segment/interception-dynamic-segment.test.ts
+  //   https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/interception-dynamic-segment/interception-dynamic-segment.test.ts
+  // - test/e2e/app-dir/parallel-routes-and-interception/parallel-routes-and-interception.test.ts
+  //   https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/parallel-routes-and-interception/parallel-routes-and-interception.test.ts
   test("direct navigation to photo shows full page", async ({ page }) => {
     await page.goto(`${BASE}/photos/42`);
 
@@ -116,16 +137,19 @@ test.describe("Intercepting Routes", () => {
   test("chained intercepted navigations keep the original source context", async ({ page }) => {
     await page.goto(`${BASE}/feed`);
     await waitForAppRouterHydration(page);
+    await fillFeedSourceState(page);
 
     await page.click("#feed-photo-42-link");
     await expect(page.locator('[data-testid="photo-modal"]')).toBeVisible();
     await expect(page.locator('[data-testid="photo-modal"]')).toContainText("Viewing photo 42");
+    await expectFeedSourceState(page);
 
     await page.click("#modal-photo-43-link");
 
     await expect(page.locator('[data-testid="photo-modal"]')).toBeVisible();
     await expect(page.locator('[data-testid="photo-modal"]')).toContainText("Viewing photo 43");
     await expect(page.locator('[data-testid="feed-page"]')).toBeVisible();
+    await expectFeedSourceState(page);
     await expect(page.locator('[data-testid="photo-page"]')).not.toBeVisible();
   });
 
@@ -137,21 +161,38 @@ test.describe("Intercepting Routes", () => {
     // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/parallel-routes-revalidation/parallel-routes-revalidation.test.ts
     await page.goto(`${BASE}/feed`);
     await waitForAppRouterHydration(page);
+    await fillFeedSourceState(page);
 
     await page.click("#feed-photo-42-link");
     await expect(page.locator('[data-testid="photo-modal"]')).toContainText("Viewing photo 42");
+    await expectFeedSourceState(page);
 
     await page.click("#modal-photo-43-link");
     await expect(page.locator('[data-testid="photo-modal"]')).toContainText("Viewing photo 43");
     await expect(page.locator('[data-testid="feed-page"]')).toBeVisible();
+    await expectFeedSourceState(page);
     await expect(page.locator('[data-testid="photo-page"]')).not.toBeVisible();
 
     await page.click('[data-testid="photo-modal-refresh"]');
 
     await expect(page.locator('[data-testid="photo-modal"]')).toContainText("Viewing photo 43");
     await expect(page.locator('[data-testid="feed-page"]')).toBeVisible();
+    await expectFeedSourceState(page);
     await expect(page.locator('[data-testid="photo-page"]')).not.toBeVisible();
     expect(new URL(page.url()).pathname).toBe("/photos/43");
+  });
+
+  test("intercepted navigation preserves source search and client state", async ({ page }) => {
+    await page.goto(`${BASE}/feed?tab=popular`);
+    await waitForAppRouterHydration(page);
+    await fillFeedSourceState(page);
+
+    await page.click("#feed-photo-42-link");
+
+    await expect(page.locator('[data-testid="photo-modal"]')).toContainText("Viewing photo 42");
+    await expect(page.locator('[data-testid="feed-page"]')).toBeVisible();
+    await expectFeedSourceState(page, { tab: "popular" });
+    await expect(page.locator('[data-testid="photo-page"]')).not.toBeVisible();
   });
 
   test("refresh on direct photo load preserves the full-page render", async ({ page }) => {
@@ -168,8 +209,7 @@ test.describe("Intercepting Routes", () => {
   test("refresh on direct target clears stale intercepted history context", async ({ page }) => {
     const refreshInterceptionHeaders: Array<string | null> = [];
     page.on("request", (request) => {
-      const url = new URL(request.url());
-      if (url.pathname === "/photos/42.rsc") {
+      if (isAppRouterRscRequestForPath(request, "/photos/42")) {
         refreshInterceptionHeaders.push(request.headers()["x-vinext-interception-context"] ?? null);
       }
     });
@@ -183,7 +223,18 @@ test.describe("Intercepting Routes", () => {
       const nextState =
         currentState && typeof currentState === "object" ? Object.assign({}, currentState) : {};
       Reflect.set(nextState, "__vinext_previousNextUrl", "/feed");
-      window.history.replaceState(nextState, "", window.location.href);
+
+      const clientNavigationState = Reflect.get(window, Symbol.for("vinext.clientNavigationState"));
+      const originalReplaceState =
+        clientNavigationState && typeof clientNavigationState === "object"
+          ? Reflect.get(clientNavigationState, "originalReplaceState")
+          : null;
+
+      if (typeof originalReplaceState !== "function") {
+        throw new Error("Expected Vinext original history.replaceState to be installed");
+      }
+
+      originalReplaceState.call(window.history, nextState, "", window.location.href);
     });
     await expect
       .poll(() =>
@@ -249,24 +300,29 @@ test.describe("Intercepting Routes", () => {
   test("router.refresh preserves intercepted modal view", async ({ page }) => {
     await page.goto(`${BASE}/feed`);
     await waitForAppRouterHydration(page);
+    await fillFeedSourceState(page);
 
     await page.click("#feed-photo-42-link");
     await expect(page.locator('[data-testid="photo-modal"]')).toBeVisible();
+    await expectFeedSourceState(page);
 
     await page.click('[data-testid="photo-modal-refresh"]');
 
     await expect(page.locator('[data-testid="photo-modal"]')).toBeVisible();
     await expect(page.locator('[data-testid="feed-page"]')).toBeVisible();
+    await expectFeedSourceState(page);
     await expect(page.locator('[data-testid="photo-page"]')).not.toBeVisible();
   });
 
   test("server action from intercepted modal preserves modal tree", async ({ page }) => {
     await page.goto(`${BASE}/feed`);
     await waitForAppRouterHydration(page);
+    await fillFeedSourceState(page);
 
     await page.click("#feed-photo-42-link");
     await expect(page.locator('[data-testid="photo-modal"]')).toBeVisible();
     await expect(page.locator('[data-testid="feed-page"]')).toBeVisible();
+    await expectFeedSourceState(page);
 
     const likesLocator = page.locator('[data-testid="photo-likes"]');
     const baselineText = (await likesLocator.textContent()) ?? "";
@@ -288,6 +344,7 @@ test.describe("Intercepting Routes", () => {
     // direct /photos/[id] page NOT rendered, URL unchanged.
     await expect(page.locator('[data-testid="photo-modal"]')).toBeVisible();
     await expect(page.locator('[data-testid="feed-page"]')).toBeVisible();
+    await expectFeedSourceState(page);
     await expect(page.locator('[data-testid="photo-page"]')).not.toBeVisible();
     expect(new URL(page.url()).pathname).toBe("/photos/42");
 
@@ -366,18 +423,22 @@ test.describe("Intercepting Routes", () => {
   test("back then forward restores intercepted modal view", async ({ page }) => {
     await page.goto(`${BASE}/feed`);
     await waitForAppRouterHydration(page);
+    await fillFeedSourceState(page);
 
     await page.click("#feed-photo-42-link");
     await expect(page.locator('[data-testid="photo-modal"]')).toBeVisible();
     await expect(page.locator('[data-testid="feed-page"]')).toBeVisible();
+    await expectFeedSourceState(page);
 
     await page.goBack();
     await expect(page.locator('[data-testid="photo-modal"]')).not.toBeVisible();
     await expect(page.locator('[data-testid="feed-page"]')).toBeVisible();
+    await expectFeedSourceState(page);
 
     await page.goForward();
     await expect(page.locator('[data-testid="photo-modal"]')).toBeVisible();
     await expect(page.locator('[data-testid="feed-page"]')).toBeVisible();
+    await expectFeedSourceState(page);
     await expect(page.locator('[data-testid="photo-page"]')).not.toBeVisible();
   });
 });

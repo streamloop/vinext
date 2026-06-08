@@ -1,11 +1,20 @@
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { describe, expect, it, vi } from "vite-plus/test";
 import {
   computeRscCacheBustingSearchParam,
   createRscRequestHeaders,
   createRscRequestUrl,
+  VINEXT_RSC_CACHE_BUSTING_SEARCH_PARAM,
   VINEXT_RSC_VARY_HEADER,
 } from "../packages/vinext/src/server/app-rsc-cache-busting.js";
 import { createAppRscHandler } from "../packages/vinext/src/server/app-rsc-handler.js";
+import { createArtifactCompatibilityEnvelope } from "../packages/vinext/src/server/artifact-compatibility.js";
+import {
+  createClientReuseManifest,
+  createClientReusePayloadHash,
+} from "../packages/vinext/src/server/client-reuse-manifest.js";
+import { VINEXT_CLIENT_REUSE_MANIFEST_HEADER } from "../packages/vinext/src/server/headers.js";
 import { makeThenableParams } from "../packages/vinext/src/shims/thenable-params.js";
 
 type TestRoute = {
@@ -47,6 +56,7 @@ function createHandler(overrides: Partial<HandlerOptions> = {}) {
       beforeFiles: [],
       fallback: [],
     },
+    draftModeSecret: overrides.draftModeSecret ?? "test-draft-secret",
     dispatchMatchedPage:
       overrides.dispatchMatchedPage ??
       (async () => new Response("page", { status: 200, headers: { "x-from-dispatch": "page" } })),
@@ -70,6 +80,7 @@ function createHandler(overrides: Partial<HandlerOptions> = {}) {
     metadataRoutes: overrides.metadataRoutes ?? [],
     middlewareModule: overrides.middlewareModule ?? null,
     publicFiles: overrides.publicFiles ?? new Set<string>(),
+    registerCacheAdapters: () => {},
     renderNotFound: overrides.renderNotFound ?? (async () => null),
     renderPagesFallback: overrides.renderPagesFallback,
     rootParamNamesByPattern: overrides.rootParamNamesByPattern,
@@ -78,6 +89,10 @@ function createHandler(overrides: Partial<HandlerOptions> = {}) {
     trailingSlash: overrides.trailingSlash ?? false,
     validateDevRequestOrigin: overrides.validateDevRequestOrigin ?? (() => null),
   });
+}
+
+function prerenderRouteParamsHeader(payload: unknown): string {
+  return encodeURIComponent(JSON.stringify(payload));
 }
 
 describe("createAppRscHandler", () => {
@@ -93,13 +108,43 @@ describe("createAppRscHandler", () => {
     expect(response.headers.get("vary")).toBe(VINEXT_RSC_VARY_HEADER);
   });
 
+  it("does not trailing-slash redirect RSC requests built from already-canonical trailingSlash paths", async () => {
+    const headers = createRscRequestHeaders();
+    const requestPath = await createRscRequestUrl("/about/", headers);
+    const dispatchMatchedPage = vi.fn(async () => new Response("page", { status: 200 }));
+    const route = createPageRoute({ pattern: "/about/", routeSegments: ["about"] });
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedPage,
+      matchRoute(pathname: string) {
+        return pathname === "/about/" ? { params: {}, route } : null;
+      },
+      trailingSlash: true,
+    });
+
+    const response = await handler(
+      new Request(`https://example.test/docs${requestPath}`, { headers }),
+      null,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.has("location")).toBe(false);
+    expect(dispatchMatchedPage).toHaveBeenCalledTimes(1);
+  });
+
   it("marks progressive action page renders even when decoded form state is null", async () => {
     const dispatchMatchedPage = vi.fn(async () => new Response("page", { status: 200 }));
     const handler = createHandler({
       configHeaders: [],
       dispatchMatchedPage,
       async handleProgressiveActionRequest() {
-        return { kind: "form-state", formState: null };
+        return {
+          kind: "form-state",
+          formState: null,
+          pendingCookies: [],
+          draftCookie: null,
+          revalidationKind: 0,
+        };
       },
     });
 
@@ -118,6 +163,313 @@ describe("createAppRscHandler", () => {
         isProgressiveActionRender: true,
       }),
     );
+  });
+
+  // Regression for issue #1483 — `cookies().set(...)` / `cookies().delete(...)`
+  // and `draftMode().enable()` invoked inside a no-JS server action must flow
+  // through to the page rerender response. Before the fix, those Set-Cookie
+  // headers (plus the x-action-revalidated marker) were dropped on the floor
+  // because the handler returned the dispatcher's response untouched.
+  it("propagates cookies, draft cookie, and revalidation marker from a progressive action to the page response (#1483)", async () => {
+    const dispatchMatchedPage = vi.fn(
+      async () =>
+        new Response("page", {
+          status: 200,
+          headers: { "content-type": "text/html; charset=utf-8" },
+        }),
+    );
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedPage,
+      async handleProgressiveActionRequest() {
+        return {
+          kind: "form-state",
+          formState: null,
+          pendingCookies: ["session=abc; Path=/", "theme=dark; Path=/"],
+          draftCookie: "__prerender_bypass=secret; Path=/",
+          revalidationKind: 1,
+        };
+      },
+    });
+
+    const response = await handler(
+      new Request("https://example.test/docs/about", {
+        method: "POST",
+        headers: { "content-type": "multipart/form-data; boundary=vinext" },
+      }),
+      null,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.getSetCookie()).toEqual([
+      "session=abc; Path=/",
+      "theme=dark; Path=/",
+      "__prerender_bypass=secret; Path=/",
+    ]);
+    expect(response.headers.get("x-action-revalidated")).toBe("1");
+  });
+
+  // When an action did not mutate cookies and did not request a revalidation,
+  // the page response should NOT carry an x-action-revalidated marker — that
+  // header tells the client router cache to invalidate, and emitting it
+  // spuriously would force unnecessary refetches.
+  it("does not add x-action-revalidated when a progressive action made no mutations (#1483)", async () => {
+    const dispatchMatchedPage = vi.fn(
+      async () =>
+        new Response("page", {
+          status: 200,
+          headers: { "content-type": "text/html; charset=utf-8" },
+        }),
+    );
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedPage,
+      async handleProgressiveActionRequest() {
+        return {
+          kind: "form-state",
+          formState: null,
+          pendingCookies: [],
+          draftCookie: null,
+          revalidationKind: 0,
+        };
+      },
+    });
+
+    const response = await handler(
+      new Request("https://example.test/docs/about", {
+        method: "POST",
+        headers: { "content-type": "multipart/form-data; boundary=vinext" },
+      }),
+      null,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.getSetCookie()).toEqual([]);
+    expect(response.headers.has("x-action-revalidated")).toBe(false);
+  });
+
+  it("uses encoded prerender route params for rendering while retaining decoded params for static validation", async () => {
+    const previousPrerender = process.env.VINEXT_PRERENDER;
+    process.env.VINEXT_PRERENDER = "1";
+    const dispatchMatchedPage = vi.fn(async () => new Response("page", { status: 200 }));
+    const prerenderRoute = createPageRoute({
+      isDynamic: true,
+      pattern: "/prerender-encoding/:id",
+      routeSegments: ["prerender-encoding", "[id]"],
+    });
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedPage,
+      matchRoute(pathname: string) {
+        return pathname === "/prerender-encoding/sticks & stones"
+          ? {
+              params: { id: "sticks & stones" },
+              route: prerenderRoute,
+            }
+          : null;
+      },
+    });
+
+    try {
+      const response = await handler(
+        new Request("https://example.test/docs/prerender-encoding/sticks%20%26%20stones", {
+          headers: {
+            "x-vinext-prerender-secret": "test-secret",
+            "x-vinext-prerender-route-params": prerenderRouteParamsHeader({
+              routePattern: "/prerender-encoding/:id",
+              params: { id: "sticks%20%26%20stones" },
+            }),
+          },
+        }),
+        null,
+      );
+
+      expect(response.status).toBe(200);
+      expect(dispatchMatchedPage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          params: { id: "sticks%20%26%20stones" },
+          staticParamsValidationParams: { id: "sticks & stones" },
+        }),
+      );
+    } finally {
+      if (previousPrerender === undefined) {
+        delete process.env.VINEXT_PRERENDER;
+      } else {
+        process.env.VINEXT_PRERENDER = previousPrerender;
+      }
+    }
+  });
+
+  it("ignores encoded prerender route params from a different rewritten route pattern", async () => {
+    const previousPrerender = process.env.VINEXT_PRERENDER;
+    process.env.VINEXT_PRERENDER = "1";
+    const dispatchMatchedPage = vi.fn(async () => new Response("page", { status: 200 }));
+    const productRoute = createPageRoute({
+      isDynamic: true,
+      pattern: "/product/:id",
+      routeSegments: ["product", "[id]"],
+    });
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [{ source: "/source/:slug", destination: "/product/:slug" }],
+        afterFiles: [],
+        fallback: [],
+      },
+      dispatchMatchedPage,
+      matchRoute(pathname: string) {
+        return pathname === "/product/sticks & stones"
+          ? {
+              params: { id: "sticks & stones" },
+              route: productRoute,
+            }
+          : null;
+      },
+    });
+
+    try {
+      const response = await handler(
+        new Request("https://example.test/docs/source/sticks%20%26%20stones", {
+          headers: {
+            "x-vinext-prerender-secret": "test-secret",
+            "x-vinext-prerender-route-params": prerenderRouteParamsHeader({
+              routePattern: "/source/:slug",
+              params: { slug: "sticks%20%26%20stones" },
+            }),
+          },
+        }),
+        null,
+      );
+
+      expect(response.status).toBe(200);
+      expect(dispatchMatchedPage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cleanPathname: "/product/sticks & stones",
+          params: { id: "sticks & stones" },
+          staticParamsValidationParams: undefined,
+        }),
+      );
+    } finally {
+      if (previousPrerender === undefined) {
+        delete process.env.VINEXT_PRERENDER;
+      } else {
+        process.env.VINEXT_PRERENDER = previousPrerender;
+      }
+    }
+  });
+
+  it("ignores encoded prerender route params when a same-pattern rewrite changes the matched params", async () => {
+    const previousPrerender = process.env.VINEXT_PRERENDER;
+    process.env.VINEXT_PRERENDER = "1";
+    const dispatchMatchedPage = vi.fn(async () => new Response("page", { status: 200 }));
+    const productRoute = createPageRoute({
+      isDynamic: true,
+      pattern: "/product/:id",
+      routeSegments: ["product", "[id]"],
+    });
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [{ source: "/product/:id", destination: "/product/sticks-and-stones" }],
+        afterFiles: [],
+        fallback: [],
+      },
+      dispatchMatchedPage,
+      matchRoute(pathname: string) {
+        return pathname === "/product/sticks-and-stones"
+          ? {
+              params: { id: "sticks-and-stones" },
+              route: productRoute,
+            }
+          : null;
+      },
+    });
+
+    try {
+      const response = await handler(
+        new Request("https://example.test/docs/product/sticks%20%26%20stones", {
+          headers: {
+            "x-vinext-prerender-secret": "test-secret",
+            "x-vinext-prerender-route-params": prerenderRouteParamsHeader({
+              routePattern: "/product/:id",
+              params: { id: "sticks%20%26%20stones" },
+            }),
+          },
+        }),
+        null,
+      );
+
+      expect(response.status).toBe(200);
+      expect(dispatchMatchedPage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cleanPathname: "/product/sticks-and-stones",
+          params: { id: "sticks-and-stones" },
+          staticParamsValidationParams: undefined,
+        }),
+      );
+    } finally {
+      if (previousPrerender === undefined) {
+        delete process.env.VINEXT_PRERENDER;
+      } else {
+        process.env.VINEXT_PRERENDER = previousPrerender;
+      }
+    }
+  });
+
+  it("ignores forged prerender route params outside trusted prerender requests", async () => {
+    const previousPrerender = process.env.VINEXT_PRERENDER;
+    delete process.env.VINEXT_PRERENDER;
+    const dispatchMatchedPage = vi.fn(async () => new Response("page", { status: 200 }));
+    const prerenderRoute = createPageRoute({
+      isDynamic: true,
+      pattern: "/prerender-encoding/:id",
+      routeSegments: ["prerender-encoding", "[id]"],
+    });
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedPage,
+      matchRoute(pathname: string) {
+        return pathname === "/prerender-encoding/sticks & stones"
+          ? {
+              params: { id: "sticks & stones" },
+              route: prerenderRoute,
+            }
+          : null;
+      },
+    });
+
+    try {
+      const response = await handler(
+        new Request("https://example.test/docs/prerender-encoding/sticks%20%26%20stones", {
+          headers: {
+            "x-vinext-prerender-secret": "test-secret",
+            "x-vinext-prerender-route-params": prerenderRouteParamsHeader({
+              routePattern: "/prerender-encoding/:id",
+              params: { id: "forged" },
+            }),
+          },
+        }),
+        null,
+      );
+
+      expect(response.status).toBe(200);
+      expect(dispatchMatchedPage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          params: { id: "sticks & stones" },
+        }),
+      );
+      expect(dispatchMatchedPage).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          staticParamsValidationParams: expect.anything(),
+        }),
+      );
+    } finally {
+      if (previousPrerender === undefined) {
+        delete process.env.VINEXT_PRERENDER;
+      } else {
+        process.env.VINEXT_PRERENDER = previousPrerender;
+      }
+    }
   });
 
   it("returns config redirects before route dispatch and skips finalization", async () => {
@@ -225,7 +577,7 @@ describe("createAppRscHandler", () => {
 
     expect(response.status).toBe(307);
     expect(response.headers.get("location")).toBe(
-      `https://example.test/docs/about.rsc?from=old&_rsc=${expectedHash}`,
+      `https://example.test/docs/about?from=old&_rsc=${expectedHash}`,
     );
   });
 
@@ -253,6 +605,79 @@ describe("createAppRscHandler", () => {
     expect(dispatchMatchedPage).not.toHaveBeenCalled();
   });
 
+  it("hides internal RSC cache-busting params from middleware nextUrl", async () => {
+    // Ported from Next.js:
+    // test/e2e/app-dir/navigation/middleware.js
+    // https://github.com/vercel/next.js/blob/v16.2.6/test/e2e/app-dir/navigation/middleware.js
+    const middleware = vi.fn(
+      (_: { nextUrl: URL }) => new Response(null, { headers: { "x-middleware-next": "1" } }),
+    );
+    const dispatchMatchedPage = vi.fn(async () => new Response("page", { status: 200 }));
+    const headers = createRscRequestHeaders({ mountedSlotsHeader: "slot:modal:/" });
+    const rscUrl = await createRscRequestUrl("/docs/about?tab=latest", headers);
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedPage,
+      middlewareModule: { default: middleware },
+    });
+
+    const response = await handler(new Request(`https://example.test${rscUrl}`, { headers }), null);
+
+    expect(response.status).toBe(200);
+    expect(middleware).toHaveBeenCalledTimes(1);
+    const middlewareRequest = middleware.mock.calls[0]?.[0];
+    expect(middlewareRequest?.nextUrl.searchParams.has(VINEXT_RSC_CACHE_BUSTING_SEARCH_PARAM)).toBe(
+      false,
+    );
+    expect(middlewareRequest?.nextUrl.search).toBe("?tab=latest");
+    expect(dispatchMatchedPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides internal RSC cache-busting params from external rewrite proxies", async () => {
+    // The fetch-cache instrumentation captures the real `fetch` at module load
+    // and reinstalls a patched copy during request handling, so a global
+    // `fetch` mock can't intercept the proxied request. Use a real loopback
+    // server as the external rewrite destination and record the URL it
+    // receives — that exercises the full handler -> applyRewrite ->
+    // proxyExternalRequest path without fighting the instrumentation.
+    const receivedUrls: string[] = [];
+    const server = createServer((req, res) => {
+      receivedUrls.push(req.url ?? "");
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("upstream");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address() as AddressInfo;
+    const upstreamBase = `http://127.0.0.1:${address.port}`;
+
+    try {
+      const headers = createRscRequestHeaders({ mountedSlotsHeader: "slot:modal:/" });
+      const rscUrl = await createRscRequestUrl("/docs/proxy?tab=latest", headers);
+      const handler = createHandler({
+        configHeaders: [],
+        configRewrites: {
+          beforeFiles: [{ source: "/proxy", destination: `${upstreamBase}/proxy` }],
+          afterFiles: [],
+          fallback: [],
+        },
+        matchRoute: () => null,
+      });
+
+      const response = await handler(
+        new Request(`https://example.test${rscUrl}`, { headers }),
+        null,
+      );
+
+      expect(response.status).toBe(200);
+      expect(receivedUrls).toHaveLength(1);
+      const forwardedUrl = new URL(`${upstreamBase}${receivedUrls[0]}`);
+      expect(forwardedUrl.searchParams.has(VINEXT_RSC_CACHE_BUSTING_SEARCH_PARAM)).toBe(false);
+      expect(forwardedUrl.searchParams.get("tab")).toBe("latest");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it("does not render RSC payloads at HTML URLs marked only by RSC headers", async () => {
     const dispatchMatchedPage = vi.fn(async () => new Response("page", { status: 200 }));
     const handler = createHandler({
@@ -272,6 +697,45 @@ describe("createAppRscHandler", () => {
       expect.objectContaining({
         cleanPathname: "/about",
         isRscRequest: false,
+      }),
+    );
+  });
+
+  it("passes parsed ClientReuseManifest hints from canonical RSC requests to page dispatch", async () => {
+    const dispatchMatchedPage = vi.fn(async () => new Response("page", { status: 200 }));
+    const manifest = createClientReuseManifest({
+      entries: [
+        {
+          artifactCompatibility: createArtifactCompatibilityEnvelope(),
+          id: "layout:/",
+          payloadHash: createClientReusePayloadHash("root-layout"),
+          privacy: "public",
+          variantCacheKey: "cp1:root",
+        },
+      ],
+      visibleCommitVersion: 1,
+    });
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedPage,
+    });
+
+    const response = await handler(
+      new Request("https://example.test/docs/about.rsc", {
+        headers: {
+          [VINEXT_CLIENT_REUSE_MANIFEST_HEADER]: JSON.stringify(manifest),
+        },
+      }),
+      null,
+    );
+
+    expect(response.status).toBe(200);
+    expect(dispatchMatchedPage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        clientReuseManifest: expect.objectContaining({
+          kind: "parsed",
+        }),
+        isRscRequest: true,
       }),
     );
   });
@@ -422,6 +886,44 @@ describe("createAppRscHandler", () => {
     expect(matchRoute).not.toHaveBeenCalled();
   });
 
+  it("lets middleware Cache-Control override static metadata route defaults", async () => {
+    // Ported from Next.js: test/e2e/app-dir/no-duplicate-headers-middleware/no-duplicate-headers-middleware.test.ts
+    // https://github.com/vercel/next.js/blob/v16.2.6/test/e2e/app-dir/no-duplicate-headers-middleware/no-duplicate-headers-middleware.test.ts
+    const handler = createHandler({
+      configHeaders: [],
+      matchRoute: () => null,
+      metadataRoutes: [
+        {
+          type: "favicon",
+          isDynamic: false,
+          filePath: "/tmp/app/favicon.ico",
+          routePrefix: "",
+          routeSegments: [],
+          servedUrl: "/favicon.ico",
+          contentType: "image/x-icon",
+          fileDataBase64: btoa("icon-bytes"),
+        },
+      ],
+      middlewareModule: {
+        middleware() {
+          return new Response(null, {
+            headers: {
+              "Cache-Control": "max-age=1234",
+              "x-middleware-next": "1",
+            },
+          });
+        },
+      },
+    });
+
+    const response = await handler(new Request("https://example.test/docs/favicon.ico"), null);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("max-age=1234");
+    expect(response.headers.get("content-type")).toBe("image/x-icon");
+    await expect(response.text()).resolves.toBe("icon-bytes");
+  });
+
   it("lets server actions short-circuit routing while still applying final headers", async () => {
     const dispatchMatchedPage = vi.fn(async () => new Response("page", { status: 200 }));
     const handleServerActionRequest = vi.fn(
@@ -474,6 +976,7 @@ describe("createAppRscHandler", () => {
 
   it("dispatches route handlers with matched params", async () => {
     const route = createPageRoute({
+      isDynamic: true,
       page: null,
       pattern: "/api/:id",
       routeHandler: { GET: () => new Response("route") },
@@ -504,8 +1007,44 @@ describe("createAppRscHandler", () => {
     );
   });
 
+  // Matches Next.js behavior: non-dynamic route handlers receive params=null.
+  // See test/e2e/app-dir/app-routes/app-custom-routes.test.ts in next.js.
+  it("dispatches non-dynamic route handlers with params: null", async () => {
+    const route = createPageRoute({
+      isDynamic: false,
+      page: null,
+      pattern: "/api/static",
+      routeHandler: { GET: () => new Response("route") },
+      routeSegments: ["api", "static"],
+    });
+    const dispatchMatchedRouteHandler = vi.fn(async () => new Response("route", { status: 200 }));
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedRouteHandler,
+      matchRoute: (pathname: string) =>
+        pathname === "/api/static"
+          ? {
+              params: {},
+              route,
+            }
+          : null,
+    });
+
+    const response = await handler(new Request("https://example.test/docs/api/static"), null);
+
+    expect(response.status).toBe(200);
+    expect(dispatchMatchedRouteHandler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cleanPathname: "/api/static",
+        params: null,
+        route,
+      }),
+    );
+  });
+
   it("appends App Router RSC vary values to route handler responses", async () => {
     const route = createPageRoute({
+      isDynamic: true,
       page: null,
       pattern: "/api/:id",
       routeHandler: { GET: () => new Response("route") },
@@ -546,5 +1085,163 @@ describe("createAppRscHandler", () => {
     expect(response.status).toBe(404);
     expect(await response.text()).toBe("This page could not be found");
     expect(clearRequestContext).toHaveBeenCalledTimes(1);
+  });
+
+  // Issue #1452 — root params must be visible to actions/route handlers/use cache,
+  // not only to the page render. The handler used to call setRootParams only
+  // after the post-action route match, leaving rootParams null during action
+  // dispatch and route-handler dispatch. See app-rsc-handler.ts pre-action
+  // seeding block.
+  describe("root params propagation (issue #1452)", () => {
+    it("populates root params before route-handler dispatch", async () => {
+      const route = createPageRoute({
+        isDynamic: true,
+        page: null,
+        pattern: "/:lang/:locale/api",
+        rootParamNames: ["lang", "locale"],
+        routeHandler: { GET: () => new Response("route") },
+        routeSegments: ["[lang]", "[locale]", "api"],
+      });
+      let observedRootParams: Record<string, string | string[] | undefined> | null = null;
+      const dispatchMatchedRouteHandler = vi.fn(async () => {
+        // Read from the unified request context active at dispatch time.
+        const { getRootParam } = await import("../packages/vinext/src/shims/root-params.js");
+        observedRootParams = {
+          lang: await getRootParam("lang"),
+          locale: await getRootParam("locale"),
+        };
+        return new Response("route", { status: 200 });
+      });
+      const handler = createHandler({
+        configHeaders: [],
+        dispatchMatchedRouteHandler,
+        matchRoute: (pathname: string) =>
+          pathname === "/en/us/api"
+            ? {
+                params: { lang: "en", locale: "us" },
+                route,
+              }
+            : null,
+      });
+
+      const response = await handler(new Request("https://example.test/docs/en/us/api"), null);
+      expect(response.status).toBe(200);
+      expect(observedRootParams).toEqual({ lang: "en", locale: "us" });
+    });
+
+    it("populates root params before server-action dispatch", async () => {
+      const route = createPageRoute({
+        isDynamic: true,
+        pattern: "/:lang/:locale/server-action",
+        rootParamNames: ["lang", "locale"],
+        routeSegments: ["[lang]", "[locale]", "server-action"],
+      });
+      let observedRootParams: Record<string, string | string[] | undefined> | null = null;
+      const handleServerActionRequest = vi.fn(async () => {
+        const { getRootParam } = await import("../packages/vinext/src/shims/root-params.js");
+        observedRootParams = {
+          lang: await getRootParam("lang"),
+          locale: await getRootParam("locale"),
+        };
+        return new Response("action", { status: 200 });
+      });
+      const handler = createHandler({
+        configHeaders: [],
+        handleServerActionRequest,
+        matchRoute: (pathname: string) =>
+          pathname === "/en/us/server-action"
+            ? {
+                params: { lang: "en", locale: "us" },
+                route,
+              }
+            : null,
+      });
+
+      const response = await handler(
+        new Request("https://example.test/docs/en/us/server-action", {
+          method: "POST",
+          headers: { "next-action": "abc123" },
+        }),
+        null,
+      );
+      expect(response.status).toBe(200);
+      expect(observedRootParams).toEqual({ lang: "en", locale: "us" });
+    });
+
+    it("populates root params before progressive (form) action dispatch", async () => {
+      const route = createPageRoute({
+        isDynamic: true,
+        pattern: "/:lang/:locale/server-action",
+        rootParamNames: ["lang", "locale"],
+        routeSegments: ["[lang]", "[locale]", "server-action"],
+      });
+      let observedRootParams: Record<string, string | string[] | undefined> | null = null;
+      const handleProgressiveActionRequest = vi.fn(async () => {
+        const { getRootParam } = await import("../packages/vinext/src/shims/root-params.js");
+        observedRootParams = {
+          lang: await getRootParam("lang"),
+          locale: await getRootParam("locale"),
+        };
+        return new Response("progressive-action", { status: 200 });
+      });
+      const handler = createHandler({
+        configHeaders: [],
+        handleProgressiveActionRequest,
+        matchRoute: (pathname: string) =>
+          pathname === "/en/us/server-action"
+            ? {
+                params: { lang: "en", locale: "us" },
+                route,
+              }
+            : null,
+      });
+
+      const response = await handler(
+        new Request("https://example.test/docs/en/us/server-action", {
+          method: "POST",
+          headers: { "content-type": "multipart/form-data; boundary=vinext" },
+        }),
+        null,
+      );
+      expect(response.status).toBe(200);
+      expect(observedRootParams).toEqual({ lang: "en", locale: "us" });
+    });
+
+    it("only picks root params declared on the matched route", async () => {
+      // The route has a dynamic [slug] segment but only [lang] is a root param.
+      // setRootParams must surface only `lang`, not `slug`.
+      const route = createPageRoute({
+        isDynamic: true,
+        page: null,
+        pattern: "/:lang/blog/:slug",
+        rootParamNames: ["lang"],
+        routeHandler: { GET: () => new Response("route") },
+        routeSegments: ["[lang]", "blog", "[slug]"],
+      });
+      let observedLang: string | string[] | undefined = "<unset>";
+      let observedSlug: string | string[] | undefined = "<unset>";
+      const dispatchMatchedRouteHandler = vi.fn(async () => {
+        const { getRootParam } = await import("../packages/vinext/src/shims/root-params.js");
+        observedLang = await getRootParam("lang");
+        observedSlug = await getRootParam("slug");
+        return new Response("route", { status: 200 });
+      });
+      const handler = createHandler({
+        configHeaders: [],
+        dispatchMatchedRouteHandler,
+        matchRoute: (pathname: string) =>
+          pathname === "/en/blog/hello"
+            ? {
+                params: { lang: "en", slug: "hello" },
+                route,
+              }
+            : null,
+      });
+
+      const response = await handler(new Request("https://example.test/docs/en/blog/hello"), null);
+      expect(response.status).toBe(200);
+      expect(observedLang).toBe("en");
+      expect(observedSlug).toBeUndefined();
+    });
   });
 });

@@ -31,6 +31,7 @@ import {
 import { loadNextConfig, resolveNextConfig } from "../config/next-config.js";
 import { pagesRouter, apiRouter } from "../routing/pages-router.js";
 import { appRouter } from "../routing/app-router.js";
+import { scanMetadataFiles } from "../server/metadata-routes.js";
 import { findDir } from "./report.js";
 import { startProdServer } from "../server/prod-server.js";
 
@@ -67,6 +68,18 @@ class PrerenderProgress {
     }
     const errorPart = errors > 0 ? `, ${errors} error${errors !== 1 ? "s" : ""}` : "";
     console.log(`  Prerendered ${rendered} routes (${skipped} skipped${errorPart}).`);
+  }
+}
+
+function readBuiltBuildId(serverDir: string): string | null {
+  try {
+    const buildId = fs.readFileSync(path.join(serverDir, "BUILD_ID"), "utf-8").trim();
+    return buildId.length > 0 ? buildId : null;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
   }
 }
 
@@ -139,8 +152,11 @@ export async function runPrerender(options: RunPrerenderOptions): Promise<Preren
   process.env.VINEXT_PRERENDER = "1";
 
   // The manifest lands in dist/server/ alongside the server bundle so it's
-  // cleaned by Vite's emptyOutDir on rebuild and co-located with server artifacts.
+  // cleaned with the rest of vinext's build output on rebuild and co-located
+  // with server artifacts.
   const manifestDir = path.join(root, "dist", "server");
+  const rscBundlePath = options.rscBundlePath ?? path.join(root, "dist", "server", "index.js");
+  const serverDir = path.dirname(rscBundlePath);
 
   const loadedConfig = await resolveNextConfig(await loadNextConfig(root), root);
   const config = options.nextConfigOverride
@@ -149,12 +165,25 @@ export async function runPrerender(options: RunPrerenderOptions): Promise<Preren
       // nextConfigOverride replace the entire nested object from loadedConfig.
       // This is intentional for test usage (top-level overrides only); a deep
       // merge would be needed to support partial nested overrides in the future.
-      loadedConfig;
+      { ...loadedConfig };
+  // Prerender must reuse the exact BUILD_ID that `vinext build` wrote to disk
+  // rather than re-resolving a fresh one. `config.buildId` is consumed when
+  // computing prerendered-output identity (prerender.ts), so re-resolving here
+  // would produce artifacts keyed to a different buildId than the deployed
+  // bundle. Reading it back from the built `BUILD_ID` file keeps prerender
+  // output aligned with the bundle it was generated from. (Spreading
+  // `loadedConfig` above is required so this assignment does not mutate the
+  // shared loaded config.)
+  const builtBuildId = readBuiltBuildId(serverDir);
+  if (builtBuildId) {
+    config.buildId = builtBuildId;
+  }
   // Activate export mode when next.config.js sets `output: 'export'`.
   // In export mode, SSR routes and any dynamic routes without static params are
   // build errors rather than silently skipped.
   const mode = config.output === "export" ? "export" : "default";
   const allRoutes: PrerenderRouteResult[] = [];
+  const allOutputFiles: string[] = [];
 
   // Count total renderable URLs across both phases upfront so we can show a
   // single combined progress bar. We track completed ourselves and pass an
@@ -177,9 +206,6 @@ export async function runPrerender(options: RunPrerenderOptions): Promise<Preren
     mode === "export"
       ? path.join(root, "dist", "client")
       : path.join(root, "dist", "server", "prerendered-routes");
-
-  const rscBundlePath = options.rscBundlePath ?? path.join(root, "dist", "server", "index.js");
-  const serverDir = path.dirname(rscBundlePath);
 
   // For hybrid builds (both app/ and pages/ present), start a single shared
   // prod server and pass it to both phases. This avoids spinning up two servers
@@ -208,6 +234,7 @@ export async function runPrerender(options: RunPrerenderOptions): Promise<Preren
     // ── App Router phase ──────────────────────────────────────────────────────
     if (appDir) {
       const routes = await appRouter(appDir, config.pageExtensions);
+      const metadataRoutes = scanMetadataFiles(appDir);
 
       // We don't know the exact render-queue size until prerenderApp starts, so
       // use the progress callback's `total` to update our combined total on the
@@ -216,6 +243,7 @@ export async function runPrerender(options: RunPrerenderOptions): Promise<Preren
       const result = await prerenderApp({
         mode,
         routes,
+        metadataRoutes,
         outDir,
         skipManifest: true,
         config,
@@ -235,6 +263,7 @@ export async function runPrerender(options: RunPrerenderOptions): Promise<Preren
       });
 
       allRoutes.push(...result.routes);
+      if (result.outputFiles) allOutputFiles.push(...result.outputFiles);
     }
 
     // ── Pages Router phase ────────────────────────────────────────────────────
@@ -273,6 +302,7 @@ export async function runPrerender(options: RunPrerenderOptions): Promise<Preren
       });
 
       allRoutes.push(...result.routes);
+      if (result.outputFiles) allOutputFiles.push(...result.outputFiles);
     }
   } finally {
     // Close the shared prod server if we started one.
@@ -322,5 +352,8 @@ export async function runPrerender(options: RunPrerenderOptions): Promise<Preren
     );
   }
 
-  return { routes: allRoutes };
+  return {
+    routes: allRoutes,
+    ...(allOutputFiles.length > 0 ? { outputFiles: allOutputFiles } : {}),
+  };
 }

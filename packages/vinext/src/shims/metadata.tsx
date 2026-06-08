@@ -275,11 +275,16 @@ type AppleIconDescriptor = {
 type IconInput = string | URL | IconDescriptor;
 type AppleIconInput = string | URL | AppleIconDescriptor;
 
+type OtherIconDescriptor = { rel: string; url: string | URL; sizes?: string; type?: string };
+
 type IconsMap = {
   icon?: IconInput | IconInput[];
   shortcut?: string | URL | Array<string | URL>;
   apple?: AppleIconInput | AppleIconInput[];
-  other?: Array<{ rel: string; url: string | URL; sizes?: string; type?: string }>;
+  // Next.js accepts a single descriptor or an array (see resolveIcons in
+  // .nextjs-ref/packages/next/src/lib/metadata/resolvers/resolve-icons.ts —
+  // values pass through resolveAsArrayOrUndefined before iteration).
+  other?: OtherIconDescriptor | OtherIconDescriptor[];
 };
 
 type IconsMetadata = IconInput | IconInput[] | IconsMap;
@@ -540,7 +545,20 @@ export async function resolveModuleMetadata(
       searchParams === undefined
         ? { params: asyncParams }
         : { params: asyncParams, searchParams: makeThenableParams(searchParams) };
-    return await mod.generateMetadata(props, parent);
+    // Only pass the `parent` metadata when `generateMetadata` actually declares
+    // it (arity >= 2). Next.js omits the parent argument for `generateMetadata`
+    // functions that don't use it, which matters for `'use cache'` functions:
+    // the cache-key encoder (encodeReply) would otherwise try to serialize the
+    // resolved parent metadata, which can contain a non-serializable `URL`
+    // `metadataBase` and throws "URL objects are not supported".
+    // See Next.js resolve-metadata.ts (getResult / useCacheFunctionInfo.usedArgs[1]).
+    //
+    // Note: `fn.length` approximates Next.js's static usage analysis. It can
+    // diverge on default-parameter signatures — e.g. `(props, parent = x)`
+    // reports length 1, and `(props = {}, parent)` reports length 0 — but a
+    // default value on `generateMetadata`'s `parent` is unusual in practice.
+    const usesParent = mod.generateMetadata.length >= 2;
+    return await (usesParent ? mod.generateMetadata(props, parent) : mod.generateMetadata(props));
   }
   if (mod.metadata && typeof mod.metadata === "object") {
     return mod.metadata as Metadata;
@@ -722,6 +740,68 @@ type MetadataHeadProps = {
   metadata: Metadata;
   pathname?: string;
 };
+
+function escapeHtmlText(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+function escapeHtmlAttribute(value: string): string {
+  return escapeHtmlText(value).replaceAll('"', "&quot;");
+}
+
+function renderMetadataText(node: unknown): string {
+  if (node === null || node === undefined || typeof node === "boolean") return "";
+  if (Array.isArray(node)) return node.map(renderMetadataText).join("");
+  if (typeof node === "string" || typeof node === "number" || typeof node === "bigint") {
+    return escapeHtmlText(String(node));
+  }
+  return "";
+}
+
+function renderMetadataAttributes(props: object, names: readonly string[]): string {
+  const attributes: string[] = [];
+  for (const name of names) {
+    const value = Reflect.get(props, name);
+    if (value === null || value === undefined || typeof value === "boolean") continue;
+    const htmlName = name === "hrefLang" ? "hreflang" : name;
+    attributes.push(`${htmlName}="${escapeHtmlAttribute(String(value))}"`);
+  }
+  return attributes.length > 0 ? ` ${attributes.join(" ")}` : "";
+}
+
+function renderMetadataElementToHtml(node: unknown): string {
+  if (node === null || node === undefined || typeof node === "boolean") return "";
+  if (Array.isArray(node)) return node.map(renderMetadataElementToHtml).join("");
+  if (!React.isValidElement(node)) return renderMetadataText(node);
+
+  const props = typeof node.props === "object" && node.props !== null ? node.props : {};
+  if (node.type === React.Fragment) {
+    return renderMetadataElementToHtml(Reflect.get(props, "children"));
+  }
+  if (typeof node.type !== "string") return "";
+
+  switch (node.type) {
+    case "title":
+      return `<title>${renderMetadataText(Reflect.get(props, "children"))}</title>`;
+    case "meta":
+      return `<meta${renderMetadataAttributes(props, ["name", "property", "content"])}>`;
+    case "link":
+      return `<link${renderMetadataAttributes(props, [
+        "rel",
+        "href",
+        "hrefLang",
+        "media",
+        "type",
+        "sizes",
+      ])}>`;
+    default:
+      return "";
+  }
+}
+
+export function renderMetadataToHtml(metadata: Metadata, pathname = "/"): string {
+  return renderMetadataElementToHtml(MetadataHead({ metadata, pathname }));
+}
 
 export function MetadataHead({ metadata, pathname = "/" }: MetadataHeadProps) {
   const elements: React.ReactElement[] = [];
@@ -1018,7 +1098,7 @@ export function MetadataHead({ metadata, pathname = "/" }: MetadataHeadProps) {
         ? metadata.icons.shortcut
         : [metadata.icons.shortcut];
       for (const s of shortcuts) {
-        elements.push(<link key={key++} rel="shortcut icon" href={resolveUrl(s)} />);
+        elements.push(<link key={key++} rel="shortcut icon" href={stringifyUrl(s)} />);
       }
     }
     // Icon
@@ -1028,7 +1108,7 @@ export function MetadataHead({ metadata, pathname = "/" }: MetadataHeadProps) {
           <link
             key={key++}
             rel="icon"
-            href={resolveUrl(i.url)}
+            href={stringifyUrl(i.url)}
             {...(i.sizes ? { sizes: i.sizes } : {})}
             {...(i.type ? { type: i.type } : {})}
             {...(i.media ? { media: i.media } : {})}
@@ -1046,22 +1126,27 @@ export function MetadataHead({ metadata, pathname = "/" }: MetadataHeadProps) {
           <link
             key={key++}
             rel="apple-touch-icon"
-            href={resolveUrl(a.url)}
+            href={stringifyUrl(a.url)}
             {...(a.sizes ? { sizes: a.sizes } : {})}
             {...(a.type ? { type: a.type } : {})}
           />,
         );
       }
     }
-    // Other custom icon relations
+    // Other custom icon relations. Next.js accepts a single descriptor or an
+    // array; normalize before iterating.
     if (isIconsMap(metadata.icons) && metadata.icons.other) {
-      for (const o of metadata.icons.other) {
+      const others = Array.isArray(metadata.icons.other)
+        ? metadata.icons.other
+        : [metadata.icons.other];
+      for (const o of others) {
         elements.push(
           <link
             key={key++}
             rel={o.rel}
-            href={resolveUrl(o.url)}
+            href={stringifyUrl(o.url)}
             {...(o.sizes ? { sizes: o.sizes } : {})}
+            {...(o.type ? { type: o.type } : {})}
           />,
         );
       }

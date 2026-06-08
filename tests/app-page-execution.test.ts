@@ -322,7 +322,205 @@ describe("app page execution helpers", () => {
     expect(clearRequestContext).toHaveBeenCalledTimes(1);
   });
 
-  it("canonicalizes same-origin RSC redirect locations to .rsc URLs", async () => {
+  it("encodes redirect digest in flight payload + 200 when buildRscRedirectFlightStream is provided (RSC request)", async () => {
+    // Mirrors Next.js's `generateDynamicFlightRenderResult` path: when a
+    // server component throws redirect() during RSC rendering, the redirect
+    // digest is serialized into the flight stream and the response stays
+    // 200. The status line never carries the redirect.
+    //
+    // See: https://github.com/cloudflare/vinext/issues/1347
+    const buildRscRedirectFlightStream = vi.fn(
+      (options: { digest: string }) =>
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(`E:${options.digest}`));
+            controller.close();
+          },
+        }),
+    );
+
+    const response = await buildAppPageSpecialErrorResponse({
+      buildRscRedirectFlightStream,
+      clearRequestContext: vi.fn(),
+      isRscRequest: true,
+      request: new Request("https://example.com/start.rsc"),
+      specialError: {
+        kind: "redirect",
+        location: "/redirected",
+        statusCode: 307,
+      },
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toMatch(/^text\/x-component/);
+    expect(response.headers.get("location")).toBeNull();
+    expect(buildRscRedirectFlightStream).toHaveBeenCalledTimes(1);
+    expect(buildRscRedirectFlightStream).toHaveBeenCalledWith({
+      digest: "NEXT_REDIRECT;replace;/redirected;307;",
+    });
+    await expect(response.text()).resolves.toBe("E:NEXT_REDIRECT;replace;/redirected;307;");
+  });
+
+  it("keeps metadata-originated RSC redirects on the Flight digest path", async () => {
+    // Ported from Next.js:
+    // test/e2e/app-dir/metadata-streaming/metadata-streaming.test.ts
+    //   "should trigger redirection when call redirect"
+    //
+    // Document requests and RSC navigation requests intentionally diverge:
+    // the document path streams a refresh meta tag, while the client router
+    // still consumes the redirect digest from the Flight stream.
+    const buildRscRedirectFlightStream = vi.fn(
+      (options: { digest: string }) =>
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(`E:${options.digest}`));
+            controller.close();
+          },
+        }),
+    );
+
+    const response = await buildAppPageSpecialErrorResponse({
+      buildRscRedirectFlightStream,
+      clearRequestContext: vi.fn(),
+      isRscRequest: true,
+      request: new Request("https://example.com/start.rsc"),
+      specialError: {
+        kind: "redirect",
+        location: "/redirected",
+        statusCode: 307,
+        fromMetadata: true,
+      },
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toMatch(/^text\/x-component/);
+    expect(response.headers.get("location")).toBeNull();
+    expect(buildRscRedirectFlightStream).toHaveBeenCalledTimes(1);
+    expect(buildRscRedirectFlightStream).toHaveBeenCalledWith({
+      digest: "NEXT_REDIRECT;replace;/redirected;307;",
+    });
+    await expect(response.text()).resolves.toBe("E:NEXT_REDIRECT;replace;/redirected;307;");
+  });
+
+  it("renders a metadata-originated document redirect as an HTML refresh when metadata streams", async () => {
+    // Ported from Next.js:
+    // test/e2e/app-dir/metadata-streaming/metadata-streaming.test.ts
+    //   "should trigger redirection when call redirect"
+    //
+    // Next.js captures redirect() thrown by generateMetadata() as a streamed
+    // server error and injects the canonical refresh meta tag through
+    // make-get-server-inserted-html.tsx. The document status stays 200, but it
+    // must remain an HTML document so a browser direct visit can follow it.
+    const buildRscRedirectFlightStream = vi.fn(
+      () =>
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("flight-payload"));
+            controller.close();
+          },
+        }),
+    );
+
+    const response = await buildAppPageSpecialErrorResponse({
+      buildRscRedirectFlightStream,
+      clearRequestContext: vi.fn(),
+      isRscRequest: false,
+      request: new Request("https://example.com/start"),
+      specialError: {
+        kind: "redirect",
+        location: "/redirected",
+        statusCode: 307,
+        fromMetadata: true,
+      },
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/html");
+    expect(buildRscRedirectFlightStream).not.toHaveBeenCalled();
+    await expect(response.text()).resolves.toContain(
+      '<meta id="__next-page-redirect" http-equiv="refresh" content="1;url=/redirected"/>',
+    );
+  });
+
+  it("uses an HTTP redirect for metadata-originated redirects when metadata streaming is disabled", async () => {
+    // Ported from Next.js:
+    // test/e2e/app-dir/metadata-streaming/metadata-streaming.test.ts
+    //   "should render blocking 307 response status when html limited bots access redirect"
+    const buildRscRedirectFlightStream = vi.fn(
+      () =>
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("flight-payload"));
+            controller.close();
+          },
+        }),
+    );
+
+    const response = await buildAppPageSpecialErrorResponse({
+      buildRscRedirectFlightStream,
+      clearRequestContext: vi.fn(),
+      isRscRequest: false,
+      request: new Request("https://example.com/start"),
+      serveStreamingMetadata: false,
+      specialError: {
+        kind: "redirect",
+        location: "/redirected",
+        statusCode: 307,
+        fromMetadata: true,
+      },
+    });
+
+    expect(response.status).toBe(307);
+    expect(response.headers.get("location")).toBe("https://example.com/redirected");
+    expect(buildRscRedirectFlightStream).not.toHaveBeenCalled();
+  });
+
+  it("preserves the 307/308 status code in the encoded digest (permanentRedirect)", async () => {
+    const captured: { digest: string }[] = [];
+    const buildRscRedirectFlightStream = (opts: { digest: string }) => {
+      captured.push(opts);
+      return new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.close();
+        },
+      });
+    };
+
+    await buildAppPageSpecialErrorResponse({
+      buildRscRedirectFlightStream,
+      clearRequestContext: vi.fn(),
+      isRscRequest: true,
+      request: new Request("https://example.com/start.rsc"),
+      specialError: {
+        kind: "redirect",
+        location: "/permanent-target",
+        statusCode: 308,
+      },
+    });
+
+    expect(captured).toEqual([{ digest: "NEXT_REDIRECT;replace;/permanent-target;308;" }]);
+  });
+
+  it("falls back to 307 when buildRscRedirectFlightStream is absent (backward compat)", async () => {
+    // Callers that don't yet plumb the flight-stream builder keep the legacy
+    // behavior: HTTP 307 with a Location header. Keeps non-app-router callers
+    // (and any test helpers) working without changes.
+    const response = await buildAppPageSpecialErrorResponse({
+      clearRequestContext: vi.fn(),
+      isRscRequest: true,
+      request: new Request("https://example.com/start.rsc"),
+      specialError: {
+        kind: "redirect",
+        location: "/redirected",
+        statusCode: 307,
+      },
+    });
+
+    expect(response.status).toBe(307);
+    expect(response.headers.get("location")).toMatch(/redirected\?_rsc/);
+  });
+
+  it("canonicalizes same-origin RSC redirect locations to Next-style RSC URLs", async () => {
     const response = await buildAppPageSpecialErrorResponse({
       clearRequestContext: vi.fn(),
       isRscRequest: true,
@@ -342,7 +540,7 @@ describe("app page execution helpers", () => {
 
     expect(response.status).toBe(307);
     expect(response.headers.get("location")).toMatch(
-      /^https:\/\/example\.com\/redirected\.rsc\?tab=1&_rsc=/,
+      /^https:\/\/example\.com\/redirected\?tab=1&_rsc=/,
     );
   });
 
@@ -788,6 +986,72 @@ describe("app page execution helpers", () => {
     });
   });
 
+  it("flips a build-time static layout to dynamic when a runtime observation is unsafe for static reuse", async () => {
+    // Parity guard for the observation override: a layout the build classified
+    // `static` is downgraded to `"d"` at request time when
+    // `isLayoutObservationDynamic` reports the observed render is unsafe for
+    // static reuse (finite revalidate, cache tags, request APIs, param scope,
+    // etc.). The emitted debug reason switches from the stale build-time reason
+    // to `runtime-probe`/`dynamic` so the flag and reason stay in agreement.
+    const calls: Array<{ layoutId: string; reason: unknown }> = [];
+
+    const result = await probeAppPageLayouts({
+      layoutCount: 2,
+      onLayoutError() {
+        return Promise.resolve(null);
+      },
+      probeLayoutAt() {
+        return null;
+      },
+      runWithSuppressedHookWarning(probe) {
+        return probe();
+      },
+      classification: {
+        buildTimeClassifications: new Map([
+          [0, "static"],
+          [1, "static"],
+        ]),
+        buildTimeReasons: new Map([
+          [0, { layer: "segment-config", key: "dynamic", value: "force-static" }],
+          [1, { layer: "segment-config", key: "dynamic", value: "force-static" }],
+        ]),
+        debugClassification(layoutId, reason) {
+          calls.push({ layoutId, reason });
+        },
+        getLayoutId(layoutIndex) {
+          return ["layout:/", "layout:/dashboard"][layoutIndex];
+        },
+        // Only the dashboard layout's observation is unsafe for static reuse.
+        isLayoutObservationDynamic(layoutId) {
+          return layoutId === "layout:/dashboard";
+        },
+        runWithIsolatedDynamicScope() {
+          throw new Error("isolated scope must not run for build-time classified layouts");
+        },
+      },
+    });
+
+    expect(result.response).toBeNull();
+    // dashboard: build-time static, but the observation flips it to dynamic.
+    // root: build-time static with a safe observation stays static.
+    expect(result.layoutFlags).toEqual({
+      "layout:/": "s",
+      "layout:/dashboard": "d",
+    });
+
+    const byId = Object.fromEntries(calls.map((c) => [c.layoutId, c.reason]));
+    expect(byId["layout:/dashboard"]).toEqual({
+      layer: "runtime-probe",
+      outcome: "dynamic",
+    });
+    // The unflipped layout keeps reporting its build-time reason.
+    expect(byId["layout:/"]).toEqual({
+      layer: "segment-config",
+      key: "dynamic",
+      value: "force-static",
+    });
+  });
+
   it("emits runtime-probe reason with the error message when the probe throws", async () => {
     const calls: Array<{ layoutId: string; reason: unknown }> = [];
 
@@ -837,5 +1101,44 @@ describe("app page execution helpers", () => {
     ).toBe(
       "</font-a.woff2>; rel=preload; as=font; type=font/woff2; crossorigin, </font-b.woff2>; rel=preload; as=font; type=font/woff2; crossorigin",
     );
+  });
+
+  it("emits the `x-edge-runtime: 1` marker on RSC redirect flight responses for edge-runtime routes", async () => {
+    const response = await buildAppPageSpecialErrorResponse({
+      buildRscRedirectFlightStream: ({ digest }) =>
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(`E:${digest}`));
+            controller.close();
+          },
+        }),
+      clearRequestContext: vi.fn(),
+      isEdgeRuntime: true,
+      isRscRequest: true,
+      request: new Request("https://example.com/start.rsc"),
+      specialError: { kind: "redirect", location: "/redirected", statusCode: 307 },
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-edge-runtime")).toBe("1");
+  });
+
+  it("omits the `x-edge-runtime` marker on RSC redirect flight responses for nodejs-runtime routes", async () => {
+    const response = await buildAppPageSpecialErrorResponse({
+      buildRscRedirectFlightStream: ({ digest }) =>
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(`E:${digest}`));
+            controller.close();
+          },
+        }),
+      clearRequestContext: vi.fn(),
+      isRscRequest: true,
+      request: new Request("https://example.com/start.rsc"),
+      specialError: { kind: "redirect", location: "/redirected", statusCode: 307 },
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-edge-runtime")).toBeNull();
   });
 });

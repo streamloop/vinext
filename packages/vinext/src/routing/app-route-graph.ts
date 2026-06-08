@@ -7,11 +7,12 @@
 import path from "node:path";
 import fs from "node:fs";
 import { createHash } from "node:crypto";
-import { compareRoutes, decodeRouteSegment } from "./utils.js";
-import { scanWithExtensions, type ValidFileMatcher } from "./file-matcher.js";
+import { compareRoutes, decodeRouteSegment, isInvisibleSegment } from "./utils.js";
+import { findFileWithExts, scanWithExtensions, type ValidFileMatcher } from "./file-matcher.js";
 import { validateRoutePatterns } from "./route-validation.js";
+import { compareStrings } from "../utils/compare.js";
 
-export type InterceptingRoute = {
+type InterceptingRoute = {
   /** The interception convention: "." | ".." | "../.." | "..." */
   convention: string;
   /** The URL pattern this intercepts (e.g. "/photos/:id") */
@@ -40,7 +41,7 @@ export type InterceptingRoute = {
   params: string[];
 };
 
-export type ParallelSlot = {
+type ParallelSlot = {
   /** Graph-owned semantic slot identity. Required on AppRouteGraphParallelSlot. */
   id?: string;
   /** Stable slot identity (name + owning directory), used for route serialization keys. */
@@ -184,7 +185,7 @@ export type AppRouteSemanticIds = {
   slots: Readonly<Record<string, string>>;
 };
 
-export type AppRouteGraphParallelSlot = ParallelSlot & {
+type AppRouteGraphParallelSlot = ParallelSlot & {
   id: string;
 };
 
@@ -214,19 +215,19 @@ export type RouteManifestRoute = {
   slotIds: readonly string[];
 };
 
-export type RouteManifestPage = {
+type RouteManifestPage = {
   id: string;
   routeId: string;
   pattern: string;
 };
 
-export type RouteManifestRouteHandler = {
+type RouteManifestRouteHandler = {
   id: string;
   routeId: string;
   pattern: string;
 };
 
-export type RouteManifestLayout = {
+type RouteManifestLayout = {
   id: string;
   treePath: string;
   patternParts: readonly string[];
@@ -234,7 +235,7 @@ export type RouteManifestLayout = {
   rootBoundaryId: RootBoundaryId | null;
 };
 
-export type RouteManifestTemplate = {
+type RouteManifestTemplate = {
   id: string;
   treePath: string;
   rootBoundaryId: RootBoundaryId | null;
@@ -245,7 +246,7 @@ export type RouteManifestTemplate = {
   };
 };
 
-export type RouteManifestSlot = {
+type RouteManifestSlot = {
   id: string;
   key: string;
   name: string;
@@ -257,7 +258,7 @@ export type RouteManifestSlot = {
   hasPage: boolean;
 };
 
-export type RouteManifestDefault = {
+type RouteManifestDefault = {
   id: string;
   slotId: string;
   ownerTreePath: string;
@@ -265,7 +266,7 @@ export type RouteManifestDefault = {
   rootBoundaryId: RootBoundaryId | null;
 };
 
-export type RouteManifestSlotBindingState = "active" | "default" | "unmatched";
+type RouteManifestSlotBindingState = "active" | "default" | "unmatched";
 
 export type RouteManifestSlotBinding = {
   id: string;
@@ -291,9 +292,9 @@ export type RouteManifestInterception = {
   targetRouteId: string | null;
 };
 
-export type RouteManifestBoundaryOutcome = "error" | "forbidden" | "notFound" | "unauthorized";
+type RouteManifestBoundaryOutcome = "error" | "forbidden" | "notFound" | "unauthorized";
 
-export type RouteManifestBoundary = {
+type RouteManifestBoundary = {
   id: string;
   outcome: RouteManifestBoundaryOutcome;
   treePath: string;
@@ -367,11 +368,7 @@ function createAppRouteGraphRootBoundaryId(treePath: string): RootBoundaryId {
   return `root-boundary:${treePath}`;
 }
 
-function compareStableStrings(left: string, right: string): number {
-  if (left < right) return -1;
-  if (left > right) return 1;
-  return 0;
-}
+const compareStableStrings = compareStrings;
 
 function sortedMapValues<T>(map: ReadonlyMap<string, T>): T[] {
   return Array.from(map.entries())
@@ -823,9 +820,32 @@ export async function buildAppRouteGraph(
   // Find all page.tsx and route.ts files, excluding @slot directories
   // (slot pages are not standalone routes — they're rendered as props of their parent layout)
   // and _private folders (Next.js convention for colocated non-route files).
+  //
+  // The `@children` directory is special: Next.js treats `@children` as
+  // transparent — `app/@children/page.tsx` provides the layout's children
+  // prop for `/` and registers a real page route at `/`. This mirrors the
+  // Next.js types plugin (which skips `@children` when enumerating slots)
+  // and `normalizeAppPath` (which strips any `@` segment including
+  // `@children` from the URL). See:
+  //   - packages/next/src/build/webpack/plugins/next-types-plugin/index.ts
+  //   - packages/next/src/shared/lib/router/utils/app-paths.ts
+  //   - packages/next/src/build/normalize-catchall-routes.ts
+  //
+  // Interception marker directories (e.g. `(.)photo`, `(..)showcase`,
+  // `(..)(..)hoge`, `(...)photos`) are also excluded from the global page
+  // scan because the marker is not a real URL segment — Next.js treats these
+  // as a separate route family resolved via interception rewrites. Without
+  // this exclusion the scanner would register patterns like
+  // `/templates/(..)showcase` as standalone routes, breaking the build (and
+  // any URL containing the marker).
+  //
+  // See https://github.com/vercel/next.js/blob/canary/packages/next/src/shared/lib/router/utils/interception-routes.ts
   const routes: AppRouteGraphRoute[] = [];
 
-  const excludeDir = (name: string) => name.startsWith("@") || name.startsWith("_");
+  const excludeDir = (name: string) =>
+    (name.startsWith("@") && name !== "@children") ||
+    name.startsWith("_") ||
+    isInterceptionMarkerDir(name);
 
   // Process page files in a single pass
   // Use function form of exclude for Node < 22.14 compatibility (string arrays require >= 22.14)
@@ -844,6 +864,12 @@ export async function buildAppRouteGraph(
   // segment has no children page. Next.js uses this for modal/feed patterns
   // like app/user/[id]/layout + @feed/page + @modal/default.
   const routePatterns = new Set(routes.map((route) => route.pattern));
+  // Ghost parents are layout-only routes whose URL pattern collides with an
+  // existing route (e.g. sibling route groups like (group-a)/layout.tsx and
+  // (group-b)/page.tsx both anchored at "/"). Their slot directories still
+  // contribute synthetic sub-routes (e.g. @parallel/[...catcher]/page.tsx →
+  // /:catcher+), but the ghost itself is not added to the routes table.
+  const ghostParentRoutes: AppRouteGraphRoute[] = [];
   for await (const file of scanWithExtensions(
     "**/layout",
     appDir,
@@ -856,7 +882,11 @@ export async function buildAppRouteGraph(
     if (discoverParallelSlots(routeDir, appDir, matcher).length === 0) continue;
 
     const route = directoryToAppRoute(dir, appDir, matcher, null, null);
-    if (!route || routePatterns.has(route.pattern)) continue;
+    if (!route) continue;
+    if (routePatterns.has(route.pattern)) {
+      ghostParentRoutes.push(route);
+      continue;
+    }
 
     routes.push(route);
     routePatterns.add(route.pattern);
@@ -866,7 +896,7 @@ export async function buildAppRouteGraph(
   // In Next.js, pages nested inside @slot directories create additional URL routes.
   // For example, @audience/demographics/page.tsx at app/parallel-routes/ creates
   // a route at /parallel-routes/demographics.
-  const slotSubRoutes = discoverSlotSubRoutes(routes, matcher);
+  const slotSubRoutes = discoverSlotSubRoutes(routes, matcher, ghostParentRoutes);
   routes.push(...slotSubRoutes);
 
   validatePageRouteConflicts(routes, appDir);
@@ -890,9 +920,13 @@ export async function buildAppRouteGraph(
 
 function hasParallelSlotDirectory(dir: string): boolean {
   try {
-    return fs
-      .readdirSync(dir, { withFileTypes: true })
-      .some((entry) => entry.isDirectory() && entry.name.startsWith("@"));
+    return fs.readdirSync(dir, { withFileTypes: true }).some(
+      (entry) =>
+        entry.isDirectory() &&
+        entry.name.startsWith("@") &&
+        // `@children` is not a parallel slot — see discoverParallelSlots.
+        entry.name !== "@children",
+    );
   } catch {
     return false;
   }
@@ -954,6 +988,7 @@ function formatAppFilePath(filePath: string, appDir: string): string {
 function discoverSlotSubRoutes(
   routes: AppRouteGraphRoute[],
   matcher: ValidFileMatcher,
+  ghostParents: readonly AppRouteGraphRoute[] = [],
 ): AppRouteGraphRoute[] {
   const syntheticRoutes: AppRouteGraphRoute[] = [];
 
@@ -975,7 +1010,10 @@ function discoverSlotSubRoutes(
     });
   };
 
-  for (const parentRoute of routes) {
+  // Iterate real routes first so that later ghost-parent passes can detect
+  // synthetic conflicts against routes the real pass minted.
+  const allParents: AppRouteGraphRoute[] = [...routes, ...ghostParents];
+  for (const parentRoute of allParents) {
     if (parentRoute.parallelSlots.length === 0) continue;
 
     // Only page-bearing routes or layout-only UI routes (not route handlers)
@@ -1205,7 +1243,21 @@ function fileToAppRoute(
   matcher: ValidFileMatcher,
 ): AppRouteGraphRoute | null {
   // Remove the filename (page.tsx or route.ts)
-  const dir = path.dirname(file);
+  let dir = path.dirname(file);
+
+  // `@children` is transparent in routing: `app/foo/@children/page.tsx`
+  // provides the children prop for `/foo` and registers a real page route
+  // at `/foo`. Strip a trailing `@children` segment so the route is
+  // anchored at its parent directory — that way slot discovery treats
+  // sibling `@slot` directories as owned (not inherited) and the route's
+  // layouts/boundaries are sourced from the parent. Mirrors Next.js'
+  // `normalizeAppPath` which drops any `@` segment (including `@children`)
+  // from the URL. See packages/next/src/shared/lib/router/utils/app-paths.ts.
+  if (type === "page" && dir !== "." && path.basename(dir) === "@children") {
+    const parent = path.dirname(dir);
+    dir = parent === "" || parent === "." ? "." : parent;
+  }
+
   return directoryToAppRoute(
     dir,
     appDir,
@@ -1837,6 +1889,12 @@ function discoverParallelSlots(
 
   for (const entry of entries) {
     if (!entry.isDirectory() || !entry.name.startsWith("@")) continue;
+    // `@children` is not a parallel slot — Next.js maps it to the layout's
+    // `children` prop, i.e., it provides the route's page rather than an
+    // independent slot. Skip it here so it never appears in parallelSlots.
+    // See packages/next/src/build/webpack/plugins/next-types-plugin/index.ts
+    // and packages/next/src/build/normalize-catchall-routes.ts.
+    if (entry.name === "@children") continue;
 
     const slotName = entry.name.slice(1); // "@team" -> "team"
     const slotDir = path.join(dir, entry.name);
@@ -1885,6 +1943,19 @@ const INTERCEPT_PATTERNS = [
   { prefix: "(..)", convention: ".." },
   { prefix: "(.)", convention: "." },
 ] as const;
+
+/**
+ * Check whether a directory name begins with an interception route marker.
+ *
+ * Matches the prefixes listed in {@link INTERCEPT_PATTERNS}: `(.)`, `(..)`,
+ * `(...)`, `(..)(..)`. The marker is not a real URL segment, so the global
+ * page/route scanner must skip these directories to avoid materialising
+ * literal patterns like `/templates/(..)showcase`. Interception target
+ * registration happens separately via {@link discoverInterceptingRoutes}.
+ */
+function isInterceptionMarkerDir(name: string): boolean {
+  return matchInterceptConvention(name) !== null;
+}
 
 /**
  * Discover intercepting routes inside a parallel slot directory.
@@ -2078,18 +2149,10 @@ function computeInterceptSourceMatchPattern(interceptParentDir: string, appDir: 
   return "/" + urlSegments.join("/");
 }
 
-/**
- * Check whether a path segment is invisible in the URL (route groups, parallel slots, ".").
- *
- * Used by computeInterceptTarget, convertSegmentsToRouteParts, and
- * hasRemainingVisibleSegments — keep this the single source of truth.
- */
-export function isInvisibleSegment(segment: string): boolean {
-  if (segment === ".") return true;
-  if (segment.startsWith("(") && segment.endsWith(")")) return true;
-  if (segment.startsWith("@")) return true;
-  return false;
-}
+// `isInvisibleSegment` (route groups, parallel slots, ".") is defined in the
+// browser-safe ./utils module and re-exported here so existing import sites
+// keep working without pulling node:path/node:fs into client bundles.
+export { isInvisibleSegment };
 
 /**
  * Compute the target URL pattern for an intercepting route.
@@ -2118,9 +2181,15 @@ function computeInterceptTarget(
 
   let baseParts: string[];
   switch (convention) {
-    case ".":
-      baseParts = routeSegments;
+    case ".": {
+      const interceptParentDir = path.dirname(interceptRoot);
+      // Use raw filesystem segments here. Invisible segments (@slot, route
+      // groups) and dynamic [param] syntax are resolved by the single
+      // convertSegmentsToRouteParts call below; feeding already-converted
+      // segments would drop dynamic ancestor params on the second pass.
+      baseParts = path.relative(appDir, interceptParentDir).split(path.sep).filter(Boolean);
       break;
+    }
     case "..":
     case "../..": {
       const levelsToClimb = convention === ".." ? 1 : 2;
@@ -2207,13 +2276,7 @@ function markerForInterceptionConvention(convention: string): string {
  * Find a file by name (without extension) in a directory.
  * Checks configured pageExtensions.
  */
-function findFile(dir: string, name: string, matcher: ValidFileMatcher): string | null {
-  for (const ext of matcher.dottedExtensions) {
-    const filePath = path.join(dir, name + ext);
-    if (fs.existsSync(filePath)) return filePath;
-  }
-  return null;
-}
+const findFile = findFileWithExts;
 
 /**
  * Convert filesystem path segments to URL route parts, skipping invisible segments
@@ -2283,4 +2346,64 @@ function hasRemainingVisibleSegments(segments: readonly string[], startIndex: nu
 function joinRoutePattern(basePattern: string, subPath: string): string {
   if (!subPath) return basePattern;
   return basePattern === "/" ? `/${subPath}` : `${basePattern}/${subPath}`;
+}
+
+/**
+ * Returns the unique static sibling segment names at each dynamic URL level
+ * of the matched route. Mirrors Next.js's `getStaticSiblingSegments` from
+ * the next-app-loader: for `/products/[id]` with a sibling route at
+ * `/products/sale`, the dynamic `[id]` segment has `staticSiblings: ['sale']`.
+ *
+ * The returned list flattens siblings across all dynamic positions and is
+ * intended for the RSC payload — the client router uses it to determine if
+ * a cached dynamic-route prefetch can be reused when navigating to a static
+ * sibling URL.
+ *
+ * Ported from Next.js: packages/next/src/build/webpack/loaders/next-app-loader/index.ts
+ * (getStaticSiblingSegments).
+ *
+ * Route group segments and parallel-route slot segments are part of the
+ * filesystem tree but not the URL namespace — sibling computation is done on
+ * the URL-level `patternParts`, so they are correctly transparent here.
+ */
+export function computeAppRouteStaticSiblings(
+  allRoutes: readonly { patternParts?: readonly string[] | null }[],
+  matchedRoute: { patternParts?: readonly string[] | null },
+): string[] {
+  const siblings = new Set<string>();
+  const parts = matchedRoute.patternParts;
+  if (!parts) return [];
+
+  for (let level = 0; level < parts.length; level++) {
+    const segmentAtLevel = parts[level];
+    // Only compute siblings for dynamic segments (`:id`, `:rest+`, `:rest*`).
+    if (!segmentAtLevel.startsWith(":")) continue;
+
+    for (const otherRoute of allRoutes) {
+      const otherParts = otherRoute.patternParts;
+      if (!otherParts || otherParts.length <= level) continue;
+
+      // Parent prefix (segments before `level`) must match exactly. We
+      // intentionally do not normalize dynamic-to-dynamic equivalence here:
+      // siblings are only collected when the prefix is literally the same,
+      // matching Next.js's path-string comparison.
+      let prefixMatches = true;
+      for (let i = 0; i < level; i++) {
+        if (parts[i] !== otherParts[i]) {
+          prefixMatches = false;
+          break;
+        }
+      }
+      if (!prefixMatches) continue;
+
+      const otherSegmentAtLevel = otherParts[level];
+      if (otherSegmentAtLevel === segmentAtLevel) continue;
+      // Only collect static siblings.
+      if (otherSegmentAtLevel.startsWith(":")) continue;
+
+      siblings.add(otherSegmentAtLevel);
+    }
+  }
+
+  return Array.from(siblings);
 }

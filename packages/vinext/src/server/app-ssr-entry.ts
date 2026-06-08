@@ -12,6 +12,7 @@ import {
   ServerInsertedHTMLContext,
   appRouterInstance,
   clearServerInsertedHTML,
+  getBfcacheIdMapContext,
   renderServerInsertedHTML,
   setNavigationContext,
   useServerInsertedHTML,
@@ -21,6 +22,10 @@ import { runWithRootParamsScope, type RootParams } from "vinext/shims/root-param
 import { isOpenRedirectShaped } from "./request-pipeline.js";
 import { notFoundResponse } from "./http-error-responses.js";
 import { withScriptNonce } from "vinext/shims/script-nonce-context";
+import {
+  BeforeInteractiveContext,
+  type BeforeInteractiveInlineScript,
+} from "vinext/shims/before-interactive-context";
 import {
   createInlineScriptTag,
   createNonceAttribute,
@@ -32,10 +37,13 @@ import {
   createRscEmbedTransform,
   createTickBufferedTransform,
 } from "./app-ssr-stream.js";
-import { deferUntilStreamConsumed } from "./app-page-stream.js";
+import { deferUntilStreamConsumed, type AppSsrRenderResult } from "./app-page-stream.js";
 import { createSsrErrorMetaRenderer } from "./app-ssr-error-meta.js";
+import { createInitialDevServerErrorScript } from "./dev-initial-server-error.js";
+import { getClientTraceMetadataHTML } from "./client-trace-metadata.js";
 import { AppElementsWire, type AppWireElements } from "./app-elements.js";
-import { ElementsContext, Slot } from "vinext/shims/slot";
+import { createBfcacheSegmentStateKeyMap, createInitialBfcacheIdMap } from "./app-browser-state.js";
+import { BfcacheStateKeyMapContext, ElementsContext, Slot } from "vinext/shims/slot";
 import { AppRouterContext } from "vinext/shims/internal/app-router-context";
 import { createClientReferencePreloader } from "./app-client-reference-preloader.js";
 import { RSC_FORM_STATE_GLOBAL } from "./app-browser-hydration.js";
@@ -64,6 +72,7 @@ const clientReferencePreloader = createClientReferencePreloader({
     }
   },
 });
+const BfcacheIdMapContext = getBfcacheIdMapContext();
 
 function ssrErrorDigest(input: string): string {
   let hash = 5381;
@@ -95,11 +104,64 @@ function renderInsertedHtml(insertedElements: readonly unknown[]): string {
   return insertedHTML;
 }
 
-function renderFontHtml(fontData?: FontData, nonce?: string): string {
+/**
+ * Render captured `<Script strategy="beforeInteractive">` inline scripts to
+ * HTML, ready to splice immediately after `<head ...>` opens. Each entry has
+ * already had its inline content escaped via `escapeInlineContent(..., "script")`
+ * inside the Script shim, so this function only quotes the attributes that
+ * actually go on the tag (id, nonce, plus the residual passthroughs).
+ *
+ * Keeping this function colocated with the rest of the head-injection
+ * helpers makes it obvious where the boundary is: anything passed through
+ * here is being concatenated directly into HTML; treat the inputs
+ * accordingly.
+ */
+// Conservative subset of the HTML attribute-name grammar. Must start with a
+// letter and contain only letters, digits, underscores, hyphens, or dots —
+// enough to round-trip data-* and standard attributes (`async`, `defer`,
+// `type`, `crossorigin`, etc.) without ever splicing a `"`/`>`/whitespace
+// into the unquoted *name* position where escaping wouldn't help.
+const VALID_ATTR_NAME = /^[a-zA-Z][\w.-]*$/;
+
+function renderBeforeInteractiveInlineScripts(
+  scripts: readonly BeforeInteractiveInlineScript[],
+): string {
+  if (scripts.length === 0) return "";
+  let html = "";
+  for (const script of scripts) {
+    let attrs = "";
+    if (script.id) {
+      attrs += ` id="${escapeHtmlAttr(script.id)}"`;
+    }
+    attrs += createNonceAttribute(script.nonce);
+    if (script.attributes) {
+      for (const [key, value] of Object.entries(script.attributes)) {
+        // Attribute *values* go through escapeHtmlAttr below. The *name*
+        // can't be escaped — a malformed key would break the tag — so we
+        // gate at the boundary instead of trying to neutralise it.
+        if (!VALID_ATTR_NAME.test(key)) continue;
+        if (value === true) {
+          attrs += ` ${key}`;
+        } else if (typeof value === "string") {
+          attrs += ` ${key}="${escapeHtmlAttr(value)}"`;
+        }
+      }
+    }
+    html += `<script${attrs}>${script.innerHTML}</script>`;
+  }
+  return html;
+}
+
+function renderFontHtml(
+  fontData?: FontData,
+  nonce?: string,
+  options: { includeStyles?: boolean } = {},
+): string {
   if (!fontData) return "";
 
   let fontHTML = "";
   const nonceAttr = createNonceAttribute(nonce);
+  const includeStyles = options.includeStyles ?? true;
 
   for (const url of fontData.links ?? []) {
     fontHTML += `<link rel="stylesheet"${nonceAttr} href="${escapeHtmlAttr(url)}" />\n`;
@@ -109,11 +171,15 @@ function renderFontHtml(fontData?: FontData, nonce?: string): string {
     fontHTML += `<link rel="preload"${nonceAttr} href="${escapeHtmlAttr(preload.href)}" as="font" type="${escapeHtmlAttr(preload.type)}" crossorigin />\n`;
   }
 
-  if (fontData.styles && fontData.styles.length > 0) {
+  if (includeStyles && fontData.styles && fontData.styles.length > 0) {
     fontHTML += `<style data-vinext-fonts${nonceAttr}>${fontData.styles.join("\n")}</style>\n`;
   }
 
   return fontHTML;
+}
+
+function hasInlineCssManifest(manifest: Record<string, string> | undefined): boolean {
+  return manifest !== undefined && Object.keys(manifest).length > 0;
 }
 
 /**
@@ -146,7 +212,7 @@ function buildModulePreloadHtml(bootstrapModuleUrl?: string, nonce?: string): st
 }
 
 function buildHeadInjectionHtml(
-  navContext: NavigationContext | null,
+  navContext: NavigationContext,
   bootstrapModuleUrl: string | undefined,
   formState: ReactFormState | null,
   insertedHTML: string,
@@ -154,11 +220,11 @@ function buildHeadInjectionHtml(
   scriptNonce?: string,
 ): string {
   const navPayload = {
-    pathname: navContext?.pathname ?? "/",
-    searchParams: navContext?.searchParams ? [...navContext.searchParams.entries()] : [],
+    pathname: navContext.pathname,
+    searchParams: [...navContext.searchParams.entries()],
   };
   const rscMetadataScript = createInlineScriptTag(
-    createNavigationRuntimeRscMetadataScript(navContext?.params ?? {}, navPayload),
+    createNavigationRuntimeRscMetadataScript(navContext.params, navPayload),
     scriptNonce,
   );
   const formStateScript =
@@ -178,6 +244,17 @@ function buildHeadInjectionHtml(
   );
 }
 
+function requireNavigationContext(navContext: NavigationContext | null): NavigationContext {
+  if (!navContext) {
+    // Guaranteed by the RSC handler (app-rsc-handler.ts) before every main
+    // render and by the ISR/revalidation path (app-page-dispatch.ts). Fallback
+    // boundary renderers synthesize one (app-page-boundary-render.ts) when
+    // request scope is gone.
+    throw new Error("App SSR requires navigation context for BFCache state keys");
+  }
+  return navContext;
+}
+
 export async function handleSsr(
   rscStream: ReadableStream<Uint8Array>,
   navContext: NavigationContext | null,
@@ -192,19 +269,27 @@ export async function handleSsr(
     capturedRscDataRef?: { value: Promise<ArrayBuffer> | null };
     formState?: ReactFormState | null;
     basePath?: string;
+    /**
+     * Allow-list of OpenTelemetry propagation keys (from
+     * `experimental.clientTraceMetadata`) to render as `<meta>` tags in the
+     * SSR head. Undefined or empty disables emission entirely.
+     */
+    clientTraceMetadata?: readonly string[];
     rootParams?: RootParams;
+    /** Dev-only: original server error to surface in the browser overlay. */
+    initialDevServerError?: unknown;
     /** When true, wait for the full React tree (including Suspense boundaries)
      *  to resolve before returning the HTML stream. Used for static prerender
      *  and ISR cache writes to avoid caching fallback content. */
     waitForAllReady?: boolean;
   },
-): Promise<ReadableStream<Uint8Array>> {
+): Promise<AppSsrRenderResult> {
   return runWithNavigationContext(async () => {
+    const ssrNavigationContext = requireNavigationContext(navContext);
+
     await clientReferencePreloader.preload();
 
-    if (navContext) {
-      setNavigationContext(navContext);
-    }
+    setNavigationContext(ssrNavigationContext);
 
     clearServerInsertedHTML();
 
@@ -243,11 +328,36 @@ export async function handleSsr(
           const wireElements = use(flightRoot);
           const elements = AppElementsWire.decode(wireElements);
           const metadata = AppElementsWire.readMetadata(elements);
-          return createReactElement(
+          const routeTree = createReactElement(
             ElementsContext.Provider,
             { value: elements },
             createReactElement(Slot, { id: metadata.routeId }),
           );
+          const stateKeyTree = createReactElement(
+            BfcacheStateKeyMapContext.Provider,
+            {
+              value: createBfcacheSegmentStateKeyMap({
+                elements,
+                // Normalized inside the function to match the client navigation
+                // snapshot pathname (SSR/client Activity key parity).
+                pathname: ssrNavigationContext.pathname,
+              }),
+            },
+            routeTree,
+          );
+          // During SSR we only provide the id *map*, seeded entirely with the
+          // INITIAL_BFCACHE_ID sentinel. BfcacheSlotBoundary may still publish a
+          // BfcacheSegmentIdContext value here, but every map entry is the "0"
+          // sentinel, so formatPublicBfcacheId resolves useRouter().bfcacheId to
+          // the public hydration sentinel ("_b_0_") regardless until the client
+          // context takes over. Per-segment minted ids are browser-only.
+          return BfcacheIdMapContext
+            ? createReactElement(
+                BfcacheIdMapContext.Provider,
+                { value: createInitialBfcacheIdMap(elements) },
+                stateKeyTree,
+              )
+            : stateKeyTree;
         }
 
         const flightRootElement = createReactElement(VinextFlightRoot);
@@ -265,7 +375,27 @@ export async function handleSsr(
               root,
             )
           : root;
-        const ssrRoot = withScriptNonce(ssrTree, options?.scriptNonce);
+
+        // Capture inline `<Script strategy="beforeInteractive">` content so the
+        // SSR stream transform can emit it immediately after `<head ...>`
+        // opens — ahead of every React-emitted resource hint. The Script shim
+        // pushes here when it sees an inline beforeInteractive Script and
+        // returns `null` from its render so React does not also serialize the
+        // tag where the user wrote it (where Fizz would push it *after* the
+        // hoisted stylesheets/modulepreloads). See
+        // packages/vinext/src/shims/script.tsx for the capture side.
+        const beforeInteractiveInlineScripts: BeforeInteractiveInlineScript[] = [];
+        const registerBeforeInteractiveInlineScript = (
+          script: BeforeInteractiveInlineScript,
+        ): void => {
+          beforeInteractiveInlineScripts.push(script);
+        };
+        const treeWithBeforeInteractive = createReactElement(
+          BeforeInteractiveContext.Provider,
+          { value: registerBeforeInteractiveInlineScript },
+          ssrTree,
+        );
+        const ssrRoot = withScriptNonce(treeWithBeforeInteractive, options?.scriptNonce);
 
         // plugin-rsc returns the bootstrap as `import("<url>")` so callers can
         // inject it via `bootstrapScriptContent`. We hand the URL to React's
@@ -327,42 +457,101 @@ export async function handleSsr(
           },
         });
 
-        // When producing static output (prerender / ISR cache writes), wait for
-        // the full React tree to resolve before emitting bytes. This prevents
-        // Suspense fallback content from being serialized to the cache.
-        // Matches Next.js waitForAllReady forkpoint in renderToNodeFizzStream.
-        if (options?.waitForAllReady === true) {
-          await htmlStream.allReady;
-        }
-
-        const fontHTML = renderFontHtml(fontData, options?.scriptNonce);
+        // Populated before any SSR request runs: at prod-server startup
+        // (prod-server.ts) or via build-time bundle injection (index.ts). Left
+        // undefined in dev, which naturally disables inline CSS there.
+        const inlineCssManifest = globalThis.__VINEXT_INLINE_CSS__;
+        const fontStyles = fontData?.styles ?? [];
+        const mergeFontStylesIntoInlineCss =
+          fontStyles.length > 0 && hasInlineCssManifest(inlineCssManifest);
+        const inlineCssFontStyles = mergeFontStylesIntoInlineCss ? fontStyles.join("\n") : "";
+        const inlineCssFontStyleFallbackHTML = mergeFontStylesIntoInlineCss
+          ? renderFontHtml({ styles: fontStyles }, options?.scriptNonce)
+          : "";
+        const fontHTML = renderFontHtml(fontData, options?.scriptNonce, {
+          includeStyles: !mergeFontStylesIntoInlineCss,
+        });
+        // Trace meta tags only need to land in the document head once.
+        // Read the active OTel context lazily so the value reflects the
+        // span that was active when the SSR shell rendered. When
+        // clientTraceMetadata is unset (the common case) this is empty.
+        let traceMetaHTML: string | null = null;
+        const getTraceMetaHTML = (): string => {
+          if (traceMetaHTML === null) {
+            traceMetaHTML = getClientTraceMetadataHTML(options?.clientTraceMetadata);
+          }
+          return traceMetaHTML;
+        };
         let didInjectHeadHTML = false;
         const getInsertedHTML = (): string => {
           const insertedHTML = renderInsertedHtml(renderServerInsertedHTML());
           const errorMetaHTML = errorMetaRenderer.flush();
+          const initialDevServerErrorHTML = createInitialDevServerErrorScript(
+            options?.initialDevServerError,
+            options?.scriptNonce,
+          );
           if (didInjectHeadHTML) return insertedHTML + errorMetaHTML;
 
           didInjectHeadHTML = true;
           return buildHeadInjectionHtml(
-            navContext,
+            ssrNavigationContext,
             bootstrapModuleUrl,
             options?.formState ?? null,
-            insertedHTML + errorMetaHTML,
+            insertedHTML + errorMetaHTML + getTraceMetaHTML() + initialDevServerErrorHTML,
             fontHTML,
             options?.scriptNonce,
           );
         };
 
-        return deferUntilStreamConsumed(
-          htmlStream.pipeThrough(createTickBufferedTransform(rscEmbed, getInsertedHTML)),
+        // The transform calls this once when it splices after `<head ...>`.
+        // By that point React Fizz has rendered the layout's `<head>` children
+        // (which is where the Script shim registers), so the captured array is
+        // populated. We deliberately return a snapshot — `flushBuffered` will
+        // not re-invoke us, and any beforeInteractive Script that renders
+        // later (inside a Suspense boundary further down the tree) falls back
+        // to its inline location, matching the documented guarantee that
+        // ordering applies to scripts rendered in the initial shell.
+        const getBeforeInteractiveHeadHTML = (): string =>
+          renderBeforeInteractiveInlineScripts(beforeInteractiveInlineScripts);
+
+        if (options?.waitForAllReady === true) {
+          await htmlStream.allReady;
+        }
+
+        const finalStream = deferUntilStreamConsumed(
+          htmlStream.pipeThrough(
+            createTickBufferedTransform(
+              rscEmbed,
+              getInsertedHTML,
+              getBeforeInteractiveHeadHTML,
+              inlineCssManifest,
+              inlineCssFontStyles,
+              inlineCssFontStyleFallbackHTML,
+              options?.scriptNonce,
+            ),
+          ),
           cleanup,
         );
+
+        return {
+          htmlStream: finalStream,
+          // `metadataReady` resolves eagerly precisely *because* `allReady` was
+          // already awaited above when `waitForAllReady` is set (the prerender
+          // path). At that point the React tree is fully rendered, so all
+          // render-time metadata (cache life, headers, captured RSC errors) is
+          // already settled and there is nothing left for the lifecycle to wait
+          // on. The promise exists to keep `renderAppPageLifecycle` agnostic to
+          // *where* the blocking happens — do not move the `allReady` await onto
+          // this promise expecting it to be load-bearing in production.
+          metadataReady: Promise.resolve(),
+          capturedRscData: options?.capturedRscDataRef?.value ?? null,
+        };
       } catch (error) {
         cleanup();
         throw error;
       }
     });
-  }) as Promise<ReadableStream<Uint8Array>>;
+  }) as Promise<AppSsrRenderResult>;
 }
 
 export default {

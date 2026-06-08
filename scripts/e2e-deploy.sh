@@ -207,9 +207,9 @@ cleanup_on_error() {
   if [ -f "${PID_FILE}" ]; then
     local pid
     pid="$(cat "${PID_FILE}")"
-    kill -TERM "-${pid}" >/dev/null 2>&1 || kill -TERM "${pid}" >/dev/null 2>&1 || true
+    kill -TERM "${pid}" >/dev/null 2>&1 || true
     sleep 1
-    kill -KILL "-${pid}" >/dev/null 2>&1 || kill -KILL "${pid}" >/dev/null 2>&1 || true
+    kill -KILL "${pid}" >/dev/null 2>&1 || true
   fi
 
   # Kill any process still listening on the allocated port (handles orphaned children).
@@ -219,7 +219,7 @@ cleanup_on_error() {
     local cleanup_port
     cleanup_port="$(cat "${PORT_FILE}")"
     local listener_pid
-    listener_pid="$(lsof -ti "tcp:${cleanup_port}" 2>/dev/null || true)"
+    listener_pid="$(lsof -ti "tcp:${cleanup_port}" -sTCP:LISTEN 2>/dev/null || true)"
     if [ -n "${listener_pid}" ]; then
       kill -TERM ${listener_pid} >/dev/null 2>&1 || true
       sleep 1
@@ -285,6 +285,9 @@ const rootPkg = JSON.parse(fs.readFileSync(path.join(vinextDir, 'package.json'),
 const vinextPkg = JSON.parse(
   fs.readFileSync(path.join(vinextDir, 'packages', 'vinext', 'package.json'), 'utf8'),
 )
+const cloudflarePkg = JSON.parse(
+  fs.readFileSync(path.join(vinextDir, 'packages', 'cloudflare', 'package.json'), 'utf8'),
+)
 const workspaceConfig = fs.readFileSync(
   path.join(vinextDir, 'pnpm-workspace.yaml'),
   'utf8',
@@ -324,6 +327,15 @@ function parseCatalog(yaml) {
 }
 
 const catalog = parseCatalog(workspaceConfig)
+const localCloudflarePkgDir = path.join(process.cwd(), '.vinext-local-cloudflare-package')
+
+function workspaceDependencySpecFor(name) {
+  if (name === cloudflarePkg.name) {
+    return 'file:../.vinext-local-cloudflare-package'
+  }
+
+  throw new Error(`Unable to resolve workspace dependency spec for ${name}`)
+}
 
 function dependencySpecFor(name) {
   for (const deps of [
@@ -335,6 +347,7 @@ function dependencySpecFor(name) {
   ]) {
     const spec = deps?.[name]
     if (!spec) continue
+    if (spec.startsWith('workspace:')) return workspaceDependencySpecFor(name)
     if (spec !== 'catalog:') return spec
     if (catalog[name]) return catalog[name]
   }
@@ -352,14 +365,42 @@ function resolveManifestDeps(deps) {
   return Object.fromEntries(
     Object.entries(deps).map(([name, spec]) => [
       name,
-      spec === 'catalog:' ? dependencySpecFor(name) : spec,
+      spec === 'catalog:' || spec.startsWith('workspace:') ? dependencySpecFor(name) : spec,
     ]),
   )
 }
 
 const localVinextPkgDir = path.join(process.cwd(), '.vinext-local-package')
 fs.rmSync(localVinextPkgDir, { recursive: true, force: true })
+fs.rmSync(localCloudflarePkgDir, { recursive: true, force: true })
 fs.mkdirSync(localVinextPkgDir, { recursive: true })
+fs.mkdirSync(localCloudflarePkgDir, { recursive: true })
+fs.cpSync(
+  path.join(vinextDir, 'packages', 'cloudflare', 'dist'),
+  path.join(localCloudflarePkgDir, 'dist'),
+  {
+    recursive: true,
+  },
+)
+fs.writeFileSync(
+  path.join(localCloudflarePkgDir, 'package.json'),
+  JSON.stringify(
+    {
+      name: cloudflarePkg.name,
+      version: cloudflarePkg.version,
+      description: cloudflarePkg.description,
+      license: cloudflarePkg.license,
+      repository: cloudflarePkg.repository,
+      type: cloudflarePkg.type,
+      files: ['dist'],
+      exports: cloudflarePkg.exports,
+      peerDependencies: resolveManifestDeps(cloudflarePkg.peerDependencies),
+      engines: cloudflarePkg.engines,
+    },
+    null,
+    2,
+  ) + '\n',
+)
 fs.cpSync(path.join(vinextDir, 'packages', 'vinext', 'dist'), path.join(localVinextPkgDir, 'dist'), {
   recursive: true,
 })
@@ -390,6 +431,62 @@ fs.writeFileSync(
 
 pkg.devDependencies = pkg.devDependencies || {}
 pkg.devDependencies.vinext = 'file:.vinext-local-package'
+
+// App Router fixtures need React to satisfy the same peer range as the
+// injected react-server-dom-webpack. If they install an older React pair first,
+// `vinext build` runs its RSC compatibility upgrade and pays for a second
+// package-manager install inside every throwaway test app. Normalize the temp
+// manifest before the first install so the final dependency graph is unchanged
+// but setup is single-pass.
+function hasAppRouterDir(root) {
+  return fs.existsSync(path.join(root, 'app')) || fs.existsSync(path.join(root, 'src', 'app'))
+}
+
+function compareSemver(a, b) {
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] < b[index]) return -1
+    if (a[index] > b[index]) return 1
+  }
+
+  return 0
+}
+
+function parseSemverSpec(spec) {
+  const match = /(\d+)\.(\d+)\.(\d+)/.exec(spec)
+  if (!match) return null
+  return [Number(match[1]), Number(match[2]), Number(match[3])]
+}
+
+function dependencyBucketFor(name) {
+  for (const bucket of ['dependencies', 'devDependencies', 'peerDependencies']) {
+    if (pkg[bucket]?.[name]) return bucket
+  }
+
+  return null
+}
+
+function normalizeAppRouterReactDeps() {
+  if (!hasAppRouterDir(process.cwd())) return
+
+  for (const dep of ['react', 'react-dom']) {
+    const bucket = dependencyBucketFor(dep)
+    if (!bucket) continue
+
+    const current = pkg[bucket][dep]
+    const version = parseSemverSpec(current)
+    const replacement = dependencySpecFor(dep)
+    const minimumVersion = parseSemverSpec(replacement)
+    if (!minimumVersion) continue
+    if (!version || compareSemver(version, minimumVersion) >= 0) continue
+
+    pkg[bucket][dep] = replacement
+    console.log(
+      `Bumped ${bucket}.${dep} from ${current} to ${replacement} for RSC compatibility`,
+    )
+  }
+}
+
+normalizeAppRouterReactDeps()
 
 // Catalog-tracked deps: spec sourced from vinext or workspace root package.json.
 // Includes the Vite/RSC peers that vinext consumers must install, plus runtime
