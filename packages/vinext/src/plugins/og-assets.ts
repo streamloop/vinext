@@ -184,8 +184,10 @@ function findEmittedWasmAsset(
   baseName: string,
 ): string | null {
   const stem = baseName.replace(/\.wasm$/, "");
-  // Matches `resvg.wasm` or `resvg-<hash>.wasm` as the basename.
-  const re = new RegExp(`^${stem}(?:-[\\w-]+)?\\.wasm$`);
+  // Matches `resvg.wasm`, `resvg-<hash>.wasm` (Vite default flat naming), or
+  // `resvg.<hash8>.wasm` (the dot-hash `media/` naming produced when the rsc
+  // env routes assets through `createClientAssetFileNames`) as the basename.
+  const re = new RegExp(`^${stem}(?:[-.][\\w-]+)?\\.wasm$`);
   for (const output of Object.values(bundle)) {
     if (output.type !== "asset") continue;
     if (re.test(path.posix.basename(output.fileName))) return output.fileName;

@@ -1719,7 +1719,27 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             // and any static file server can resolve
             // `<assetPrefix?>/_next/static/...` requests directly, and
             // misses naturally fall through as plain-text 404s.
-            assetsDir: clientAssetsDir,
+            //
+            // Scope to single-build client output only. A bare top-level
+            // `assetsDir` leaks into EVERY environment Vite derives from this
+            // config (`resolveConfig` copies unset `environments.*.build`
+            // fields down from the top level), so on a multi-env build it
+            // would silently set `assetsDir` on the rsc/ssr environments too.
+            // Those environments use Vite's DEFAULT flat `assetFileNames`
+            // (`<assetsDir>/[name]-[hash][extname]`), while the client env
+            // routes media to `<assetsDir>/media/[name].[hash:8][extname]`
+            // (see `createClientAssetFileNames`). For the same imported asset
+            // (e.g. an svg used by a 'use client' nav) the client would EMIT
+            // `_next/static/media/logo.<hash8>.svg` but SSR/RSC would RENDER
+            // `_next/static/logo-<hash>.svg` → a 404 in the SSR HTML because
+            // the file only exists under `media/`. We therefore set
+            // `assetsDir` (and the matching `assetFileNames`) EXPLICITLY on
+            // each environment below so all three agree by construction
+            // instead of relying on the leak. When there is no dedicated
+            // client build environment (single-build client output: CLI Pages
+            // Router), keep it at the top level so that lone build still picks
+            // it up — there's no rsc/ssr env to leak into in that case.
+            ...(!isSSR && !hasClientBuildEnvironment ? { assetsDir: clientAssetsDir } : {}),
             // Single-build client output has no client environment to carry the
             // default, so apply it at the top level. Multi-env builds set it on
             // `environments.client.build` below to avoid changing RSC/SSR asset
@@ -2080,8 +2100,18 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               },
               build: {
                 outDir: options.rscOutDir ?? "dist/server",
+                // Align the RSC environment's asset layout with the client
+                // environment so any asset URL rendered server-side (RSC)
+                // equals the path the client build actually emits/uploads
+                // (`<assetsDir>/media/[name].[hash:8][extname]` for media,
+                // `<assetsDir>/css/...` for CSS). Set both explicitly rather
+                // than relying on the (now-removed) top-level `assetsDir`
+                // leak. The served file always comes from `dist/client`, so
+                // the RSC-rendered string must match `createClientAssetFileNames`.
+                assetsDir: clientAssetsDir,
                 ...withBuildBundlerOptions(viteMajorVersion, {
                   input: { index: VIRTUAL_RSC_ENTRY },
+                  output: { assetFileNames: createClientAssetFileNames(clientAssetsDir) },
                 }),
               },
             },
@@ -2126,8 +2156,19 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               },
               build: {
                 outDir: options.ssrOutDir ?? "dist/server/ssr",
+                // Align the SSR environment's asset layout with the client
+                // environment. The landing nav is a 'use client' component
+                // SERVER-RENDERED through this SSR env, so the asset URL it
+                // emits into the streamed HTML must equal the path the client
+                // build uploads (`<assetsDir>/media/[name].[hash:8][extname]`).
+                // Without this, an svg import resolves to Vite's default flat
+                // `<assetsDir>/[name]-[hash][extname]` here while the client
+                // emits it under `media/` → 404 in production. Set both
+                // explicitly rather than relying on the top-level leak.
+                assetsDir: clientAssetsDir,
                 ...withBuildBundlerOptions(viteMajorVersion, {
                   input: { index: VIRTUAL_APP_SSR_ENTRY },
+                  output: { assetFileNames: createClientAssetFileNames(clientAssetsDir) },
                 }),
               },
             },
@@ -2179,8 +2220,19 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 // on every page — defeating code-splitting for React.lazy() and
                 // next/dynamic boundaries.
                 ...(hasCloudflarePlugin ? { manifest: true } : {}),
-                // Client-scoped so RSC/SSR keep their normal asset handling
-                // unless the user configured Vite globally.
+                // The on-disk output directory for emitted assets. This is the
+                // build whose files are uploaded/served (`dist/client`), so the
+                // rsc/ssr envs above are aligned to THIS value. Set explicitly
+                // (rather than inheriting the top-level default) so the client
+                // env is self-documenting and the three environments visibly
+                // agree. The matching `assetFileNames` is supplied by
+                // `getClientOutputConfigForVite` → `createClientAssetFileNames`.
+                // The font plugins (`vinext:google-fonts` writeBundle and the
+                // local/google transforms) also read this env's resolved
+                // `build.assetsDir` to compute the `/<assetsDir>/_vinext_fonts/`
+                // URL prefix and copy target, so keeping it `clientAssetsDir`
+                // here preserves self-hosted font emission.
+                assetsDir: clientAssetsDir,
                 assetsInlineLimit: clientAssetsInlineLimit,
                 ...withBuildBundlerOptions(viteMajorVersion, {
                   input: { index: VIRTUAL_APP_BROWSER_ENTRY },
@@ -2203,6 +2255,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               build: {
                 manifest: true,
                 ssrManifest: true,
+                // Explicit so it doesn't depend on the (single-build-only)
+                // top-level `assetsDir`. Matches `createClientAssetFileNames`
+                // (in the `output` below) and the `_vinext_fonts` copy target
+                // the font writeBundle derives from this env's `assetsDir`.
+                assetsDir: clientAssetsDir,
                 assetsInlineLimit: clientAssetsInlineLimit,
                 ...withBuildBundlerOptions(viteMajorVersion, {
                   input: { index: VIRTUAL_CLIENT_ENTRY },
@@ -2230,6 +2287,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 outDir: "dist/client",
                 manifest: true,
                 ssrManifest: true,
+                // Explicit so it doesn't depend on the (single-build-only)
+                // top-level `assetsDir`. Matches `createClientAssetFileNames`
+                // (in the `output` below) and the `_vinext_fonts` copy target
+                // the font writeBundle derives from this env's `assetsDir`.
+                assetsDir: clientAssetsDir,
                 assetsInlineLimit: clientAssetsInlineLimit,
                 ...withBuildBundlerOptions(viteMajorVersion, {
                   input: { index: VIRTUAL_CLIENT_ENTRY },
@@ -2254,10 +2316,18 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               },
               build: {
                 outDir: "dist/server",
+                // Align the Pages Router SSR env's asset layout with the
+                // client env: a server-rendered page that imports an asset
+                // must reference the same `<assetsDir>/media|css/...` path the
+                // client build emits/uploads. Without this the SSR env uses
+                // Vite's default flat `assetFileNames` and the URL diverges
+                // from the on-disk client file → 404.
+                assetsDir: clientAssetsDir,
                 ...withBuildBundlerOptions(viteMajorVersion, {
                   input: { index: VIRTUAL_SERVER_ENTRY },
                   output: {
                     entryFileNames: "entry.js",
+                    assetFileNames: createClientAssetFileNames(clientAssetsDir),
                   },
                 }),
               },
