@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { glob } from "node:fs/promises";
 import path from "node:path";
 import { escapeRegExp } from "../utils/regex.js";
+import { normalizePathSeparators } from "../utils/path.js";
 
 const DEFAULT_PAGE_EXTENSIONS = ["tsx", "ts", "jsx", "js"] as const;
 
@@ -91,6 +92,9 @@ export function findFileWithExtensions(basePath: string, matcher: ValidFileMatch
 /**
  * Find a file by basename and configured page extension in a directory.
  * Returns the first matching absolute path, or null if not found.
+ *
+ * `dir` must be forward-slash. The returned path is built with `path.posix.join`,
+ * so it is forward-slash too.
  */
 export function findFileWithExts(
   dir: string,
@@ -98,7 +102,7 @@ export function findFileWithExts(
   matcher: ValidFileMatcher,
 ): string | null {
   for (const ext of matcher.dottedExtensions) {
-    const filePath = path.join(dir, name + ext);
+    const filePath = path.posix.join(dir, name + ext);
     if (existsSync(filePath)) return filePath;
   }
   return null;
@@ -117,11 +121,18 @@ export function findFileWithExts(
  *  1. User-configured pageExtensions go first (each prefixed with `.`) so
  *     the user's priority wins. e.g. `.platform.tsx` resolves before `.tsx`.
  *  2. Vite's defaults follow, with duplicates removed.
+ *  3. `.cjs`/`.cts` go last (lowest priority). Neither Vite's defaults nor the
+ *     user's pageExtensions include them, but `vinext init` renames CJS config
+ *     files (e.g. `tailwind.config.js` → `tailwind.config.cjs`) when it adds
+ *     `"type": "module"`, and app code imports those extensionlessly
+ *     (`import cfg from "../tailwind.config"`). Without these, the bundle fails
+ *     with "[UNRESOLVED_IMPORT] Could not resolve '../tailwind.config'".
  *
  * The user's pageExtensions retain their relative order, which is what
  * Next.js / Turbopack do via the `resolveExtensions` config option.
  *
- * See: cloudflare/vinext#1502
+ * See: cloudflare/vinext#1502 for page-extension ordering, and
+ * cloudflare/vinext#2435 for extensionless `.cjs` config imports.
  */
 export function buildViteResolveExtensions(
   pageExtensions?: readonly string[] | null,
@@ -131,7 +142,7 @@ export function buildViteResolveExtensions(
   const dotted = normalized.map((ext) => `.${ext}`);
   const seen = new Set<string>();
   const result: string[] = [];
-  for (const ext of [...dotted, ...viteDefaults]) {
+  for (const ext of [...dotted, ...viteDefaults, ".cjs", ".cts"]) {
     if (seen.has(ext)) continue;
     seen.add(ext);
     result.push(ext);
@@ -140,7 +151,34 @@ export function buildViteResolveExtensions(
 }
 
 /**
+ * Normalize an explicit Next.js resolver extension list for Vite.
+ *
+ * Unlike `pageExtensions`, both Turbopack's `resolveExtensions` and webpack's
+ * `resolve.extensions` replace their resolver defaults. The empty string is a
+ * webpack/Turbopack convention for trying the import exactly as written; Vite
+ * already does that before appending extensions, so it must be omitted here.
+ */
+export function normalizeViteResolveExtensions(extensions: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const extension of extensions) {
+    const trimmed = extension.trim();
+    if (!trimmed) continue;
+    const dotted = trimmed.startsWith(".") ? trimmed : `.${trimmed}`;
+    if (seen.has(dotted)) continue;
+    seen.add(dotted);
+    result.push(dotted);
+  }
+  return result;
+}
+
+/**
  * Use function-form exclude for Node < 22.14 compatibility.
+ *
+ * Yields forward-slash relative paths: node's glob emits native (backslash)
+ * separators on Windows, so each match is normalized — this is the entry point
+ * that lets downstream consumers treat the scanned paths as canonical
+ * forward-slash ids.
  */
 export async function* scanWithExtensions(
   stem: string,
@@ -153,6 +191,6 @@ export async function* scanWithExtensions(
     cwd,
     ...(exclude ? { exclude } : {}),
   })) {
-    yield file;
+    yield normalizePathSeparators(file);
   }
 }

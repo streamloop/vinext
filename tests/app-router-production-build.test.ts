@@ -9,6 +9,13 @@ import { APP_FIXTURE_DIR } from "./helpers.js";
 
 type BuiltAppHandler = (request: Request) => Promise<Response | string | null | undefined>;
 
+type ClientManifestEntry = {
+  imports?: string[];
+  isEntry?: boolean;
+  name?: string;
+  src?: string;
+};
+
 function isBuiltAppHandler(value: unknown): value is BuiltAppHandler {
   return typeof value === "function";
 }
@@ -47,10 +54,65 @@ describe("App Router Production build", () => {
     // Client bundle should exist
     expect(fs.existsSync(path.join(outDir, "client"))).toBe(true);
 
-    // Client should have hashed JS assets under Next.js's canonical
-    // `_next/static/` directory (matches `resolveAssetsDir("")`).
-    const clientAssets = fs.readdirSync(path.join(outDir, "client", "_next", "static"));
+    // Client JS should land under Next.js's canonical `_next/static/chunks/`
+    // directory.
+    const clientAssets = fs.readdirSync(path.join(outDir, "client", "_next", "static", "chunks"));
     expect(clientAssets.some((f: string) => f.endsWith(".js"))).toBe(true);
+    const clientJs = readAllJs(path.join(outDir, "client"));
+
+    // Ported from Next.js:
+    // test/production/app-dir/browser-chunks/browser-chunks.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/production/app-dir/browser-chunks/browser-chunks.test.ts
+    //
+    // Dev overlay and HMR plumbing must not create a production client chunk
+    // edge. Keep this list focused on symbols/module ids that only belong to
+    // vinext's App Router dev overlay path.
+    for (const devOnlyNeedle of [
+      "dev-error-overlay",
+      "vinext-dev-error-overlay",
+      "installDevErrorOverlay",
+      "installViteHmrErrorHandler",
+      "rsc:update",
+    ]) {
+      expect(clientJs).not.toContain(devOnlyNeedle);
+    }
+
+    // Ported from the client-reference chunk ownership covered by Next.js:
+    // test/e2e/app-dir/client-reference-chunking/client-reference-chunking.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/client-reference-chunking/client-reference-chunking.test.ts
+    //
+    // `next/link` is a client reference used by selected routes. It must remain
+    // a lazy chunk instead of being pulled into the eager App Router bootstrap
+    // by vinext's manual chunk policy.
+    const clientManifest = JSON.parse(
+      fs.readFileSync(path.join(outDir, "client", ".vite", "manifest.json"), "utf-8"),
+    ) as Record<string, ClientManifestEntry>;
+    const browserEntryKey = Object.keys(clientManifest).find(
+      (key) => clientManifest[key]?.isEntry === true,
+    );
+    const linkEntryKey = Object.keys(clientManifest).find((key) => {
+      const entry = clientManifest[key];
+      const source = entry?.src?.replaceAll("\\", "/") ?? key.replaceAll("\\", "/");
+      return entry?.name === "link" || /\/shims\/link\.(?:js|tsx)$/.test(source);
+    });
+    const serverActionClientKey = Object.keys(clientManifest).find((key) => {
+      const source = clientManifest[key]?.src?.replaceAll("\\", "/") ?? key.replaceAll("\\", "/");
+      return source.includes("/server/app-browser-server-action-client.");
+    });
+    expect(browserEntryKey).toBeDefined();
+    expect(linkEntryKey).toBeDefined();
+    expect(serverActionClientKey).toBeDefined();
+
+    const eagerKeys = new Set<string>();
+    const visitEagerImports = (key: string): void => {
+      if (eagerKeys.has(key)) return;
+      eagerKeys.add(key);
+      for (const importedKey of clientManifest[key]?.imports ?? []) {
+        visitEagerImports(importedKey);
+      }
+    };
+    if (browserEntryKey) visitEagerImports(browserEntryKey);
+    expect(linkEntryKey ? eagerKeys.has(linkEntryKey) : true).toBe(false);
 
     // RSC bundle should contain route handling code
     const rscEntry = fs.readFileSync(path.join(outDir, "server", "index.js"), "utf-8");
@@ -67,7 +129,54 @@ describe("App Router Production build", () => {
     // silently never written for pure App Router apps.
     const buildIdPath = path.join(outDir, "server", "BUILD_ID");
     expect(fs.existsSync(buildIdPath)).toBe(true);
-    expect(fs.readFileSync(buildIdPath, "utf-8").trim().length).toBeGreaterThan(0);
+    const buildId = fs.readFileSync(buildIdPath, "utf-8").trim();
+    expect(buildId.length).toBeGreaterThan(0);
+
+    const warmupManifestPath = path.join(outDir, "server", "vinext-prerender-paths.json");
+    expect(fs.existsSync(warmupManifestPath)).toBe(false);
+    expect(fs.existsSync(path.join(outDir, "server", "prerendered-routes"))).toBe(false);
+  }, 30000);
+
+  it("omits the browser server-action client when the app has no server actions", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-action-free-client-"));
+
+    try {
+      fs.symlinkSync(
+        path.resolve(import.meta.dirname, "../node_modules"),
+        path.join(tmpDir, "node_modules"),
+        "junction",
+      );
+      fs.mkdirSync(path.join(tmpDir, "app"), { recursive: true });
+      fs.writeFileSync(
+        path.join(tmpDir, "app", "layout.tsx"),
+        `export default function Root({ children }: { children: React.ReactNode }) {
+  return <html><body>{children}</body></html>;
+}
+`,
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, "app", "page.tsx"),
+        `export default function Page() {
+  return <p>action-free</p>;
+}
+`,
+      );
+
+      const builder = await createBuilder({
+        root: tmpDir,
+        configFile: false,
+        plugins: [vinext({ appDir: tmpDir })],
+        logLevel: "silent",
+      });
+      await builder.buildApp();
+
+      const clientDir = path.join(tmpDir, "dist", "client");
+      const manifest = fs.readFileSync(path.join(clientDir, ".vite", "manifest.json"), "utf-8");
+      expect(manifest).not.toContain("app-browser-server-action-client");
+      expect(readAllJs(clientDir)).not.toContain("UnrecognizedActionError");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   }, 30000);
 
   it("adopts __VINEXT_SHARED_BUILD_ID so the runtime and BUILD_ID file agree", async () => {
@@ -246,6 +355,128 @@ export default function proxy(request: NextRequest) {
     }
   }, 120000);
 
+  it("serves TypeScript language service from a production route handler", async () => {
+    // Ported from Next.js: test/e2e/twoslash/index.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/twoslash/index.test.ts
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-twoslash-typescript-"));
+
+    try {
+      fs.writeFileSync(path.join(tmpDir, "package.json"), `{"type":"module"}`);
+      fs.symlinkSync(
+        path.resolve(import.meta.dirname, "../node_modules"),
+        path.join(tmpDir, "node_modules"),
+        "junction",
+      );
+      fs.mkdirSync(path.join(tmpDir, "app"), { recursive: true });
+      fs.writeFileSync(
+        path.join(tmpDir, "app", "route.ts"),
+        `import ts from "typescript";
+
+const code = "type X = Promise<number>;\\n'hello'.toUpperCase()";
+
+export function GET(request) {
+  const compilerOptions = request.nextUrl.searchParams.has("esnext")
+    ? { target: ts.ScriptTarget.ESNext, lib: ["lib.esnext.d.ts", "lib.dom.d.ts"] }
+    : {};
+  const fileName = "input.ts";
+  const host = {
+    getCompilationSettings: () => compilerOptions,
+    getScriptFileNames: () => [fileName],
+    getScriptVersion: () => "0",
+    getScriptSnapshot: (name) => {
+      if (name === fileName) return ts.ScriptSnapshot.fromString(code);
+      if (!ts.sys.fileExists(name)) return undefined;
+      return ts.ScriptSnapshot.fromString(ts.sys.readFile(name));
+    },
+    getCurrentDirectory: () => process.cwd(),
+    getDefaultLibFileName: (options) => ts.getDefaultLibFilePath(options),
+    fileExists: ts.sys.fileExists,
+    readFile: ts.sys.readFile,
+    readDirectory: ts.sys.readDirectory,
+  };
+  const service = ts.createLanguageService(host);
+  const promise = service.getQuickInfoAtPosition(fileName, 9);
+  const upper = service.getQuickInfoAtPosition(fileName, 34);
+  return Response.json({
+    defaultLib: ts.getDefaultLibFilePath(compilerOptions),
+    promise: promise && ts.displayPartsToString(promise.displayParts),
+    upper: upper && ts.displayPartsToString(upper.displayParts),
+  });
+}
+`,
+      );
+
+      const builder = await createBuilder({
+        root: tmpDir,
+        configFile: false,
+        plugins: [vinext({ appDir: tmpDir })],
+        logLevel: "silent",
+      });
+      await builder.buildApp();
+
+      const externals = JSON.parse(
+        fs.readFileSync(path.join(tmpDir, "dist", "server", "vinext-externals.json"), "utf-8"),
+      ) as string[];
+      expect(externals).toContain("typescript");
+
+      const built: { default?: unknown } = await import(
+        `${pathToFileURL(path.join(tmpDir, "dist", "server", "index.js")).href}?t=${Date.now()}`
+      );
+      expect(isBuiltAppHandler(built.default)).toBe(true);
+      if (!isBuiltAppHandler(built.default)) return;
+
+      for (const mode of ["default", "esnext"]) {
+        const response = await built.default(new Request(`http://localhost/?${mode}`));
+        expect(response).toBeInstanceOf(Response);
+        if (!(response instanceof Response)) return;
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({
+          promise: "interface Promise<T>",
+          upper: "(method) String.toUpperCase(): string",
+        });
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }, 120000);
+
+  it("fails the production build when proxy.ts has an invalid export", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-app-proxy-invalid-build-"));
+    try {
+      fs.writeFileSync(path.join(tmpDir, "package.json"), `{"type":"module"}`);
+      fs.symlinkSync(
+        path.resolve(import.meta.dirname, "../node_modules"),
+        path.join(tmpDir, "node_modules"),
+        "junction",
+      );
+      fs.mkdirSync(path.join(tmpDir, "app"), { recursive: true });
+      fs.writeFileSync(
+        path.join(tmpDir, "app", "layout.tsx"),
+        `export default function Root({ children }: { children: React.ReactNode }) {
+  return <html><body>{children}</body></html>;
+}
+`,
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, "app", "page.tsx"),
+        `export default function Page() { return <p>hello world</p>; }\n`,
+      );
+      fs.writeFileSync(path.join(tmpDir, "proxy.ts"), `export function middleware() {}\n`);
+
+      const builder = await createBuilder({
+        root: tmpDir,
+        configFile: false,
+        plugins: [vinext({ appDir: tmpDir })],
+        logLevel: "silent",
+      });
+      await expect(builder.buildApp()).rejects.toThrow(
+        'The file "./proxy.ts" must export a function, either as a default export or as a named "proxy" export.',
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }, 120000);
+
   it("serves production build via preview server", async () => {
     const { preview } = await import("vite");
 
@@ -268,9 +499,9 @@ export default function proxy(request: NextRequest) {
       const homeHtml = await homeRes.text();
       expect(homeHtml).toContain("Welcome to App Router");
       expect(homeHtml).toContain("<script");
-      // Production bootstrap is emitted as a real <script type="module" src=…>
-      // tag (via React's bootstrapModules option) referencing hashed assets.
-      expect(homeHtml).toMatch(/<script[^>]+type="module"[^>]+src="\/_next\/static\/[^"]+\.js"/);
+      expect(homeHtml).toMatch(
+        /<script[^>]+type="module"[^>]+src="\/_next\/static\/chunks\/[^"]+\.js"/,
+      );
 
       // Dynamic route works
       const blogRes = await fetch(`${previewUrl}/blog/test-post`);
@@ -298,4 +529,92 @@ export default function proxy(request: NextRequest) {
       previewServer.httpServer.close();
     }
   }, 30000);
+
+  it("emits and serves Pages client entry in hybrid builds with basePath + assetPrefix", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-hybrid-basepath-assetprefix-"));
+
+    try {
+      fs.writeFileSync(path.join(tmpDir, "package.json"), `{"type":"module"}`);
+      fs.symlinkSync(
+        path.resolve(import.meta.dirname, "../node_modules"),
+        path.join(tmpDir, "node_modules"),
+        "junction",
+      );
+      fs.mkdirSync(path.join(tmpDir, "app"), { recursive: true });
+      fs.writeFileSync(
+        path.join(tmpDir, "app", "layout.tsx"),
+        `export default function Root({ children }: { children: React.ReactNode }) {
+  return <html><body>{children}</body></html>;
+}
+`,
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, "app", "page.tsx"),
+        `export default function Page() {
+  return <p>App Router</p>;
+}
+`,
+      );
+      fs.mkdirSync(path.join(tmpDir, "pages"), { recursive: true });
+      fs.writeFileSync(
+        path.join(tmpDir, "pages", "legacy.tsx"),
+        `export default function Legacy() {
+  return <p>Pages Router</p>;
+}
+`,
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, "next.config.mjs"),
+        `export default { basePath: "/app", assetPrefix: "/cdn" };`,
+      );
+
+      const builder = await createBuilder({
+        root: tmpDir,
+        configFile: false,
+        plugins: [vinext({ appDir: tmpDir })],
+        logLevel: "silent",
+      });
+      await builder.buildApp();
+
+      const clientDir = path.join(tmpDir, "dist", "client");
+      const clientEntryManifestPath = path.join(clientDir, "vinext-client-entry-manifest.json");
+      expect(fs.existsSync(clientEntryManifestPath)).toBe(true);
+
+      const clientEntryManifest = JSON.parse(fs.readFileSync(clientEntryManifestPath, "utf-8"));
+      expect(clientEntryManifest.pagesClientEntry).toBeTruthy();
+      expect(clientEntryManifest.appBrowserEntry).toBeTruthy();
+
+      // The Pages client entry should be written under the assetPrefix path
+      // (cdn/_next/static/...) because assetPrefix is a path prefix.
+      const pagesEntryPath = clientEntryManifest.pagesClientEntry;
+      expect(pagesEntryPath.startsWith("cdn/_next/static/")).toBe(true);
+      expect(pagesEntryPath).toContain("vinext-client-entry");
+
+      // The App browser entry should also be under the assetPrefix path
+      const appEntryPath = clientEntryManifest.appBrowserEntry;
+      expect(appEntryPath.startsWith("cdn/_next/static/")).toBe(true);
+      expect(appEntryPath).toContain("index-");
+
+      // Import the RSC handler and verify the baked constants
+      const rscEntryPath = path.join(tmpDir, "dist", "server", "index.js");
+      const rscMtime = fs.statSync(rscEntryPath).mtimeMs;
+      const rscModule = await import(`${pathToFileURL(rscEntryPath).href}?t=${rscMtime}`);
+      expect(rscModule.__basePath).toBe("/app");
+      expect(rscModule.__assetPrefix).toBe("/cdn");
+      expect(rscModule.__hasPagesDir).toBe(true);
+
+      // Verify the RSC handler can serve the App route under basePath
+      const appResponse = await rscModule.default(new Request("http://localhost/app/"));
+      expect(appResponse.status).toBe(200);
+      const appHtml = await appResponse.text();
+      expect(appHtml).toContain("App Router");
+
+      // The App HTML should include the App browser entry script
+      // addressed through the assetPrefix (CDN) path, not basePath.
+      const appScriptMatch = appHtml.match(/<script[^>]+type="module"[^>]+src="\/cdn\/[^"]+\.js"/);
+      expect(appScriptMatch).toBeTruthy();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }, 120000);
 });

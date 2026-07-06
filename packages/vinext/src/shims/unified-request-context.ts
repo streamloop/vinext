@@ -88,6 +88,7 @@ export function createRequestContext(opts?: Partial<UnifiedRequestContext>): Uni
     actionRevalidationKind: 0,
     dynamicUsageDetected: false,
     renderRequestApiUsage: new Set(),
+    connectionProbe: null,
     invalidDynamicUsageError: null,
     pendingSetCookies: [],
     draftModeCookieHeader: null,
@@ -103,7 +104,9 @@ export function createRequestContext(opts?: Partial<UnifiedRequestContext>): Uni
     currentRequestTags: [],
     currentFetchSoftTags: [],
     currentFetchCacheMode: null,
+    currentForceDynamicFetchDefault: false,
     dynamicFetchUrls: new Set<string>(),
+    refreshStaleFetchesInForeground: false,
     isFetchDedupeActive: false,
     currentFetchDedupeEntries: new Map(),
     executionContext: _getInheritedExecutionContext(), // inherits from standalone ALS if present

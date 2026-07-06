@@ -9,11 +9,16 @@
  */
 import "./server-globals.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { NextI18nConfig } from "../config/next-config.js";
 import { decode as decodeQueryString } from "node:querystring";
 import { Buffer } from "node:buffer";
 import { type Route, matchRoute } from "../routing/pages-router.js";
 import { reportRequestError, importModule, type ModuleImporter } from "./instrumentation.js";
-import { mergeRouteParamsIntoQuery, parseQueryString } from "../utils/query.js";
+import {
+  mergeRouteParamsIntoQuery,
+  parseQueryString,
+  urlQueryToSearchParams,
+} from "../utils/query.js";
 import { PagesBodyParseError, getMediaType, isJsonMediaType } from "./pages-media-type.js";
 import { isEdgeApiRuntime } from "./edge-api-runtime.js";
 import {
@@ -21,7 +26,10 @@ import {
   resolveBodyParserConfig,
 } from "./pages-body-parser-config.js";
 import { resolveRequestProtocol, resolveRequestHost } from "./proxy-trust.js";
+import { performOnDemandRevalidate, type RevalidateOptions } from "./pages-revalidate.js";
 import { NextRequest } from "vinext/shims/server";
+import { hasBasePath } from "../utils/base-path.js";
+import { attachPagesRequestCookies } from "./pages-node-compat.js";
 
 /**
  * Extend the Node.js request with Next.js-style helpers.
@@ -40,6 +48,7 @@ type NextApiResponse = {
   json(data: unknown): void;
   send(data: unknown): void;
   redirect(statusOrUrl: number | string, url?: string): void;
+  revalidate(urlPath: string, opts?: RevalidateOptions): Promise<void>;
 } & ServerResponse;
 
 type EdgeApiRouteModule = {
@@ -129,21 +138,6 @@ async function parseBody(
   });
 }
 
-/**
- * Parse cookies from the Cookie header.
- */
-function parseCookies(req: IncomingMessage): Record<string, string> {
-  const header = req.headers.cookie ?? "";
-  const cookies: Record<string, string> = {};
-  for (const part of header.split(";")) {
-    const [key, ...rest] = part.split("=");
-    if (key) {
-      cookies[key.trim()] = rest.join("=").trim();
-    }
-  }
-  return cookies;
-}
-
 function isEdgeApiRouteModule(module: Record<string, unknown>): module is EdgeApiRouteModule {
   if (typeof module.default !== "function") return false;
   // Bare `export const runtime = 'edge'` takes precedence over the nested config
@@ -170,9 +164,18 @@ function readEdgeRequestBody(req: IncomingMessage): ReadableStream<Uint8Array> |
   });
 }
 
-function createEdgeApiRequest(req: IncomingMessage, url: string): Request {
+function createEdgeApiRequest(
+  req: IncomingMessage,
+  url: string,
+  params: Record<string, string | string[]>,
+  nextConfig?: { basePath?: string },
+): Request {
   const headers = new Headers();
   for (const [name, value] of Object.entries(req.headers)) {
+    // Skip HTTP/2 pseudo-headers (`:method`/`:authority`/`:path`/`:scheme`,
+    // RFC 7540 §8.1.2.1) — WHATWG `Headers` rejects `:`-prefixed names.
+    // See: https://github.com/cloudflare/vinext/issues/2013
+    if (name.startsWith(":")) continue;
     if (Array.isArray(value)) {
       for (const item of value) headers.append(name, item);
     } else if (value !== undefined) {
@@ -188,7 +191,18 @@ function createEdgeApiRequest(req: IncomingMessage, url: string): Request {
   // TLS-terminated. See: Finding F-PROD-7 in SECURITY-AUDIT-2026-05.md.
   const proto = resolveRequestProtocol(req);
   const host = resolveRequestHost(req, "localhost");
-  const requestUrl = new URL(url, `${proto}://${host}`);
+  // Keep this in sync with pages-api-route.ts: preserve the visible incoming
+  // pathname while replacing only the resolved query and dynamic params.
+  // Dev runs after Vite has stripped its configured basePath, so reconstruct
+  // it here; prod/Workers do this earlier in pages-request-pipeline.ts using
+  // the adapter's hadBasePath state before calling pages-api-route.ts.
+  const requestUrl = new URL(req.url ?? url, `${proto}://${host}`);
+  const basePath = nextConfig?.basePath;
+  if (basePath && !hasBasePath(requestUrl.pathname, basePath)) {
+    requestUrl.pathname = `${basePath}${requestUrl.pathname}`;
+  }
+  const query = mergeRouteParamsIntoQuery(parseQueryString(url), params);
+  requestUrl.search = urlQueryToSearchParams(query).toString();
   const body = readEdgeRequestBody(req);
 
   const init: RequestInit & { duplex?: "half" } = {
@@ -266,11 +280,11 @@ function enhanceApiObjects(
   query: Record<string, string | string[]>,
   body: unknown,
 ): { apiReq: NextApiRequest; apiRes: NextApiResponse } {
-  const apiReq: NextApiRequest = Object.assign(req, {
+  const apiReq = Object.assign(req, {
     body,
-    cookies: parseCookies(req),
     query,
-  });
+  }) as NextApiRequest;
+  attachPagesRequestCookies(apiReq);
 
   const apiRes: NextApiResponse = Object.assign(res, {
     status(this: NextApiResponse, code: number) {
@@ -312,6 +326,14 @@ function enhanceApiObjects(
       }
       this.end();
     },
+
+    // `res.revalidate(urlPath)` triggers on-demand ISR regeneration of a Pages
+    // Router route. Delegates to the shared helper so the secret wiring and
+    // success detection stay identical to the dev/Node-compat path. See
+    // `pages-revalidate.ts`.
+    async revalidate(this: NextApiResponse, urlPath: string, opts?: RevalidateOptions) {
+      await performOnDemandRevalidate(req, urlPath, opts);
+    },
   });
 
   return { apiReq, apiRes };
@@ -327,6 +349,11 @@ export async function handleApiRoute(
   res: ServerResponse,
   url: string,
   apiRoutes: Route[],
+  nextConfig?: {
+    basePath?: string;
+    i18n?: NextI18nConfig | null;
+    trailingSlash?: boolean;
+  },
 ): Promise<boolean> {
   const match = matchRoute(url, apiRoutes);
   if (!match) return false;
@@ -340,7 +367,18 @@ export async function handleApiRoute(
       // Next.js wraps the incoming Request in a NextRequest before invoking
       // edge API handlers, so handlers can use `req.nextUrl.searchParams`,
       // `req.cookies`, etc. (Cf. NextRequestHint in next/src/server/web/adapter.ts.)
-      const nextRequest = new NextRequest(createEdgeApiRequest(req, url));
+      const nextRequest = new NextRequest(
+        createEdgeApiRequest(req, url, params, nextConfig),
+        nextConfig
+          ? {
+              nextConfig: {
+                basePath: nextConfig.basePath,
+                i18n: nextConfig.i18n ?? undefined,
+                trailingSlash: nextConfig.trailingSlash,
+              },
+            }
+          : undefined,
+      );
       const response = await apiModule.default(nextRequest);
       if (!(response instanceof Response)) {
         throw new Error("Edge API route did not return a Response");
@@ -408,10 +446,11 @@ export async function handleApiRoute(
         path: url,
         method: req.method ?? "GET",
         headers: Object.fromEntries(
-          Object.entries(req.headers).map(([k, v]) => [
-            k,
-            Array.isArray(v) ? v.join(", ") : String(v ?? ""),
-          ]),
+          Object.entries(req.headers)
+            // Exclude HTTP/2 pseudo-headers (RFC 7540 §8.1.2.1) — they are not
+            // real request headers. See: cloudflare/vinext#2013
+            .filter(([k]) => !k.startsWith(":"))
+            .map(([k, v]) => [k, Array.isArray(v) ? v.join(", ") : String(v ?? "")]),
         ),
       },
       { routerKind: "Pages Router", routePath: match.route.pattern, routeType: "route" },

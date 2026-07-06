@@ -111,6 +111,106 @@ describe("dedupedPagesDataFetch", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps locale, basePath, deployment, and query request identities distinct", async () => {
+    let resolveFetch: (response: Response) => void = () => {};
+    const fetchPromise = new Promise<Response>((resolve) => {
+      resolveFetch = resolve;
+    });
+    const fetchSpy = vi.fn(() => fetchPromise);
+    (globalThis as unknown as { fetch: unknown }).fetch = fetchSpy;
+
+    const requests = [
+      dedupedPagesDataFetch("/_next/data/id/about.json?tab=one", {
+        headers: { "x-deployment-id": "deployment-a" },
+      }),
+      dedupedPagesDataFetch("/_next/data/id/fr/about.json?tab=one", {
+        headers: { "x-deployment-id": "deployment-a" },
+      }),
+      dedupedPagesDataFetch("/docs/_next/data/id/about.json?tab=one", {
+        headers: { "x-deployment-id": "deployment-a" },
+      }),
+      dedupedPagesDataFetch("/_next/data/id/about.json?tab=two", {
+        headers: { "x-deployment-id": "deployment-a" },
+      }),
+      dedupedPagesDataFetch("/_next/data/id/about.json?tab=one", {
+        headers: { "x-deployment-id": "deployment-b" },
+      }),
+    ];
+
+    expect(fetchSpy).toHaveBeenCalledTimes(5);
+    resolveFetch(new Response(JSON.stringify({ pageProps: {} })));
+    await Promise.all(requests);
+  });
+
+  it("cancels one caller without aborting the shared request", async () => {
+    let resolveFetch: (response: Response) => void = () => {};
+    const fetchPromise = new Promise<Response>((resolve) => {
+      resolveFetch = resolve;
+    });
+    const fetchSpy = vi.fn(() => fetchPromise);
+    (globalThis as unknown as { fetch: unknown }).fetch = fetchSpy;
+
+    const controller = new AbortController();
+    const cancelled = dedupedPagesDataFetch("/_next/data/id/slow.json", {
+      signal: controller.signal,
+    });
+    const active = dedupedPagesDataFetch("/_next/data/id/slow.json");
+    controller.abort();
+
+    await expect(cancelled).rejects.toMatchObject({ name: "AbortError" });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    resolveFetch(new Response(JSON.stringify({ pageProps: { ok: true } })));
+    await expect(active.then((response) => response.json())).resolves.toEqual({
+      pageProps: { ok: true },
+    });
+  });
+
+  it("keeps the shared request alive when all callers cancel", async () => {
+    const fetchSignals: AbortSignal[] = [];
+    let resolveFetch: (response: Response) => void = () => {};
+    const fetchSpy = vi.fn((_url: RequestInfo | URL, init?: RequestInit) => {
+      const signal = init?.signal;
+      if (!signal) throw new Error("missing shared abort signal");
+      fetchSignals.push(signal);
+
+      return new Promise<Response>((resolve) => {
+        resolveFetch = resolve;
+      });
+    });
+    (globalThis as unknown as { fetch: unknown }).fetch = fetchSpy;
+
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    const url = "/_next/data/id/all-cancel.json";
+    const first = dedupedPagesDataFetch(url, { signal: firstController.signal });
+    const second = dedupedPagesDataFetch(url, { signal: secondController.signal });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    firstController.abort();
+    expect(fetchSignals[0].aborted).toBe(false);
+    secondController.abort();
+    expect(fetchSignals[0].aborted).toBe(false);
+
+    await expect(first).rejects.toMatchObject({ name: "AbortError" });
+    await expect(second).rejects.toMatchObject({ name: "AbortError" });
+
+    const replacementJoiner = dedupedPagesDataFetch(url);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    resolveFetch(new Response(JSON.stringify({ pageProps: { attempt: 1 } })));
+    await expect(replacementJoiner.then((response) => response.json())).resolves.toEqual({
+      pageProps: { attempt: 1 },
+    });
+
+    const afterSettle = dedupedPagesDataFetch(url);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    resolveFetch(new Response(JSON.stringify({ pageProps: { attempt: 2 } })));
+    await expect(afterSettle.then((response) => response.json())).resolves.toEqual({
+      pageProps: { attempt: 2 },
+    });
+  });
+
   it("evicts the inflight entry on fetch rejection so the next call retries", async () => {
     let attempt = 0;
     const fetchSpy = vi.fn(() => {

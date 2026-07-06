@@ -6,6 +6,7 @@ import { UNMATCHED_SLOT } from "../packages/vinext/src/shims/slot.js";
 import {
   APP_ARTIFACT_COMPATIBILITY_KEY,
   APP_CACHE_ENTRY_REUSE_PROOF_KEY,
+  APP_DYNAMIC_STALE_TIME_KEY,
   AppElementsWire,
   APP_INTERCEPTION_KEY,
   APP_INTERCEPTION_CONTEXT_KEY,
@@ -15,6 +16,7 @@ import {
   APP_ROOT_LAYOUT_KEY,
   APP_ROUTE_KEY,
   APP_SKIPPED_LAYOUT_IDS_KEY,
+  APP_SOURCE_PAGE_KEY,
   APP_SLOT_BINDINGS_KEY,
   APP_UNMATCHED_SLOT_WIRE_VALUE,
   buildOutgoingAppPayload,
@@ -83,7 +85,18 @@ describe("AppElementsWire", () => {
       routeId: "route:/photos/42\0/feed",
       skippedLayoutIds: [],
       slotBindings: [],
+      sourcePage: null,
     });
+  });
+
+  it("degrades malformed optional source-page metadata to null", () => {
+    const decoded = AppElementsWire.decode({
+      [APP_ROOT_LAYOUT_KEY]: "/",
+      [APP_ROUTE_KEY]: AppElementsWire.encodeRouteId("/dashboard", null),
+      [APP_SOURCE_PAGE_KEY]: "dashboard/page",
+    });
+
+    expect(AppElementsWire.readMetadata(decoded).sourcePage).toBeNull();
   });
 
   it("creates the canonical metadata entries for outgoing AppElements records", () => {
@@ -92,6 +105,7 @@ describe("AppElementsWire", () => {
       layoutIds: ["layout:/(dashboard)"],
       rootLayoutTreePath: "/(dashboard)",
       routeId: AppElementsWire.encodeRouteId("/dashboard", null),
+      sourcePage: "/(dashboard)/page",
     });
 
     expect(metadata).toEqual({
@@ -99,6 +113,7 @@ describe("AppElementsWire", () => {
       [APP_LAYOUT_IDS_KEY]: ["layout:/(dashboard)"],
       [APP_ROOT_LAYOUT_KEY]: "/(dashboard)",
       [APP_ROUTE_KEY]: "route:/dashboard",
+      [APP_SOURCE_PAGE_KEY]: "/(dashboard)/page",
     });
   });
 
@@ -301,7 +316,29 @@ describe("AppElementsWire", () => {
       routeId: "route:/dashboard",
       skippedLayoutIds: [],
       slotBindings: [],
+      sourcePage: null,
     });
+  });
+
+  it("round-trips per-page dynamic stale time through payload metadata", () => {
+    const payload = AppElementsWire.encodeOutgoingPayload({
+      dynamicStaleTimeSeconds: 30,
+      element: {
+        ...AppElementsWire.createMetadataEntries({
+          interceptionContext: null,
+          rootLayoutTreePath: "/",
+          routeId: AppElementsWire.encodeRouteId("/dashboard", null),
+        }),
+        [AppElementsWire.encodePageId("/dashboard", null)]: "page",
+      },
+      layoutFlags: {},
+    });
+
+    expect(isAppElementsRecord(payload)).toBe(true);
+    if (!isAppElementsRecord(payload)) return;
+
+    expect(payload[APP_DYNAMIC_STALE_TIME_KEY]).toBe(30);
+    expect(AppElementsWire.readMetadata(payload).dynamicStaleTimeSeconds).toBe(30);
   });
 
   it("keeps legacy unmatched-slot markers compatible while parsing slot keys", () => {

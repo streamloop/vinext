@@ -1,4 +1,5 @@
 import http from "node:http";
+import fsp from "node:fs/promises";
 import { type ViteDevServer } from "vite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { APP_FIXTURE_DIR, fetchHtml, startFixtureServer } from "./helpers.js";
@@ -84,6 +85,17 @@ describe("App Router integration", () => {
     expect(html).toContain("<html");
     expect(html).toContain("Welcome to App Router");
     expect(html).toContain("Server Component");
+  });
+
+  it("loads the current source App Router request handler in source-checkout tests", async () => {
+    const response = await fetch(`${baseUrl}/`);
+    expect(response.status).toBe(200);
+    await response.arrayBuffer();
+
+    const rscModuleIds = server.environments.rsc.moduleGraph.idToModuleMap.keys();
+    const handlerIds = [...rscModuleIds].filter((id) => id.includes("app-rsc-handler"));
+    expect(handlerIds.some((id) => id.includes("/src/server/app-rsc-handler.ts"))).toBe(true);
+    expect(handlerIds.some((id) => id.includes("/dist/server/app-rsc-handler.js"))).toBe(false);
   });
 
   it("renders the about page", async () => {
@@ -468,18 +480,16 @@ describe("App Router integration", () => {
     expect(html).toContain("Team Members");
   });
 
-  it("renders slot layout around default.tsx on child routes", async () => {
-    // On /dashboard/settings, inherited @team slot uses default.tsx but
-    // should still be wrapped by the slot layout
+  it("renders default.tsx without the slot layout on child routes", async () => {
+    // On /dashboard/settings, inherited @team uses its default.tsx fallback.
+    // Next.js does not wrap that fallback with the slot-local layout.
     const res = await fetch(`${baseUrl}/dashboard/settings`);
     expect(res.status).toBe(200);
 
     const html = await res.text();
-    // @team slot layout should still wrap the default.tsx content
-    expect(html).toContain('data-testid="team-slot-layout"');
-    expect(html).toContain('data-testid="team-slot-nav"');
-    expect(html).toContain("Team Nav");
-    // Default content should be present
+    expect(html).not.toContain('data-testid="team-slot-layout"');
+    expect(html).not.toContain('data-testid="team-slot-nav"');
+    expect(html).not.toContain("Team Nav");
     expect(html).toContain('data-testid="team-default"');
   });
 
@@ -495,6 +505,20 @@ describe("App Router integration", () => {
     expect(html).toContain('data-testid="slot-collision-child-default"');
     expect(html).toContain("Child modal default");
     expect(html).toContain('data-testid="slot-collision-page"');
+  });
+
+  // Ported from Next.js: test/e2e/app-dir/parallel-routes-group-depth/parallel-routes-group-depth.test.ts
+  // https://github.com/vercel/next.js/blob/v16.2.6/test/e2e/app-dir/parallel-routes-group-depth/parallel-routes-group-depth.test.ts
+  it("renders a sibling parallel slot when children are inside a route group", async () => {
+    const res = await fetch(`${baseUrl}/parallel-route-group-depth`);
+    expect(res.status).toBe(200);
+
+    const html = await res.text();
+    expect(html).toContain('data-testid="parallel-route-group-depth-layout"');
+    expect(html).toContain('data-testid="parallel-route-group-depth-slot-layout"');
+    expect(html).toContain('data-testid="parallel-route-group-depth-slot-page"');
+    expect(html).toContain('data-testid="parallel-route-group-depth-children-layout"');
+    expect(html).toContain('data-testid="parallel-route-group-depth-children-page"');
   });
 
   it("parallel slots do not affect URL routing", async () => {
@@ -1151,7 +1175,7 @@ describe("App Router integration", () => {
   // instead of silently returning a fallback value.
   it("errors when client hook is used in a Server Component without 'use client' (#834)", async () => {
     const { res, html } = await fetchHtml(baseUrl, "/missing-use-client-test");
-    expect(res.status).toBe(200); // error boundary renders, not a 500
+    expect(res.status).toBe(500);
     // The error message should be clear and actionable
     expect(html).toContain("usePathname()");
     expect(html).toContain("Client Components");
@@ -1162,7 +1186,7 @@ describe("App Router integration", () => {
 
   it("errors when React client hook is used in a Server Component without 'use client' (#834)", async () => {
     const { res, html } = await fetchHtml(baseUrl, "/missing-use-client-react-hook");
-    expect(res.status).toBe(200); // error boundary renders, not a 500
+    expect(res.status).toBe(500);
     // The error message should be clear and actionable
     expect(html).toContain("useState()");
     expect(html).toContain("Client Components");
@@ -1186,6 +1210,23 @@ describe("App Router integration", () => {
     const location = res.headers.get("location");
     expect(location).toBeTruthy();
     expect(location).toContain("/about");
+  });
+
+  // Issue #1529: an RSC client navigation that hits a next.config.js redirect
+  // must keep the cache-busting `_rsc` query on the redirect Location so the
+  // browser's auto-followed request to the destination is still treated as an
+  // RSC fetch. The vinext client addresses RSC navigations via the `RSC: 1`
+  // header + `?_rsc=` query (not a `.rsc` suffix), so we replicate that shape.
+  it("preserves the _rsc query on config-redirect Location for RSC navigations (#1529)", async () => {
+    const res = await fetch(`${baseUrl}/old-about?_rsc=abc123`, {
+      redirect: "manual",
+      headers: { Accept: "text/x-component", RSC: "1" },
+    });
+    expect(res.status).toBe(308);
+    const location = res.headers.get("location");
+    expect(location).toBeTruthy();
+    expect(location).toContain("/about");
+    expect(location).toContain("_rsc=abc123");
   });
 
   // Ported from Next.js: test/e2e/app-dir/rsc-redirect/rsc-redirect.test.ts
@@ -1824,18 +1865,36 @@ describe("App Router integration", () => {
     expect(unknown.status).toBe(404);
   });
 
-  it("defaults dynamicParams to false under a dynamic = 'error' layout", async () => {
+  it("keeps implicit dynamicParams enabled under a dynamic = 'error' layout", async () => {
     const known = await fetch(`${baseUrl}/layout-segment-config/dynamic-error/known`);
     expect(known.status).toBe(200);
     expect(await known.text()).toContain('data-testid="layout-segment-config-dynamic-error"');
 
     const unknown = await fetch(`${baseUrl}/layout-segment-config/dynamic-error/unknown`);
+    expect(unknown.status).toBe(200);
+    expect(await unknown.text()).toContain('data-testid="layout-segment-config-dynamic-error"');
+  });
+
+  it("keeps explicit dynamicParams = true enabled under a dynamic = 'error' layout", async () => {
+    const unknown = await fetch(`${baseUrl}/layout-segment-config/dynamic-error-true/unknown`);
+    expect(unknown.status).toBe(200);
+    expect(await unknown.text()).toContain(
+      'data-testid="layout-segment-config-dynamic-error-true"',
+    );
+  });
+
+  it("enforces explicit dynamicParams = false under a dynamic = 'error' layout", async () => {
+    const known = await fetch(`${baseUrl}/layout-segment-config/dynamic-error-false/known`);
+    expect(known.status).toBe(200);
+    expect(await known.text()).toContain('data-testid="layout-segment-config-dynamic-error-false"');
+
+    const unknown = await fetch(`${baseUrl}/layout-segment-config/dynamic-error-false/unknown`);
     expect(unknown.status).toBe(404);
   });
 
   it("applies dynamic = 'error' as only-cache fetch policy", async () => {
     const res = await fetch(`${baseUrl}/layout-segment-config/dynamic-error-fetch`);
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(500);
     expect(await res.text()).toContain("only-cache");
   });
 
@@ -1920,7 +1979,7 @@ describe("App Router integration", () => {
   });
 
   it("sets optimizeDeps.entries for rsc, ssr, and client environments so deps are discovered at startup", () => {
-    // Without optimizeDeps.entries, Vite only crawls build.rollupOptions.input
+    // Without optimizeDeps.entries, Vite only crawls build.rolldownOptions.input
     // for dependency discovery — but those are virtual modules that don't
     // import user dependencies. This causes lazy discovery, re-optimisation
     // cascades, and "Invalid hook call" errors on first load.
@@ -1972,6 +2031,42 @@ describe("App Router integration", () => {
     expect(clientInclude).toContain("react");
     expect(clientInclude).toContain("react-dom");
     expect(clientInclude).toContain("react-dom/client");
+  });
+
+  it("drops unused NODE_ENV branches from optimized server dependencies", async () => {
+    expect(server.config.environments.rsc?.keepProcessEnv).toBe(true);
+    expect(server.config.environments.ssr?.keepProcessEnv).toBe(true);
+
+    const response = await fetch(`${baseUrl}/`);
+    expect(response.status).toBe(200);
+    await response.arrayBuffer();
+
+    for (const envName of ["rsc", "ssr"]) {
+      const environment = server.environments[envName];
+      await environment.waitForRequestsIdle();
+
+      const depInfos = environment.depsOptimizer?.metadata.depInfoList ?? [];
+      await Promise.all(depInfos.flatMap((dep) => (dep.processing ? [dep.processing] : [])));
+      const files = [...new Set(depInfos.map((dep) => dep.file))];
+      expect(files.length, `${envName} optimized dependencies`).toBeGreaterThan(0);
+
+      const optimizedCode = (
+        await Promise.all(files.map((file) => fsp.readFile(file, "utf8")))
+      ).join("\n");
+      expect(optimizedCode, `${envName} NODE_ENV references`).not.toContain("process.env.NODE_ENV");
+      expect(optimizedCode, `${envName} production branches`).not.toMatch(
+        /react(?:-dom|-server-dom-webpack)?[^"\n]*\.production\.js/,
+      );
+    }
+  });
+
+  it("includes the static RSC renderer in startup dependency optimization", async () => {
+    const rscEnvironment = server.environments.rsc;
+    await rscEnvironment.waitForRequestsIdle();
+
+    const optimizedDependencies =
+      rscEnvironment.depsOptimizer?.metadata.depInfoList.map((dep) => dep.id) ?? [];
+    expect(optimizedDependencies).toContain("react-server-dom-webpack/static.edge");
   });
 
   // ── CSRF protection for server actions ───────────────────────────────
@@ -2033,7 +2128,28 @@ describe("App Router integration", () => {
     expect(res.headers.get("x-nextjs-action-not-found")).toBe("1");
   });
 
-  it("rejects cyclic multipart server action payloads before decodeReply", async () => {
+  it("returns action-not-found for an MPA form POST to a page with no decodable action", async () => {
+    // Ported from Next.js: test/e2e/app-dir/no-server-actions/no-server-actions.test.ts
+    // ("should error when triggering an MPA action on an app with no server actions")
+    //
+    // A multipart form POST to a *page* route is always a server-action
+    // attempt. When the body carries no action reference, it must surface as
+    // Next.js' 404 + x-nextjs-action-not-found rather than rendering the page.
+    // This exercises the entry-side route classification (matchRoute +
+    // __loadPage / __loadRouteHandler markers) end-to-end. See issue #1340.
+    const body = new FormData();
+    body.append("test", "value");
+    const res = await fetch(`${baseUrl}/about`, {
+      method: "POST",
+      headers: { Origin: baseUrl, Host: new URL(baseUrl).host },
+      body,
+    });
+    expect(res.status).toBe(404);
+    expect(res.headers.get("x-nextjs-action-not-found")).toBe("1");
+    expect(await res.text()).toBe("Server action not found.");
+  });
+
+  it("returns action-not-found before reading cyclic multipart payloads for stale ids", async () => {
     const body = new FormData();
     body.set("0", '["$Q0"]');
 
@@ -2048,8 +2164,9 @@ describe("App Router integration", () => {
       signal: AbortSignal.timeout(5_000),
     });
 
-    expect(res.status).toBe(400);
-    expect(await res.text()).toBe("Invalid server action payload");
+    expect(res.status).toBe(404);
+    expect(res.headers.get("x-nextjs-action-not-found")).toBe("1");
+    expect(await res.text()).toBe("Server action not found.");
   });
 
   it("blocks server action POST with Origin 'null' (CSRF via sandboxed context)", async () => {

@@ -21,6 +21,10 @@ type RscEmbedTransform = {
 
 type HtmlInsertion = string | (() => string);
 type InlineCssManifest = Record<string, string>;
+export type InitialNavigationCacheMetadata = {
+  kind: "dynamic" | "static";
+  dynamicStaleTimeSeconds?: number;
+};
 type InlineCssRewriteResult = {
   html: string;
   consumedPrependCss: boolean;
@@ -37,6 +41,7 @@ export function navigationRuntimeRscBootstrapExpression(): string {
 export function createNavigationRuntimeRscMetadataScript(
   params: Record<string, string | string[]>,
   nav: { pathname: string; searchParams: [string, string][] },
+  dynamicStaleTimeSeconds?: number,
 ): string {
   return (
     "Object.assign(" +
@@ -45,6 +50,9 @@ export function createNavigationRuntimeRscMetadataScript(
     safeJsonStringify(params) +
     ",nav:" +
     safeJsonStringify(nav) +
+    (dynamicStaleTimeSeconds === undefined
+      ? ""
+      : ",dynamicStaleTimeSeconds:" + safeJsonStringify(dynamicStaleTimeSeconds)) +
     "})"
   );
 }
@@ -53,8 +61,24 @@ function createNavigationRuntimeRscChunkScript(chunk: RscEmbeddedChunk): string 
   return navigationRuntimeRscBootstrapExpression() + ".rsc.push(" + safeJsonStringify(chunk) + ")";
 }
 
-function createNavigationRuntimeRscDoneScript(): string {
-  return navigationRuntimeRscBootstrapExpression() + ".done=true";
+function createNavigationRuntimeRscDoneScript(metadata?: InitialNavigationCacheMetadata): string {
+  const bootstrap = navigationRuntimeRscBootstrapExpression();
+  return (
+    (metadata === undefined
+      ? ""
+      : "Object.assign(" +
+        bootstrap +
+        "," +
+        safeJsonStringify({
+          initialCacheKind: metadata.kind,
+          ...(metadata.dynamicStaleTimeSeconds === undefined
+            ? {}
+            : { dynamicStaleTimeSeconds: metadata.dynamicStaleTimeSeconds }),
+        }) +
+        ");") +
+    bootstrap +
+    ".done=true"
+  );
 }
 
 /**
@@ -73,6 +97,7 @@ export function fixFlightHints(text: string): string {
 export function createRscEmbedTransform(
   embedStream: ReadableStream<Uint8Array>,
   scriptNonce?: string,
+  getInitialNavigationCacheMetadata?: () => InitialNavigationCacheMetadata,
 ): RscEmbedTransform {
   const reader = embedStream.getReader();
   let pendingChunks: RscEmbeddedChunk[] = [];
@@ -129,7 +154,10 @@ export function createRscEmbedTransform(
     async finalize(): Promise<string> {
       await pumpPromise;
       let scripts = this.flush();
-      scripts += createInlineScriptTag(createNavigationRuntimeRscDoneScript(), scriptNonce);
+      scripts += createInlineScriptTag(
+        createNavigationRuntimeRscDoneScript(getInitialNavigationCacheMetadata?.()),
+        scriptNonce,
+      );
       return scripts;
     },
 
@@ -161,6 +189,17 @@ const LINK_TAG_RE = /<link\b[^>]*>/gi;
 const HTML_REWRITE_EXCLUDED_REGION_RE =
   /<!--[\s\S]*?-->|<(script|style|textarea|title)\b[^>]*>[\s\S]*?<\/\1\s*>/gi;
 const HTML_REWRITE_EXCLUDED_REGION_START_RE = /<!--|<(script|style|textarea|title)\b[^>]*>/gi;
+
+// Pre-compiled close-tag regexes for the four tags captured by
+// HTML_REWRITE_EXCLUDED_REGION_START_RE. `match[1]` is always one of these
+// four names (lowercased below), so the lookup always hits. `i`-only flags —
+// no `lastIndex` state — safe to share across concurrent requests/chunks.
+const CLOSE_TAG_RES: Record<string, RegExp> = {
+  script: /<\/script\s*>/i,
+  style: /<\/style\s*>/i,
+  textarea: /<\/textarea\s*>/i,
+  title: /<\/title\s*>/i,
+};
 
 function getHtmlAttribute(tag: string, name: string): string | null {
   const attrRe = /\s([^\s"'=<>`]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
@@ -234,7 +273,8 @@ function findTrailingOpenHtmlRewriteExcludedRegionStart(html: string): number | 
     const tagName = match[1]?.toLowerCase();
     if (!tagName) continue;
 
-    const closeTagRe = new RegExp(`</${tagName}\\s*>`, "i");
+    const closeTagRe = CLOSE_TAG_RES[tagName];
+    if (!closeTagRe) continue;
     const close = closeTagRe.exec(html.slice(HTML_REWRITE_EXCLUDED_REGION_START_RE.lastIndex));
     if (!close) return start;
     HTML_REWRITE_EXCLUDED_REGION_START_RE.lastIndex += close.index + close[0].length;

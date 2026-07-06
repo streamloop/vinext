@@ -115,6 +115,33 @@ describe("App Router next.config.js features (generateRscEntry)", () => {
     expect(code).toContain("vinext");
   });
 
+  it("embeds image validation config in the pure App Router RSC handler", () => {
+    const code = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false, {
+      imageConfig: {
+        deviceSizes: [320, 640],
+        imageSizes: [16],
+        qualities: [60, 75],
+      },
+    });
+    expect(code).toContain("const __runtimeImageConfig");
+    expect(code).toContain("export const __imageConfig");
+    expect(code).toContain('"deviceSizes":[320,640]');
+    expect(code).toContain('"qualities":[60,75]');
+    expect(code).toContain("imageConfig: __runtimeImageConfig");
+    expect(code).toContain('isDev: process.env.NODE_ENV !== "production"');
+  });
+
+  it("embeds resolved prefetchInlining thresholds in the RSC handler", () => {
+    const code = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false, {
+      prefetchInlining: {
+        maxBundleSize: Number.MAX_SAFE_INTEGER,
+        maxSize: 512,
+      },
+    });
+
+    expect(code).toContain('prefetchInlining: {"maxBundleSize":9007199254740991,"maxSize":512}');
+  });
+
   it("routes hybrid Pages API misses through the Pages server entry", () => {
     // Ported from Next.js: test/e2e/og-api/index.test.ts
     // https://github.com/vercel/next.js/blob/canary/test/e2e/og-api/index.test.ts
@@ -129,11 +156,23 @@ describe("App Router next.config.js features (generateRscEntry)", () => {
     expect(code).toContain("renderPagesFallback as __renderPagesFallback");
     expect(code).toContain("server/app-pages-bridge.js");
     expect(code).toContain("return __renderPagesFallback(");
+    expect(code).toContain("pagesDataRequest");
     expect(code).toContain('return import.meta.viteRsc.loadModule("ssr", "index");');
+    expect(code).toContain("buildId: process.env.__VINEXT_BUILD_ID ?? null");
     expect(code).toContain("buildRequestHeaders: __buildRequestHeadersFromMiddlewareResponse");
     expect(code).toContain(
       "applyRouteHandlerMiddlewareContext: __applyRouteHandlerMiddlewareContext",
     );
+  });
+
+  it("exports whether the App Router build includes Pages Router routes", () => {
+    const appOnlyCode = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false);
+    const hybridCode = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false, {
+      hasPagesDir: true,
+    });
+
+    expect(appOnlyCode).toContain("export const __hasPagesDir = false;");
+    expect(hybridCode).toContain("export const __hasPagesDir = true;");
   });
 
   it("re-exports Pages API handling from the hybrid SSR entry", () => {
@@ -145,9 +184,7 @@ describe("App Router next.config.js features (generateRscEntry)", () => {
     // dispatcher as well as page rendering.
     const code = generateSsrEntry(true);
 
-    expect(code).toContain(
-      'export { handleApiRoute, pageRoutes, renderPage } from "virtual:vinext-server-entry";',
-    );
+    expect(code).toContain("handleApiRoute, matchApiRoute, matchPageRoute, pageRoutes, renderPage");
   });
 
   it("embeds basePath and trailingSlash alongside config", () => {
@@ -172,7 +209,7 @@ describe("App Router next.config.js features (generateRscEntry)", () => {
     const code = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false, {
       redirects: [{ source: "/old", destination: "/new", permanent: true }],
     });
-    expect(code).toContain("export default __createAppRscHandler({");
+    expect(code).toContain("export default createAppRscHandler({");
     expect(code).toContain("configRedirects: __configRedirects");
     expect(code).toContain("dispatchMatchedPage({");
     expect(code).toContain("    clientReuseManifest,");

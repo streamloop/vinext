@@ -27,13 +27,21 @@ import {
   type ClientReuseManifestParseResult,
   type ClientReuseManifestSkipDisposition,
 } from "../packages/vinext/src/server/client-reuse-manifest.js";
-import { VINEXT_DYNAMIC_STALE_TIME_HEADER } from "../packages/vinext/src/server/headers.js";
+import {
+  VINEXT_DYNAMIC_STALE_TIME_HEADER,
+  VINEXT_PRERENDER_CACHE_LIFE_HEADER,
+} from "../packages/vinext/src/server/headers.js";
 import type { CachedAppPageValue } from "../packages/vinext/src/shims/cache.js";
+import {
+  DefaultCdnCacheAdapter,
+  setCdnCacheAdapter,
+} from "../packages/vinext/src/shims/cdn-cache.js";
 import { markDynamicUsage } from "../packages/vinext/src/shims/headers.js";
 import {
   createRequestContext,
   runWithRequestContext,
 } from "../packages/vinext/src/shims/unified-request-context.js";
+import { CloudflareCdnCacheAdapter } from "../packages/cloudflare/src/cache/cdn-adapter.runtime.js";
 
 function captureRecord(value: ReactNode | AppOutgoingElements): Record<string, unknown> {
   if (!isAppElementsRecord(value)) {
@@ -182,6 +190,7 @@ function createCommonOptions() {
         headers: null,
         status: null,
       },
+      navigationParams: { slug: "post" },
       params: { slug: "post" },
       probeLayoutAt() {
         return null;
@@ -194,7 +203,6 @@ function createCommonOptions() {
       renderLayoutSpecialError,
       renderPageSpecialError,
       renderToReadableStream,
-      routeHasLocalBoundary: false,
       routePattern: "/posts/[slug]",
       runWithSuppressedHookWarning<T>(probe: () => Promise<T>) {
         return probe();
@@ -323,6 +331,51 @@ describe("clearRequestContext timing — issue #660", () => {
   });
 });
 
+describe("SSR shell error recovery", () => {
+  it("returns an uncached 500 response for a recovered dynamic shell error", async () => {
+    setCdnCacheAdapter(new CloudflareCdnCacheAdapter());
+    const common = createCommonOptions();
+    try {
+      const response = await renderAppPageLifecycle({
+        ...common.options,
+        isProduction: true,
+        middlewareContext: {
+          headers: new Headers({
+            "Cache-Control": "public, max-age=3600",
+            "CDN-Cache-Control": "public, max-age=3600",
+            "Cloudflare-CDN-Cache-Control": "public, max-age=3600",
+            "Cache-Tag": "shell-error",
+          }),
+          status: null,
+        },
+        revalidateSeconds: 30,
+        loadSsrHandler: async () => ({
+          async handleSsr() {
+            return {
+              htmlStream: createStream(['<html id="__next_error__"></html>']),
+              metadataReady: Promise.resolve(),
+              capturedRscData: null,
+              shellErrorRecovered: true,
+            };
+          },
+        }),
+      });
+
+      expect(response.status).toBe(500);
+      expect(response.headers.get("cache-control")).toBe(
+        "private, no-cache, no-store, max-age=0, must-revalidate",
+      );
+      expect(response.headers.get("cdn-cache-control")).toBeNull();
+      expect(response.headers.get("cloudflare-cdn-cache-control")).toBeNull();
+      expect(response.headers.get("cache-tag")).toBeNull();
+      await expect(response.text()).resolves.toContain("__next_error__");
+      expect(common.isrSet).not.toHaveBeenCalled();
+    } finally {
+      setCdnCacheAdapter(new DefaultCdnCacheAdapter());
+    }
+  });
+});
+
 describe("form state rendering", () => {
   it("passes action form state to SSR and disables HTML cache writes", async () => {
     const common = createCommonOptions();
@@ -360,6 +413,7 @@ describe("app page render lifecycle", () => {
 
     const response = await renderAppPageLifecycle({
       ...common.options,
+      isRscRequest: true,
       probePage() {
         throw { digest: "NEXT_NOT_FOUND" };
       },
@@ -369,6 +423,105 @@ describe("app page render lifecycle", () => {
     await expect(response.text()).resolves.toBe("page:404");
     expect(common.renderToReadableStream).not.toHaveBeenCalled();
     expect(common.renderPageSpecialError).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not run the page probe before normal HTML rendering", async () => {
+    const common = createCommonOptions();
+    const probePage = vi.fn(() => {
+      throw new Error("page probe should not execute for HTML");
+    });
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      isRscRequest: false,
+      probePage,
+    });
+
+    expect(probePage).not.toHaveBeenCalled();
+    expect(common.renderToReadableStream).toHaveBeenCalledTimes(1);
+    expect(common.renderPageSpecialError).not.toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe("<html>page</html>");
+  });
+
+  it("streams lazy HTML while pending dynamic usage determines the cache write", async () => {
+    const common = createCommonOptions();
+    const streamGate = createDeferred();
+    let dynamicUsed = false;
+
+    const responsePromise = renderAppPageLifecycle({
+      ...common.options,
+      omitPendingDynamicCacheState: true,
+      consumeDynamicUsage() {
+        const value = dynamicUsed;
+        dynamicUsed = false;
+        return value;
+      },
+      isProduction: true,
+      loadSsrHandler: async () => ({
+        async handleSsr() {
+          return new ReadableStream<Uint8Array>({
+            async pull(controller) {
+              await streamGate.promise;
+              dynamicUsed = true;
+              controller.enqueue(new TextEncoder().encode("<html>dynamic</html>"));
+              controller.close();
+            },
+          });
+        },
+      }),
+      revalidateSeconds: 60,
+    });
+
+    const timeout = Symbol("timeout");
+    const response = await Promise.race([
+      responsePromise,
+      new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), 50)),
+    ]);
+    expect(response).not.toBe(timeout);
+    expect(response).toBeInstanceOf(Response);
+    if (!(response instanceof Response)) {
+      throw new Error("Expected renderAppPageLifecycle to return a Response before stream pull");
+    }
+
+    expect(response.headers.get("cache-control")).toBe("no-store, must-revalidate");
+    expect(response.headers.get("x-vinext-cache")).toBeNull();
+    streamGate.resolve();
+    await expect(response.text()).resolves.toBe("<html>dynamic</html>");
+    await Promise.all(common.waitUntilPromises.splice(0));
+    expect(common.isrSet).not.toHaveBeenCalled();
+  });
+
+  it("recovers HTML page special errors from the real render when the page probe is skipped", async () => {
+    const common = createCommonOptions();
+    const notFoundError = Object.assign(new Error("NEXT_NOT_FOUND"), { digest: "NEXT_NOT_FOUND" });
+    let capturedOnError: ((error: unknown, ...args: unknown[]) => void) | null = null;
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      hasLoadingBoundary: false,
+      isRscRequest: false,
+      loadSsrHandler: async () => ({
+        async handleSsr() {
+          capturedOnError?.(notFoundError, null, null);
+          return createStream(["<html>fallback</html>"]);
+        },
+      }),
+      probePage() {
+        throw new Error("page probe should not execute for HTML");
+      },
+      renderToReadableStream(_element, opts) {
+        capturedOnError = opts.onError;
+        return createStream(["flight-data"]);
+      },
+    });
+
+    expect(response.status).toBe(404);
+    expect(common.renderPageSpecialError).toHaveBeenCalledTimes(1);
+    expect(common.renderPageSpecialError).toHaveBeenCalledWith({
+      kind: "http-access-fallback",
+      statusCode: 404,
+    });
   });
 
   it("returns RSC responses and schedules an ISR cache write through waitUntil", async () => {
@@ -424,6 +577,50 @@ describe("app page render lifecycle", () => {
     });
     expect(JSON.stringify(cachedValue?.renderObservation)).not.toContain("secret");
     expect(consumeDynamicUsage).toHaveBeenCalledTimes(2);
+  });
+
+  it("omits RSC cache state and skips cache writes when stream-time searchParams usage is dynamic", async () => {
+    const common = createCommonOptions();
+    const streamGate = createDeferred();
+    let dynamicUsed = false;
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      consumeDynamicUsage() {
+        const value = dynamicUsed;
+        dynamicUsed = false;
+        return value;
+      },
+      isProduction: true,
+      isRscRequest: true,
+      omitPendingDynamicCacheState: true,
+      renderToReadableStream() {
+        let sent = false;
+        return new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            if (sent) {
+              controller.close();
+              return;
+            }
+            sent = true;
+            await streamGate.promise;
+            dynamicUsed = true;
+            controller.enqueue(new TextEncoder().encode("flight-data"));
+          },
+        });
+      },
+      revalidateSeconds: 60,
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store, must-revalidate");
+    expect(response.headers.get("x-vinext-cache")).toBeNull();
+    expect(common.waitUntilPromises).toHaveLength(1);
+
+    streamGate.resolve();
+    await expect(response.text()).resolves.toBe("flight-data");
+    await Promise.all(common.waitUntilPromises);
+    expect(common.isrSet).not.toHaveBeenCalled();
   });
 
   it("does not cache RSC responses when skip transport omits layout records", async () => {
@@ -521,7 +718,7 @@ describe("app page render lifecycle", () => {
     );
   });
 
-  it("rerenders HTML responses with the error boundary when a global RSC error was captured", async () => {
+  it("preserves HTML responses when a post-shell RSC error may be caught by a client boundary", async () => {
     const common = createCommonOptions();
 
     const response = await renderAppPageLifecycle({
@@ -532,8 +729,8 @@ describe("app page render lifecycle", () => {
       },
     });
 
-    expect(common.renderErrorBoundaryResponse).toHaveBeenCalledTimes(1);
-    await expect(response.text()).resolves.toBe("boundary:boom");
+    expect(common.renderErrorBoundaryResponse).not.toHaveBeenCalled();
+    await expect(response.text()).resolves.toBe("<html>page</html>");
   });
 
   it("prefers the captured RSC error over an SSR decoder error when rendering the error boundary", async () => {
@@ -556,8 +753,27 @@ describe("app page render lifecycle", () => {
       },
     });
 
-    expect(common.renderErrorBoundaryResponse).toHaveBeenCalledWith(rscError);
+    expect(common.renderErrorBoundaryResponse).toHaveBeenCalledWith(rscError, "rsc");
     await expect(response.text()).resolves.toBe("boundary:rsc-original");
+  });
+
+  it("marks uncaptured SSR errors as SSR-origin boundary failures", async () => {
+    const common = createCommonOptions();
+    const ssrError = new Error("ssr-decoder");
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      async loadSsrHandler() {
+        return {
+          async handleSsr() {
+            throw ssrError;
+          },
+        };
+      },
+    });
+
+    expect(common.renderErrorBoundaryResponse).toHaveBeenCalledWith(ssrError, "ssr");
+    await expect(response.text()).resolves.toBe("boundary:ssr-decoder");
   });
 
   it("writes paired HTML and RSC cache entries for cacheable HTML responses", async () => {
@@ -730,6 +946,116 @@ describe("app page render lifecycle", () => {
     expect(common.isrSet).not.toHaveBeenCalled();
   });
 
+  it("captures late RSC cache metadata during speculative prerender", async () => {
+    const common = createCommonOptions();
+    let capturedWaitForAllReady: boolean | undefined;
+    let capturedFallbackToErrorDocumentOnShellError: boolean | undefined;
+    let requestCacheLife: { revalidate: number; expire: number } | null = null;
+    const getRequestCacheLife = vi.fn(() => {
+      const value = requestCacheLife;
+      requestCacheLife = null;
+      return value;
+    });
+    const releaseRscData = createDeferred<ArrayBuffer>();
+
+    const responsePromise = renderAppPageLifecycle({
+      ...common.options,
+      getRequestCacheLife,
+      isPrerender: true,
+      isSpeculativePrerender: true,
+      loadSsrHandler: vi.fn(async () => ({
+        async handleSsr(
+          _rscStream: ReadableStream<Uint8Array>,
+          _navContext: unknown,
+          _fontData: unknown,
+          options?: {
+            capturedRscDataRef?: { value: Promise<ArrayBuffer> | null };
+            fallbackToErrorDocumentOnShellError?: boolean;
+            sideStream?: ReadableStream<Uint8Array>;
+            waitForAllReady?: boolean;
+          },
+        ) {
+          capturedWaitForAllReady = options?.waitForAllReady;
+          capturedFallbackToErrorDocumentOnShellError =
+            options?.fallbackToErrorDocumentOnShellError;
+          if (options?.capturedRscDataRef) {
+            options.capturedRscDataRef.value = releaseRscData.promise;
+          }
+          if (options?.sideStream) {
+            void options.sideStream.getReader().cancel();
+          }
+          return createStream(["<html>speculative</html>"]);
+        },
+      })),
+      revalidateSeconds: 1,
+    });
+
+    await Promise.resolve();
+    expect(getRequestCacheLife).not.toHaveBeenCalled();
+    requestCacheLife = { revalidate: 1, expire: 3 };
+    releaseRscData.resolve(new ArrayBuffer(0));
+    const response = await responsePromise;
+
+    expect(capturedWaitForAllReady).toBe(false);
+    expect(capturedFallbackToErrorDocumentOnShellError).toBe(false);
+    expect(getRequestCacheLife).toHaveBeenCalledOnce();
+    expect(response.headers.get("x-vinext-prerender-cache-life")).toBe(
+      JSON.stringify({ revalidate: 1, expire: 3 }),
+    );
+    expect(response.headers.get("cache-control")).toBe("s-maxage=1, stale-while-revalidate=2");
+    await expect(response.text()).resolves.toBe("<html>speculative</html>");
+  });
+
+  it("does not wait for speculative prerender cache metadata after dynamic usage", async () => {
+    const common = createCommonOptions();
+    let dynamicUsed = false;
+    const getRequestCacheLife = vi.fn(() => null);
+    const pendingRscData = new Promise<ArrayBuffer>(() => {});
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      consumeDynamicUsage() {
+        const value = dynamicUsed;
+        dynamicUsed = false;
+        return value;
+      },
+      getRequestCacheLife,
+      isPrerender: true,
+      isSpeculativePrerender: true,
+      loadSsrHandler: vi.fn(async () => ({
+        async handleSsr(
+          _rscStream: ReadableStream<Uint8Array>,
+          _navContext: unknown,
+          _fontData: unknown,
+          options?: {
+            capturedRscDataRef?: { value: Promise<ArrayBuffer> | null };
+            sideStream?: ReadableStream<Uint8Array>;
+          },
+        ) {
+          if (options?.capturedRscDataRef) {
+            options.capturedRscDataRef.value = pendingRscData;
+          }
+          if (options?.sideStream) {
+            void options.sideStream.getReader().cancel();
+          }
+          queueMicrotask(() => {
+            dynamicUsed = true;
+          });
+          return createStream(["<html>dynamic</html>"]);
+        },
+      })),
+      peekDynamicUsage() {
+        return dynamicUsed;
+      },
+      revalidateSeconds: 1,
+    });
+
+    expect(getRequestCacheLife).toHaveBeenCalledOnce();
+    expect(response.headers.get("cache-control")).toBe("no-store, must-revalidate");
+    expect(response.headers.get("x-vinext-prerender-cache-life")).toBeNull();
+    await expect(response.text()).resolves.toBe("<html>dynamic</html>");
+  });
+
   it("captures prerender cache metadata when cacheLife provides the only revalidate value", async () => {
     const common = createCommonOptions();
     let requestCacheLife: { revalidate: number; expire: number } | null = null;
@@ -865,6 +1191,9 @@ describe("app page render lifecycle", () => {
     });
 
     expect(response.headers.get("cache-control")).toBe("s-maxage=1");
+    expect(response.headers.get(VINEXT_PRERENDER_CACHE_LIFE_HEADER)).toBe(
+      '{"revalidate":1,"expire":1}',
+    );
     await expect(response.text()).resolves.toBe("<html>page</html>");
     expect(consumeRequestCacheLife()).toEqual({ revalidate: 1, expire: 1 });
   });
@@ -900,6 +1229,9 @@ describe("app page render lifecycle", () => {
     });
 
     expect(response.headers.get("cache-control")).toBe("s-maxage=1, stale-while-revalidate=2");
+    expect(response.headers.get(VINEXT_PRERENDER_CACHE_LIFE_HEADER)).toBe(
+      '{"revalidate":1,"expire":3}',
+    );
     expect(response.headers.get("x-vinext-cache")).toBe("MISS");
     await expect(response.text()).resolves.toBe("<html>page</html>");
     expect(common.waitUntilPromises).toHaveLength(0);
@@ -1161,6 +1493,7 @@ describe("layoutFlags injection into RSC payload", () => {
       layoutCount: overrides.layoutCount ?? 0,
       loadSsrHandler: vi.fn(),
       middlewareContext: { headers: null, status: null },
+      navigationParams: {},
       params: {},
       probeLayoutAt: overrides.probeLayoutAt ?? (() => null),
       probePage: () => null,
@@ -1172,7 +1505,6 @@ describe("layoutFlags injection into RSC payload", () => {
         capturedElement = captureRecord(el);
         return createStream(["flight-data"]);
       },
-      routeHasLocalBoundary: false,
       routePattern: overrides.routePattern ?? "/test",
       runWithSuppressedHookWarning: <T>(probe: () => Promise<T>) => probe(),
       element: overrides.element ?? { "page:/test": "test-page" },
@@ -1286,6 +1618,7 @@ describe("layoutFlags injection into RSC payload", () => {
 
     await renderAppPageLifecycle({
       ...options,
+      navigationParams: { id: "123" },
       params: { id: "123" },
       peekRenderObservationState() {
         return {

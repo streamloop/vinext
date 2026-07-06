@@ -7,6 +7,7 @@ export {
   AppElementsWire,
   APP_ARTIFACT_COMPATIBILITY_KEY,
   APP_CACHE_ENTRY_REUSE_PROOF_KEY,
+  APP_DYNAMIC_STALE_TIME_KEY,
   APP_INTERCEPTION_KEY,
   APP_INTERCEPTION_CONTEXT_KEY,
   APP_LAYOUT_IDS_KEY,
@@ -15,6 +16,7 @@ export {
   APP_ROOT_LAYOUT_KEY,
   APP_ROUTE_KEY,
   APP_SKIPPED_LAYOUT_IDS_KEY,
+  APP_SOURCE_PAGE_KEY,
   APP_SLOT_BINDINGS_KEY,
   APP_STATIC_SIBLINGS_KEY,
   APP_UNMATCHED_SLOT_WIRE_VALUE,
@@ -41,8 +43,10 @@ export function getMountedSlotIds(elements: AppElements): string[] {
   return Object.keys(elements)
     .filter((key) => {
       const value = elements[key];
+      const parsed = AppElementsWire.parseElementKey(key);
       return (
-        AppElementsWire.isSlotId(key) &&
+        parsed?.kind === "slot" &&
+        parsed.name !== "children" &&
         value !== null &&
         value !== undefined &&
         value !== UNMATCHED_SLOT

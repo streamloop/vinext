@@ -5,6 +5,7 @@ import * as ReactDOM from "react-dom";
 import {
   consumeAppRouterScrollIntent,
   getPendingAppRouterScrollIntent,
+  markAppRouterScrollIntentHeadHoisted,
 } from "./app-router-scroll-state.js";
 import { decodeHashFragment } from "./hash-scroll.js";
 
@@ -58,18 +59,28 @@ function topOfElementInViewport(element: HTMLElement, viewportHeight: number): b
   return elementTop >= 0 && elementTop <= viewportHeight;
 }
 
-function getHashFragmentDomNode(hash: string): HTMLElement | null {
+function getHashFragmentDomNode(hash: string): Element | null {
   const fragment = decodeHashFragment(hash.startsWith("#") ? hash.slice(1) : hash);
   if (fragment === "top") {
     return document.body;
   }
 
-  const element = document.getElementById(fragment) ?? document.getElementsByName(fragment)[0];
-  return element instanceof HTMLElement ? element : null;
+  return document.getElementById(fragment) ?? document.getElementsByName(fragment)[0] ?? null;
 }
 
-function findNextScrollTarget(node: Element | Text | null): HTMLElement | null {
+function isInDocumentHead(node: Element | Text): boolean {
+  const head = node.ownerDocument?.head;
+  return head != null && head.contains(node);
+}
+
+type NextScrollTarget = { kind: "element"; element: HTMLElement } | null;
+
+function findNextScrollTarget(node: Element | Text | null): NextScrollTarget {
   if (!(node instanceof Element)) {
+    return null;
+  }
+
+  if (isInDocumentHead(node)) {
     return null;
   }
 
@@ -81,7 +92,7 @@ function findNextScrollTarget(node: Element | Text | null): HTMLElement | null {
     target = target.nextElementSibling;
   }
 
-  return target;
+  return { kind: "element", element: target };
 }
 
 function scrollToElement(target: HTMLElement, hash: string | null): void {
@@ -113,36 +124,72 @@ export class AppRouterScrollTargetInner extends React.Component<{
   children: React.ReactNode;
   commitId: number | null;
 }> {
+  scheduledCommitId: number | null = null;
+
+  schedulePotentialScroll = () => {
+    const commitId = this.props.commitId;
+    this.scheduledCommitId = commitId;
+    queueMicrotask(() => {
+      if (this.scheduledCommitId !== commitId) return;
+      this.handlePotentialScroll();
+    });
+  };
+
   handlePotentialScroll = () => {
     const intent = getPendingAppRouterScrollIntent();
     if (intent === null) return;
     if (this.props.commitId === null || intent.commitId !== this.props.commitId) return;
 
-    let target: HTMLElement | null;
+    let node: Element | Text | null;
     if (intent.hash !== null) {
-      target = getHashFragmentDomNode(intent.hash);
+      node = getHashFragmentDomNode(intent.hash);
     } else {
-      // oxlint-disable-next-line react/no-find-dom-node -- Next's default App Router scroll handler targets wrapperless route content after commit.
-      target = findNextScrollTarget(findDOMNode(this));
+      node = null;
     }
-    if (target === null) return;
+    if (node === null) {
+      // oxlint-disable-next-line react/no-find-dom-node -- Next's default App Router scroll handler targets wrapperless route content after commit.
+      node = findDOMNode(this);
+
+      const headElement = node instanceof Element ? node : node?.parentElement;
+      if (
+        node !== null &&
+        headElement != null &&
+        isInDocumentHead(node) &&
+        !intent.headElements?.has(headElement)
+      ) {
+        // React hoisted this navigation's first route DOM node into <head>
+        // (e.g. a newly introduced precedence-ordered stylesheet rendered as
+        // the page's first child). Next's old App Router scroll handler walks
+        // the head siblings, finds nothing scrollable, and gives up without
+        // scrolling. A stylesheet that was already present before navigation
+        // is not the target route's newly hoisted child, so let the document-top
+        // fallback handle that case.
+        markAppRouterScrollIntentHeadHoisted(intent, this.props.commitId);
+        return;
+      }
+    }
+
+    const next = findNextScrollTarget(node);
+    if (next === null) return;
+    const target = next.element;
 
     const consumed = consumeAppRouterScrollIntent(intent, this.props.commitId);
     if (consumed === null) return;
 
     scrollToElement(target, consumed.hash);
-    // Next's default handler uses plain focus(), but that lets the browser run
-    // a second implicit scroll after our explicit navigation scroll. Keep the
-    // focus transfer while preserving the scroll position we just chose.
-    target.focus({ preventScroll: true });
+    target.focus();
   };
 
   componentDidMount() {
-    this.handlePotentialScroll();
+    this.schedulePotentialScroll();
   }
 
   componentDidUpdate() {
-    this.handlePotentialScroll();
+    this.schedulePotentialScroll();
+  }
+
+  componentWillUnmount() {
+    this.scheduledCommitId = null;
   }
 
   render() {

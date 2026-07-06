@@ -1,5 +1,5 @@
 import path from "node:path";
-import { compareRoutes, decodeRouteSegment } from "./utils.js";
+import { decodeRouteSegment, sortRoutes } from "./utils.js";
 import {
   createValidFileMatcher,
   scanWithExtensions,
@@ -88,7 +88,7 @@ async function scanPageRoutes(pagesDir: string, matcher: ValidFileMatcher): Prom
   validateRoutePatterns(routes.map((route) => route.pattern));
 
   // Sort: static routes first, then dynamic, then catch-all
-  routes.sort(compareRoutes);
+  sortRoutes(routes);
 
   return routes;
 }
@@ -101,8 +101,9 @@ function fileToRoute(file: string, pagesDir: string, matcher: ValidFileMatcher):
   const withoutExt = matcher.stripExtension(file);
   if (withoutExt === file) return null;
 
-  // Convert to URL segments
-  const segments = withoutExt.split(path.sep);
+  // Convert to URL segments. `file` comes from `scanWithExtensions`, which
+  // yields forward-slash paths on every platform, so split on "/".
+  const segments = withoutExt.split("/");
 
   // Handle index files: pages/index.tsx -> /
   const lastSegment = segments[segments.length - 1];
@@ -230,8 +231,9 @@ async function scanApiRoutes(pagesDir: string, matcher: ValidFileMatcher): Promi
   const routes: Route[] = [];
 
   for (const file of files) {
-    // Reuse fileToRoute but pretend the file is under a virtual "api/" prefix
-    const route = fileToRoute(path.join("api", file), pagesDir, matcher);
+    // Reuse fileToRoute but pretend the file is under a virtual "api/" prefix.
+    // Use path.posix.join to keep the forward-slash form `fileToRoute` expects.
+    const route = fileToRoute(path.posix.join("api", file), pagesDir, matcher);
     if (route) {
       routes.push(route);
     }
@@ -240,7 +242,7 @@ async function scanApiRoutes(pagesDir: string, matcher: ValidFileMatcher): Promi
   validateRoutePatterns(routes.map((route) => route.pattern));
 
   // Sort same as page routes
-  routes.sort(compareRoutes);
+  sortRoutes(routes);
 
   return routes;
 }

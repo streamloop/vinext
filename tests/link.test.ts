@@ -21,7 +21,11 @@ import Link, {
   resolveLinkPrefetchMode,
   useLinkStatus,
 } from "../packages/vinext/src/shims/link.js";
-import { navigatePagesRouterLink } from "../packages/vinext/src/client/pages-router-link-navigation.js";
+import {
+  navigatePagesRouterLink,
+  navigatePagesRouterLinkWithFallback,
+  resolvePagesRouterQueryOnlyHref,
+} from "../packages/vinext/src/client/pages-router-link-navigation.js";
 
 // Internal helpers re-exported or accessible via the router shim
 import { isExternalUrl, isHashOnlyChange } from "../packages/vinext/src/shims/router.js";
@@ -30,6 +34,7 @@ import { isExternalUrl, isHashOnlyChange } from "../packages/vinext/src/shims/ro
 // rendering occurs (same as dev-server.ts and pages-server-entry.ts do).
 import { runWithI18nState } from "../packages/vinext/src/shims/i18n-state.js";
 import { setI18nContext } from "../packages/vinext/src/shims/i18n-context.js";
+import { addLocalePrefix } from "../packages/vinext/src/utils/domain-locale.js";
 
 import {
   isAbsoluteOrProtocolRelativeUrl,
@@ -72,11 +77,16 @@ describe("Link rendering", () => {
     expect(html).toContain('href="/search?q=test"');
   });
 
-  it("renders object href with only query (defaults to /)", () => {
+  it("renders object href with only query as a relative query href", () => {
+    // An href object without a `pathname` must resolve as a query-only href
+    // (e.g. `?tab=settings`) so the browser/router applies it against the
+    // *current* path, mirroring Next.js's `formatUrl()` (`pathname || ''`).
+    // Collapsing onto the root (`/?tab=settings`) recorded the wrong history
+    // entry for shallow links and broke back/forward traversal (issue #1540).
     const html = ReactDOMServer.renderToString(
       React.createElement(Link, { href: { query: { tab: "settings" } } }, "Settings"),
     );
-    expect(html).toContain('href="/?tab=settings"');
+    expect(html).toContain('href="?tab=settings"');
   });
 
   it("renders with as prop overriding href", () => {
@@ -263,7 +273,7 @@ describe("Link App Router prefetch mode", () => {
     expect(resolveLinkPrefetchMode(true, true)).toBe("disabled");
   });
 
-  it("allows automatic full RSC prefetch only for routes without loading-shell prefetches", () => {
+  it("allows automatic full RSC prefetch for routes that do not require fresh navigation", () => {
     const originalWindow = globalThis.window;
     (globalThis as any).window = {
       location: {
@@ -275,6 +285,12 @@ describe("Link App Router prefetch mode", () => {
         { canPrefetchLoadingShell: true, patternParts: ["blog", ":slug"], isDynamic: true },
         { canPrefetchLoadingShell: true, patternParts: ["docs", ":slug+"], isDynamic: true },
         { canPrefetchLoadingShell: false, patternParts: ["products", ":id"], isDynamic: true },
+        {
+          canPrefetchLoadingShell: false,
+          patternParts: ["teams", ":team", "dashboard"],
+          isDynamic: true,
+          requiresDynamicNavigationRequest: true,
+        },
         { canPrefetchLoadingShell: true, patternParts: ["settings"], isDynamic: false },
       ],
     };
@@ -284,7 +300,8 @@ describe("Link App Router prefetch mode", () => {
       expect(canAutoPrefetchFullAppRoute("/blog/hello-world")).toBe(false);
       expect(canAutoPrefetchFullAppRoute("/docs/a/b")).toBe(false);
       expect(canAutoPrefetchFullAppRoute("/products/1")).toBe(true);
-      expect(canAutoPrefetchFullAppRoute("/settings")).toBe(true);
+      expect(canAutoPrefetchFullAppRoute("/teams/vercel/dashboard")).toBe(false);
+      expect(canAutoPrefetchFullAppRoute("/settings")).toBe(false);
       expect(canAutoPrefetchFullAppRoute("/missing")).toBe(false);
     } finally {
       if (originalWindow === undefined) {
@@ -295,7 +312,7 @@ describe("Link App Router prefetch mode", () => {
     }
   });
 
-  it("allows automatic dynamic App Router routes without loading shells to seed navigation cache", () => {
+  it("shell-prefetches dynamic routes that require fresh navigation and routes with loading boundaries", () => {
     const originalWindow = globalThis.window;
     (globalThis as any).window = {
       location: {
@@ -307,6 +324,12 @@ describe("Link App Router prefetch mode", () => {
         { canPrefetchLoadingShell: true, patternParts: ["blog", ":slug"], isDynamic: true },
         { canPrefetchLoadingShell: false, patternParts: ["products", ":id"], isDynamic: true },
         { canPrefetchLoadingShell: false, patternParts: ["clothing", ":product"], isDynamic: true },
+        {
+          canPrefetchLoadingShell: false,
+          patternParts: ["teams", ":team", "dashboard"],
+          isDynamic: true,
+          requiresDynamicNavigationRequest: true,
+        },
         { canPrefetchLoadingShell: true, patternParts: ["settings"], isDynamic: false },
       ],
     };
@@ -323,7 +346,7 @@ describe("Link App Router prefetch mode", () => {
         shouldPrefetch: true,
       });
       expect(resolveAutoAppRoutePrefetch("/settings")).toEqual({
-        cacheForNavigation: true,
+        cacheForNavigation: false,
         prefetchShellFirst: true,
         shouldPrefetch: true,
       });
@@ -337,6 +360,11 @@ describe("Link App Router prefetch mode", () => {
       // https://github.com/vercel/next.js/blob/v16.2.6/test/e2e/app-dir/segment-cache/client-params/client-params.test.ts
       expect(resolveAutoAppRoutePrefetch("/clothing/1")).toEqual({
         cacheForNavigation: true,
+        prefetchShellFirst: false,
+        shouldPrefetch: true,
+      });
+      expect(resolveAutoAppRoutePrefetch("/teams/vercel/dashboard")).toEqual({
+        cacheForNavigation: false,
         prefetchShellFirst: false,
         shouldPrefetch: true,
       });
@@ -431,6 +459,70 @@ describe("Link resolveHref", () => {
       React.createElement(Link, { href: { pathname: "/dashboard" } }, "x"),
     );
     expect(html).toContain('href="/dashboard"');
+  });
+
+  it("object href with only query resolves as a relative query href", () => {
+    // No `pathname` -> query-only href (not rooted at `/`), so the router
+    // resolves it against the current path. Mirrors Next.js's `formatUrl()`
+    // (`pathname = urlObj.pathname || ''`). Regression guard for issue #1540.
+    const html = ReactDOMServer.renderToString(
+      React.createElement(Link, { href: { query: { page: "2", sort: "name" } } }, "x"),
+    );
+    expect(html).toMatch(/href="\?page=2&(?:amp;)?sort=name"/);
+  });
+
+  it("resolves query-only Pages Links against a rewritten path before locale application", async () => {
+    const previousWindow = (globalThis as any).window;
+    const previousBasePath = process.env.__NEXT_ROUTER_BASEPATH;
+    process.env.__NEXT_ROUTER_BASEPATH = "/docs";
+    (globalThis as any).window = {
+      location: {
+        pathname: "/docs/fr/rewrite-navigation/0",
+        search: "?existing=1",
+        hash: "",
+        href: "http://localhost/docs/fr/rewrite-navigation/0?existing=1",
+        origin: "http://localhost",
+        hostname: "localhost",
+      },
+      history: {
+        state: null,
+        pushState() {},
+        replaceState() {},
+      },
+      addEventListener() {},
+      next: { router: { asPath: "/rewrite-navigation/0?existing=1", reload() {} } },
+      __VINEXT_LOCALE__: "fr",
+      __VINEXT_LOCALES__: ["en", "fr", "de"],
+      __VINEXT_DEFAULT_LOCALE__: "en",
+    };
+    try {
+      const resolvedHref = resolvePagesRouterQueryOnlyHref("?id=1", {
+        asPath: "/rewrite-navigation/0?existing=1",
+        basePath: "/docs",
+        fallbackHref: (globalThis as any).window.location.href,
+        locales: ["en", "fr", "de"],
+      });
+      const localizedHref = addLocalePrefix(resolvedHref, "de", "en");
+
+      expect(
+        toBrowserNavigationHref(localizedHref, (globalThis as any).window.location.href, "/docs"),
+      ).toBe("/docs/de/rewrite-navigation/0?id=1");
+    } finally {
+      if (previousWindow === undefined) delete (globalThis as any).window;
+      else (globalThis as any).window = previousWindow;
+      if (previousBasePath === undefined) delete process.env.__NEXT_ROUTER_BASEPATH;
+      else process.env.__NEXT_ROUTER_BASEPATH = previousBasePath;
+    }
+  });
+
+  it("preserves a bare query delimiter when resolving Pages Links", () => {
+    expect(
+      resolvePagesRouterQueryOnlyHref("?", {
+        asPath: "/rewrite-navigation/0?existing=1",
+        basePath: "",
+        fallbackHref: "http://localhost/rewrite-navigation/0?existing=1",
+      }),
+    ).toBe("/rewrite-navigation/0?");
   });
 });
 
@@ -745,6 +837,36 @@ describe("Link locale handling", () => {
 
     expect(push).toHaveBeenCalledWith("/fr/about", undefined, { scroll: true, locale: "fr" });
     expect(replace).not.toHaveBeenCalled();
+  });
+
+  it("rethrows missing-required-param interpolation errors instead of using Link fallback", async () => {
+    const interpolationError = new Error(
+      "The provided `href` (/catalog/[category]/[item]?category=music) value is missing query values (item) to be interpolated properly. Read more: https://nextjs.org/docs/messages/href-interpolation-failed",
+    );
+    const fallback = vi.fn();
+    const loadRouter = vi.fn();
+    const router = {
+      push: vi.fn(async () => {
+        throw interpolationError;
+      }),
+      replace: vi.fn(async () => true),
+    };
+
+    await expect(
+      navigatePagesRouterLinkWithFallback({
+        router,
+        loadRouter,
+        navigation: {
+          href: "/catalog/books/old?category=music",
+          replace: false,
+          scroll: true,
+          interpolateDynamicRoute: true,
+        },
+        fallback,
+      }),
+    ).rejects.toBe(interpolationError);
+    expect(loadRouter).not.toHaveBeenCalled();
+    expect(fallback).not.toHaveBeenCalled();
   });
 
   // Regression for #1332 sub-problem 3: `<Link shallow>` must reach

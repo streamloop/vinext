@@ -217,14 +217,14 @@ The `examples/` directory contains real-world Next.js apps ported to run on vine
 | `app-router-playground`   | Next.js playground (MDX, Tailwind) | `app-router-playground.vinext.workers.dev`   |
 | `realworld-api-rest`      | RealWorld spec (Pages Router)      | `realworld-api-rest.vinext.workers.dev`      |
 | `nextra-docs-template`    | Nextra docs site (MDX, App Router) | `nextra-docs-template.vinext.workers.dev`    |
-| `benchmarks`              | Performance benchmarks             | `benchmarks.vinext.workers.dev`              |
+| `apps/web/benchmarks`     | Performance benchmarks             | `vinext-web.vinext.workers.dev/benchmarks`   |
 | `hackernews`              | HN clone (App Router, RSC)         | `hackernews.vinext.workers.dev`              |
 
 #### Adding a New Example
 
 1. Create a directory under `examples/` with a `package.json` (use `"vinext": "workspace:*"`)
 2. Add a `vite.config.ts` with `vinext()` and `cloudflare()` plugins
-3. Add a `wrangler.jsonc` — for simple apps use `"main": "vinext/server/app-router-entry"` (no custom worker entry needed)
+3. Add a `wrangler.jsonc` — for simple apps use `"main": "vinext/server/fetch-handler"` (no custom worker entry needed)
 4. Add the example to the deploy matrix in `.github/workflows/deploy-examples.yml`:
    - Add to `matrix.example` array (with `name`, `project`, `wrangler_config`)
    - Add to the `examples` array in the PR comment step
@@ -334,6 +334,8 @@ If a Node built-in does the job, use it. Only reach for a dependency when the bu
 - **NEVER use `gh pr merge --admin`.** The `--admin` flag bypasses branch protection checks entirely. If merge is blocked, investigate why — don't force it through. A blocked merge usually means a required check failed or is still running.
 
 - **NEVER create changesets manually.** Changesets are generated automatically from Conventional Commits during CI by `scripts/create-changeset.mts` (see `.github/workflows/release.yml`). Do not run `pnpm changeset` or hand-author `.changeset/*.md` files. Instead, write a well-formed Conventional Commit message (e.g. `fix(build): ...`, `feat(router): ...`) and let CI produce the changeset.
+
+- **To retroactively reclassify an already-merged commit, commit a changeset named after its SHA: `.changeset/<sha>.md`.** Because auto-changesets are regenerated from commit subjects every push, you cannot hand-edit them to fix a mislabeled commit. A SHA-named changeset reclassifies that commit to the bump in its frontmatter, overriding the semver bump, the changelog section, and the changelog message: the frontmatter bump sets the section (`patch`→Bug Fixes, `minor`→Features, `major`→Features (breaking); an empty/package-less one drops the commit from the release entirely), and the changeset **body becomes that commit's changelog entry** (leave it empty to keep the original commit subject). The file is a real changeset, so it's consumed and deleted on the next release (no cleanup needed). See `.changeset/README.md` for the full format.
 
 - **PR workflow:**
   1. Create a branch: `git checkout -b fix/descriptive-name`
@@ -459,6 +461,16 @@ This repo currently resolves `vite` to `@voidzero-dev/vite-plus-core`, which bun
 - Prefer `build.rolldownOptions` / `worker.rolldownOptions` over adding new `*.rollupOptions` config
 - When touching existing `build.rollupOptions` or `manualChunks`, treat them as migration targets to Rolldown equivalents, not patterns to copy forward
 - If something breaks only on Vite 8, check the newer `build.target` baseline and stricter CommonJS default import behavior first
+
+### Performance Best Practices
+
+- **Keep the common request path lightweight.** Do not statically import feature-specific runtimes from shared App Router handlers. Gate first on cheap request or route metadata, then dynamically import metadata-file, prerender-endpoint, cache-only, action, or route-handler code only when that feature is actually used. Use `import type` when only types are needed.
+- **Split state from heavy implementations.** Request-scoped state, handler registration, and small public facades should live in lightweight modules so importing a setter or context helper does not pull the full cache, navigation, or rendering runtime into every environment.
+- **Filter Vite hooks before JavaScript runs.** Add native hook `filter` patterns to `resolveId`, `load`, and `transform` hooks, and skip defensive early returns inside the handler in favor of the filter. Avoid broad compatibility transforms over `node_modules`, generated runtimes, prebundles, and modules that cannot contain the syntax being rewritten.
+- **Prefer lazily loaded chunks.** Keep code that is only needed for specific request types behind dynamic imports so it stays off startup and common request paths. Do not eagerly merge lazy RSC chunks into shared chunks merely to reduce chunk count.
+- **Avoid repeated hot-path work.** Reuse already-computed cache keys and request derivations, hoist immutable regular expressions and lookup tables to module scope, and move deterministic parsing or asset selection to build time when possible. Do not add caching until ownership and invalidation are explicit.
+
+Performance changes must preserve dev/production parity and all supported runtimes. A smaller dev module graph is not a win if it causes stale source-checkout code, changes RSC conditions, or breaks Cloudflare/Nitro bundling.
 
 ### Virtual Module Resolution Quirks
 

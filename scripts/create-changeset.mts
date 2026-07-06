@@ -18,6 +18,11 @@
  *
  * Type → bump: feat→minor; fix/perf/revert→patch; everything else→skip;
  * any `<type>!` or `BREAKING CHANGE:` footer→major (overrides the table).
+ *
+ * Retroactive overrides: committing a changeset named after a commit SHA
+ * (`.changeset/<sha>.md`) reclassifies that commit to the bump in its
+ * frontmatter (e.g. treat a mislabeled `feat:` as a `fix:`). See CommitOverride
+ * / loadOverrides below.
  */
 
 import { execFileSync } from "node:child_process";
@@ -103,15 +108,55 @@ export function affectedPackages(
   return [...affected].sort();
 }
 
-/** Compare semver-ish strings (major.minor.patch, ignores prerelease). */
+type ParsedVersion = {
+  core: [number, number, number];
+  prerelease: string[];
+};
+
+function parseVersion(version: string): ParsedVersion {
+  const value = String(version);
+  const buildIndex = value.indexOf("+");
+  const withoutBuild = buildIndex === -1 ? value : value.slice(0, buildIndex);
+  const prereleaseIndex = withoutBuild.indexOf("-");
+  const corePart = prereleaseIndex === -1 ? withoutBuild : withoutBuild.slice(0, prereleaseIndex);
+  const prereleasePart = prereleaseIndex === -1 ? "" : withoutBuild.slice(prereleaseIndex + 1);
+  const core = corePart.split(".").map((part) => Number.parseInt(part, 10) || 0);
+  return {
+    core: [core[0] ?? 0, core[1] ?? 0, core[2] ?? 0],
+    prerelease: prereleasePart ? prereleasePart.split(".") : [],
+  };
+}
+
+/** Compare SemVer versions, including prerelease precedence and build metadata. */
 export function compareVersions(a: string, b: string): -1 | 0 | 1 {
-  const parse = (v: string) => v.split(/[.+-]/).map((n) => Number.parseInt(n, 10) || 0);
-  const pa = parse(String(a));
-  const pb = parse(String(b));
+  const pa = parseVersion(a);
+  const pb = parseVersion(b);
   for (let i = 0; i < 3; i++) {
-    const x = pa[i] ?? 0;
-    const y = pb[i] ?? 0;
+    const x = pa.core[i];
+    const y = pb.core[i];
     if (x !== y) return x > y ? 1 : -1;
+  }
+
+  if (pa.prerelease.length === 0 || pb.prerelease.length === 0) {
+    if (pa.prerelease.length === pb.prerelease.length) return 0;
+    return pa.prerelease.length === 0 ? 1 : -1;
+  }
+
+  const length = Math.max(pa.prerelease.length, pb.prerelease.length);
+  for (let i = 0; i < length; i++) {
+    const x = pa.prerelease[i];
+    const y = pb.prerelease[i];
+    if (x === undefined || y === undefined) return x === undefined ? -1 : 1;
+    if (x === y) continue;
+
+    const xNumeric = /^\d+$/.test(x);
+    const yNumeric = /^\d+$/.test(y);
+    if (xNumeric && yNumeric) {
+      if (x.length !== y.length) return x.length > y.length ? 1 : -1;
+      return x > y ? 1 : -1;
+    }
+    if (xNumeric !== yNumeric) return xNumeric ? -1 : 1;
+    return x > y ? 1 : -1;
   }
   return 0;
 }
@@ -274,6 +319,175 @@ function firstCommit(): string {
   }
 }
 
+// ───────────────────────── per-commit overrides ─────────────────────────────
+
+/**
+ * A retroactive reclassification of an already-merged commit. Auto-changesets
+ * are regenerated from commit subjects on every push and never committed to
+ * `main`, so you can't hand-edit them to fix a mislabeled commit. Instead, you
+ * commit a changeset file *named after the commit SHA* — e.g.
+ * `.changeset/<sha>.md` — and the release tooling treats that commit as the bump
+ * declared in the changeset's frontmatter instead of the bump implied by its
+ * subject. This demotes a PR that merged as `feat:` (minor) to a `fix:` (patch,
+ * listed under Bug Fixes) just by committing `<sha>.md` with `"<pkg>": patch`.
+ *
+ * The SHA-named file is itself a real changeset: `changesets/action` consumes it
+ * for the bump and deletes it on release, so overrides never accumulate. Its
+ * frontmatter bump maps to the conventional type used for both bump derivation
+ * and changelog grouping (see bumpToOverride). A SHA-named changeset with no
+ * package bump *suppresses* the commit (treated as `chore` → no release, dropped
+ * from the changelog).
+ *
+ * The changeset body *also overrides the commit's changelog message*: when the
+ * body is non-empty it becomes the entry text for that commit (rendered as a
+ * plain bullet, replacing the commit subject's description). An empty body keeps
+ * the original subject description and just reclassifies the type.
+ */
+export type CommitOverride = {
+  /** Full SHA or an unambiguous prefix (>= MIN_OVERRIDE_SHA_LEN chars) to reclassify. */
+  commit: string;
+  /** Conventional type to treat the commit as (e.g. "fix", "feat", "chore"). */
+  type: string;
+  /** Treat the commit as a breaking change (major bump). Defaults to false. */
+  breaking?: boolean;
+  /** Changelog entry text from the changeset body; overrides the commit subject. */
+  message?: string;
+};
+
+/** Shortest SHA prefix accepted as a changeset override filename (git's default). */
+export const MIN_OVERRIDE_SHA_LEN = 7;
+
+const CHANGESET_DIR = join(REPO_ROOT, ".changeset");
+
+/**
+ * The commit SHA encoded by a changeset filename, or null if it isn't one. A
+ * SHA-named changeset (7–40 hex chars + `.md`) is an override; the random
+ * `adjective-noun-verb.md` names from `changeset add`, `README.md`, and the
+ * generated `auto-*.md` are not. Pure.
+ */
+export function shaFromChangesetFilename(filename: string): string | null {
+  const m = filename.match(/^([0-9a-f]{7,40})\.md$/i);
+  return m ? m[1].toLowerCase() : null;
+}
+
+/**
+ * Highest semver bump declared in a changeset's frontmatter, or null when it
+ * declares none (an empty/package-less changeset → suppression). Only the
+ * frontmatter block is scanned, never the body. Pure.
+ */
+export function changesetFrontmatterBump(md: string): Bump | null {
+  const fm = md.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!fm) return null;
+  let bump: Bump | null = null;
+  for (const line of fm[1].split(/\r?\n/)) {
+    const m = line.match(/:\s*["']?(major|minor|patch)["']?\s*$/i);
+    if (m) bump = maxBump(bump, m[1].toLowerCase() as Bump);
+  }
+  return bump;
+}
+
+/**
+ * The changeset body (everything after the frontmatter), collapsed to a single
+ * line for use as a changelog bullet, or null when the body is empty. Pure.
+ */
+export function changesetBodyMessage(md: string): string | null {
+  const m = md.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?([\s\S]*)$/);
+  if (!m) return null;
+  const text = m[1].replace(/\s+/g, " ").trim();
+  return text || null;
+}
+
+/**
+ * Map an override changeset's frontmatter bump to the conventional type used for
+ * both bump derivation and changelog grouping: patch → fix (Bug Fixes), minor →
+ * feat (Features), major → feat + breaking. Pure.
+ */
+export function bumpToOverride(bump: Bump): { type: string; breaking: boolean } {
+  if (bump === "major") return { type: "feat", breaking: true };
+  if (bump === "minor") return { type: "feat", breaking: false };
+  return { type: "fix", breaking: false };
+}
+
+/** The override matching a commit SHA (exact or prefix), or null. Pure. */
+export function findOverride(sha: string, overrides: CommitOverride[]): CommitOverride | null {
+  const full = sha.trim().toLowerCase();
+  for (const o of overrides) {
+    if (full === o.commit || full.startsWith(o.commit)) return o;
+  }
+  return null;
+}
+
+/**
+ * Rewrite a Conventional-Commit subject so its type token becomes `type` (with a
+ * `!` breaking marker when asked). With no `message`, the scope, description, and
+ * any trailing ` (#123)` PR ref are preserved (a non-conventional subject is
+ * prefixed as-is). With a `message`, it replaces the description and the scope is
+ * dropped, so the changelog renders a plain `- <message>` bullet the author fully
+ * controls. Pure.
+ */
+export function rewriteSubjectType(
+  subject: string,
+  type: string,
+  breaking: boolean,
+  message?: string,
+): string {
+  const bang = breaking ? "!" : "";
+  if (message != null && message !== "") return `${type}${bang}: ${message}`;
+  const parts = conventionalParts(subject);
+  if (!parts) return `${type}${bang}: ${subject.trim()}`;
+  const scope = parts.scope ? `(${parts.scope})` : "";
+  return `${type}${scope}${bang}: ${parts.description}`;
+}
+
+/**
+ * Apply per-commit overrides to a commit list. For each matched commit the
+ * subject is rewritten to its overridden type (and message, when the changeset
+ * body provided one) and the body is cleared, so every downstream consumer (bump
+ * computation, changeset summary, and the changelog grouping in version.mts) sees
+ * one authoritative reclassification — including dropping any stale
+ * `BREAKING CHANGE:` footer that would otherwise re-escalate the bump. Unmatched
+ * commits pass through untouched. Pure.
+ */
+export function applyOverrides(commits: Commit[], overrides: CommitOverride[]): Commit[] {
+  if (overrides.length === 0) return commits;
+  return commits.map((c) => {
+    const o = findOverride(c.sha, overrides);
+    if (!o) return c;
+    return {
+      ...c,
+      subject: rewriteSubjectType(c.subject, o.type, o.breaking === true, o.message),
+      body: "",
+    };
+  });
+}
+
+/**
+ * Discover per-commit overrides from SHA-named changeset files in `.changeset/`.
+ * Each `<sha>.md` reclassifies commit `<sha>` to the conventional type implied by
+ * its frontmatter bump; a package-less one suppresses the commit (`chore`).
+ * Returns [] when the directory is absent. CI glue.
+ */
+export function loadOverrides(dir: string = CHANGESET_DIR): CommitOverride[] {
+  if (!existsSync(dir)) return [];
+  const overrides: CommitOverride[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isFile()) continue;
+    const commit = shaFromChangesetFilename(entry.name);
+    if (!commit) continue;
+    const md = readFileSync(join(dir, entry.name), "utf8");
+    const bump = changesetFrontmatterBump(md);
+    const { type, breaking } = bump ? bumpToOverride(bump) : { type: "chore", breaking: false }; // package-less changeset → suppress
+    const message = changesetBodyMessage(md);
+    overrides.push({
+      commit,
+      type,
+      ...(breaking ? { breaking: true } : {}),
+      ...(message ? { message } : {}),
+    });
+  }
+  return overrides;
+}
+
 /**
  * Release-worthy commits in `from..HEAD` that belong to `name`: conventional,
  * non-release, touching the package's files. Shared by the changeset generator
@@ -283,10 +497,16 @@ export function collectReleaseCommits(
   from: string,
   name: string,
   packageDirToName: Record<string, string>,
+  // Pass overrides loaded once by the caller. Defaulting to [] (not loadOverrides())
+  // keeps this FS-free and avoids a re-scan in version.mts after `changeset
+  // version` has already deleted the SHA-named override files.
+  overrides: CommitOverride[] = [],
 ): Commit[] {
-  // Non-bumping commits (chore/docs/…, incl. the "chore: version packages"
-  // release commit) are excluded by parseBumpFromSubject returning null.
-  return commitsInRange(from).filter(
+  // SHA-named changeset overrides (.changeset/<sha>.md) reclassify a commit's
+  // type before bump/changelog derivation — e.g. demote a mislabeled `feat:` to
+  // a `fix:`. Non-bumping commits (chore/docs/…, incl. the "chore: version
+  // packages" release commit) are excluded by parseBumpFromSubject → null.
+  return applyOverrides(commitsInRange(from), overrides).filter(
     (c) =>
       parseBumpFromSubject(c.subject, c.body) != null &&
       affectedPackages(c.files, packageDirToName).includes(name),
@@ -302,6 +522,14 @@ export function releaseRangeStart(name: string): string {
 /** Compute and write the auto changeset. Returns a summary; never throws on no-op. */
 export function run(): { written: string | null; bumps: Record<string, Bump> } {
   const packageDirToName = discoverPublishablePackages();
+  const overrides = loadOverrides();
+  if (overrides.length > 0) {
+    console.log(
+      `[create-changeset] Applying ${overrides.length} SHA-named changeset override(s): ${overrides
+        .map((o) => `${o.commit.slice(0, 7)}→${o.breaking ? `${o.type}!` : o.type}`)
+        .join(", ")}`,
+    );
+  }
 
   // Per-package: decide generate-vs-skip and the diff range.
   const ranges = new Map<string, string>(); // name → `from` ref
@@ -325,7 +553,7 @@ export function run(): { written: string | null; bumps: Record<string, Bump> } {
   let rangeLo = "";
   for (const [name, from] of ranges) {
     if (!rangeLo) rangeLo = from;
-    for (const commit of collectReleaseCommits(from, name, packageDirToName)) {
+    for (const commit of collectReleaseCommits(from, name, packageDirToName, overrides)) {
       const bump = parseBumpFromSubject(commit.subject, commit.body);
       const merged = maxBump(pkgBumps[name] ?? null, bump);
       if (merged) pkgBumps[name] = merged;

@@ -1,13 +1,13 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 import {
+  buildAppPageLinkHeader,
   createAppPageFontData,
   createAppPageRscErrorTracker,
-  deferUntilStreamConsumed,
   renderAppPageHtmlResponse,
   renderAppPageHtmlStream,
   renderAppPageHtmlStreamWithRecovery,
-  shouldRerenderAppPageWithGlobalError,
 } from "../packages/vinext/src/server/app-page-stream.js";
+import { deferUntilStreamConsumed } from "../packages/vinext/src/server/defer-until-stream-consumed.js";
 
 function createStream(chunks: string[]): ReadableStream<Uint8Array> {
   return new ReadableStream({
@@ -90,6 +90,31 @@ describe("app page stream helpers", () => {
       null,
       expect.anything(),
       expect.objectContaining({ waitForAllReady: true }),
+    );
+  });
+
+  it("forwards the PPR fallback-shell abort signal to the SSR handler", async () => {
+    const abortController = new AbortController();
+    const ssrHandler = vi.fn(async () => createStream(["<html>fallback-shell</html>"]));
+
+    const { htmlStream } = await renderAppPageHtmlStream({
+      fontData: createAppPageFontData({
+        getLinks: () => [],
+        getPreloads: () => [],
+        getStyles: () => [],
+      }),
+      navigationContext: null,
+      pprFallbackShellSignal: abortController.signal,
+      rscStream: createStream(["flight"]),
+      ssrHandler: { handleSsr: ssrHandler },
+    });
+
+    await expect(new Response(htmlStream).text()).resolves.toBe("<html>fallback-shell</html>");
+    expect(ssrHandler).toHaveBeenCalledWith(
+      expect.anything(),
+      null,
+      expect.anything(),
+      expect.objectContaining({ pprFallbackShellSignal: abortController.signal }),
     );
   });
 
@@ -288,7 +313,33 @@ describe("app page stream helpers", () => {
 
     expect(onShellRendered).toHaveBeenCalledTimes(1);
     expect(result.response).toBeNull();
+    expect(result.shellErrorRecovered).toBe(false);
     await expect(new Response(result.htmlStream).text()).resolves.toBe("<html>ok</html>");
+  });
+
+  it("preserves the SSR shell recovery outcome", async () => {
+    const result = await renderAppPageHtmlStreamWithRecovery({
+      async renderErrorBoundaryResponse() {
+        throw new Error("should not render an error boundary");
+      },
+      async renderHtmlStream() {
+        return {
+          htmlStream: createStream(['<html id="__next_error__"></html>']),
+          metadataReady: Promise.resolve(),
+          capturedRscData: null,
+          shellErrorRecovered: true,
+        };
+      },
+      async renderSpecialErrorResponse() {
+        throw new Error("should not render a special response");
+      },
+      resolveSpecialError() {
+        return null;
+      },
+    });
+
+    expect(result.response).toBeNull();
+    expect(result.shellErrorRecovered).toBe(true);
   });
 
   it("turns special SSR failures into the provided response", async () => {
@@ -363,27 +414,25 @@ describe("app page stream helpers", () => {
     expect(baseOnError).toHaveBeenCalledTimes(2);
   });
 
-  it("only rerenders with global-error when an RSC error was captured and no local boundary exists", () => {
-    expect(
-      shouldRerenderAppPageWithGlobalError({
-        capturedError: new Error("boom"),
-        hasLocalBoundary: false,
-      }),
-    ).toBe(true);
+  it("routes a non-signal digest error to the captured error, not the special slot", () => {
+    const baseOnError = vi.fn(() => "base-result");
+    const tracker = createAppPageRscErrorTracker(baseOnError);
 
-    expect(
-      shouldRerenderAppPageWithGlobalError({
-        capturedError: new Error("boom"),
-        hasLocalBoundary: true,
-      }),
-    ).toBe(false);
+    // A genuine error that merely carries a (e.g. hashed) digest is not a
+    // navigation signal: it must reach the error boundary, not pre-empt the
+    // 307/404 swap slot reserved for real redirect/notFound signals.
+    const realError = Object.assign(new Error("kaboom"), { digest: "1234567890" });
+    tracker.onRenderError(realError, { path: "/test" }, { chunk: 1 });
 
-    expect(
-      shouldRerenderAppPageWithGlobalError({
-        capturedError: null,
-        hasLocalBoundary: false,
-      }),
-    ).toBe(false);
+    expect(tracker.getCapturedError()).toBe(realError);
+    expect(tracker.getCapturedSpecialError()).toBeNull();
+
+    // A subsequent real navigation signal still wins the special slot.
+    const redirect = { digest: "NEXT_REDIRECT;push;%2Flogin;307" };
+    tracker.onRenderError(redirect, { path: "/test" }, { chunk: 2 });
+
+    expect(tracker.getCapturedSpecialError()).toBe(redirect);
+    expect(tracker.getCapturedError()).toBe(realError);
   });
 
   it("emits the `x-edge-runtime: 1` marker on HTML stream responses for edge-runtime routes", async () => {
@@ -419,5 +468,45 @@ describe("app page stream helpers", () => {
     });
 
     expect(response.headers.get("x-edge-runtime")).toBeNull();
+  });
+});
+
+describe("buildAppPageLinkHeader", () => {
+  // Each entry is ~40 chars including the `, ` join.
+  const reactEntry = (i: number) => `</r${i}.js>; rel=preload; as=script`;
+  const fontEntry = (i: number) => `</f${i}.woff2>; rel=preload; as=font`;
+
+  it("combines React preloads first, then font preloads", () => {
+    const header = buildAppPageLinkHeader(reactEntry(1), fontEntry(1), 6000);
+    expect(header).toBe(`${reactEntry(1)}, ${fontEntry(1)}`);
+  });
+
+  it("returns an empty string when the cap is 0 (emission disabled)", () => {
+    expect(buildAppPageLinkHeader(reactEntry(1), fontEntry(1), 0)).toBe("");
+  });
+
+  it("defaults to a 6000-char cap when no limit is supplied", () => {
+    const react = [reactEntry(1), reactEntry(2)].join(", ");
+    expect(buildAppPageLinkHeader(react, undefined, undefined)).toBe(react);
+  });
+
+  it("drops whole entries once the cap is exceeded (never a partial entry)", () => {
+    const react = [reactEntry(1), reactEntry(2), reactEntry(3)].join(", ");
+    // Cap fits only the first two entries.
+    const limit = reactEntry(1).length + 2 + reactEntry(2).length + 1;
+    const header = buildAppPageLinkHeader(react, undefined, limit);
+    expect(header.length).toBeLessThanOrEqual(limit);
+    expect(header).toBe(`${reactEntry(1)}, ${reactEntry(2)}`);
+  });
+
+  it("drops trailing font preloads first under a tight cap (React preloads survive)", () => {
+    const limit = reactEntry(1).length + 2; // room for one entry only
+    const header = buildAppPageLinkHeader(reactEntry(1), fontEntry(1), limit);
+    expect(header).toBe(reactEntry(1));
+  });
+
+  it("ignores empty sources", () => {
+    expect(buildAppPageLinkHeader("", fontEntry(1), 6000)).toBe(fontEntry(1));
+    expect(buildAppPageLinkHeader(undefined, undefined, 6000)).toBe("");
   });
 });

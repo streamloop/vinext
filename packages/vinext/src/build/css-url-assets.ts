@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { Rolldown } from "vite";
 
 /**
@@ -13,12 +14,14 @@ import type { Rolldown } from "vite";
  * vitejs/vite#8632). The one native escape hatch is `this.emitFile({ fileName })`:
  * assets emitted with an explicit `fileName` are *never* deduped. So we:
  *
- *   1. mark — during the client CSS transform, tag each relative asset `url()`
- *      with a private `?vinext_css_url_asset=<source-basename>` query. This is
- *      the only durable carrier of per-reference provenance: once Rolldown
- *      dedupes, the emitted bundle cannot tell which `url()` came from which
- *      source, and the bundle metadata (`originalFileNames`) records the set of
- *      sources but not the mapping per reference.
+ *   1. mark — during every production CSS transform, tag each relative asset
+ *      `url()` with a private `?vinext_css_url_asset=<source-basename>` query.
+ *      Using identical transformed CSS in server and client environments is
+ *      required because the default CSS Modules scoped name hashes the full CSS
+ *      text. The marker is also the only durable carrier of per-reference
+ *      provenance: once Rolldown dedupes, the emitted bundle cannot tell which
+ *      `url()` came from which source, and bundle metadata records the source
+ *      set but not the mapping per reference.
  *
  *   2. restore — at `generateBundle`, read each marked reference's source
  *      basename back out. When it differs from the deduped output's basename,
@@ -149,7 +152,7 @@ function rewriteCssUrls(code: string, replace: (rawUrl: string) => string | null
 /**
  * Append the private provenance marker to each relative asset `url()` in a CSS
  * source. Idempotent and side-effect free (only adds a query param), so it is
- * safe to run on every client-environment stylesheet, vendored CSS included.
+ * safe to run on every build-environment stylesheet, vendored CSS included.
  */
 export function markCssUrlAssetReferences(code: string, id: string): string | null {
   if (!isCssRequest(id) || !code.includes("url(")) return null;
@@ -161,6 +164,25 @@ export function markCssUrlAssetReferences(code: string, id: string): string | nu
     if (!CSS_ASSET_EXT_RE.test(lower) || lower.endsWith(".css")) return null;
     const param = `${CSS_URL_ASSET_MARKER}=${encodeURIComponent(basename(parts.path))}`;
     return joinUrl({ ...parts, query: parts.query ? `${parts.query}&${param}` : param });
+  });
+}
+
+/** Rebase relative asset URLs when Sass inlines a partial into an entry file. */
+export function rebaseCssUrlAssetReferences(
+  code: string,
+  sourceDirectory: string,
+  targetDirectory: string,
+): string | null {
+  return rewriteCssUrls(code, (rawUrl) => {
+    const parts = splitUrl(rawUrl.trim());
+    if (!isRelativeAssetUrl(parts.path)) return null;
+    const lower = parts.path.toLowerCase();
+    if (!CSS_ASSET_EXT_RE.test(lower) || lower.endsWith(".css")) return null;
+
+    const absolutePath = path.resolve(sourceDirectory, parts.path);
+    let rebasedPath = path.relative(targetDirectory, absolutePath).replaceAll("\\", "/");
+    if (!rebasedPath.startsWith(".")) rebasedPath = `./${rebasedPath}`;
+    return joinUrl({ ...parts, path: rebasedPath });
   });
 }
 

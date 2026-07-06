@@ -66,11 +66,17 @@ declare module "next/document" {
     styles?: ReactElement[] | Iterable<ReactNode> | ReactElement;
   };
   export type DocumentContext = {
-    renderPage?: (options?: {
-      enhanceApp?: (App: ComponentType<{ children?: ReactNode }>) => unknown;
-      enhanceComponent?: (Comp: ComponentType<unknown>) => unknown;
-    }) => { html: string; head?: ReadonlyArray<ReactElement> };
-    defaultGetInitialProps?: (
+    renderPage: (
+      options?:
+        | {
+            enhanceApp?: (
+              App: ComponentType<{ children?: ReactNode }>,
+            ) => ComponentType<{ children?: ReactNode }>;
+            enhanceComponent?: (Comp: ComponentType<unknown>) => ComponentType<unknown>;
+          }
+        | ((Comp: ComponentType<unknown>) => ComponentType<unknown>),
+    ) => DocumentInitialProps | Promise<DocumentInitialProps>;
+    defaultGetInitialProps: (
       ctx: DocumentContext,
       options?: { nonce?: string },
     ) => Promise<DocumentInitialProps>;
@@ -169,7 +175,7 @@ declare module "next/navigation" {
     refresh(): void;
     prefetch(href: string, options?: { onInvalidate?: () => void }): void;
   };
-  export function usePathname(): string;
+  export function usePathname(): string | null;
   export class ReadonlyURLSearchParams extends URLSearchParams {
     append(name: string, value: string): never;
     delete(name: string, value?: string): never;
@@ -179,7 +185,7 @@ declare module "next/navigation" {
   export function useSearchParams(): ReadonlyURLSearchParams;
   export function useParams<
     T extends Record<string, string | string[]> = Record<string, string | string[]>,
-  >(): T;
+  >(): T | null;
   export function useSelectedLayoutSegment(parallelRoutesKey?: string): string | null;
   export function useSelectedLayoutSegments(parallelRoutesKey?: string): string[];
   export function useServerInsertedHTML(callback: () => unknown): void;
@@ -232,6 +238,7 @@ declare module "next/navigation" {
     expiresAt?: number;
     mountedSlotsHeader?: string | null;
     paramsHeader: string | null;
+    renderedPathAndSearch: string | null;
     url: string;
   };
   export type PrefetchCacheEntry = {
@@ -243,11 +250,15 @@ declare module "next/navigation" {
     optimisticRouteShell?: boolean;
     outcome: "pending" | "cache-seeded";
     snapshot?: CachedRscResponse;
+    cacheKeys?: Set<string>;
     pending?: Promise<void>;
+    prefetchKind?: "loading-shell" | "navigation" | "route-tree";
+    searchAgnosticShell?: boolean;
     timestamp: number;
   };
   export const MAX_PREFETCH_CACHE_SIZE: number;
   export const PREFETCH_CACHE_TTL: number;
+  export const DYNAMIC_NAVIGATION_CACHE_TTL: number;
   export function getPrefetchInterceptionContext(targetHref: string): string | null;
   export function getPrefetchCache(): Map<string, PrefetchCacheEntry>;
   export function getPrefetchedUrls(): Set<string>;
@@ -259,12 +270,30 @@ declare module "next/navigation" {
     rscUrl: string,
     interceptionContext?: string | null,
     mountedSlotsHeader?: string | null,
+    options?: { notifyInvalidation?: boolean },
   ): boolean;
+  export function hasSearchAgnosticPrefetchShellForRoute(
+    rscUrl: string,
+    interceptionContext?: string | null,
+    mountedSlotsHeader?: string | null,
+  ): boolean;
+  export function peekPrefetchResponseForNavigation(
+    rscUrl: string,
+    interceptionContext?: string | null,
+    mountedSlotsHeader?: string | null,
+  ): CachedRscResponse | null;
   export function storePrefetchResponse(
     rscUrl: string,
     response: Response,
     interceptionContext?: string | null,
     options?: { onInvalidate?: () => void },
+  ): void;
+  export function seedPrefetchResponseSnapshot(
+    rscUrl: string,
+    snapshot: CachedRscResponse,
+    interceptionContext?: string | null,
+    mountedSlotsHeader?: string | null,
+    fallbackTtlMs?: number,
   ): void;
   export function snapshotRscResponse(response: Response): Promise<CachedRscResponse>;
   export function restoreRscResponse(cached: CachedRscResponse, copy?: boolean): Response;
@@ -274,7 +303,12 @@ declare module "next/navigation" {
     interceptionContext?: string | null,
     mountedSlotsHeader?: string | null,
     options?: { onInvalidate?: () => void },
-    behavior?: { cacheForNavigation?: boolean; optimisticRouteShell?: boolean },
+    behavior?: {
+      cacheForNavigation?: boolean;
+      fallbackTtlMs?: number;
+      optimisticRouteShell?: boolean;
+      prefetchKind?: "loading-shell" | "navigation" | "route-tree";
+    },
   ): void;
   export function consumePrefetchResponse(
     rscUrl: string,
@@ -522,6 +556,7 @@ declare module "next/compat/router" {
 
 declare module "next/server" {
   export class NextRequest extends Request {
+    readonly __isData?: boolean;
     get nextUrl(): any;
     get cookies(): any;
     get ip(): string | undefined;

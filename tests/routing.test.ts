@@ -59,6 +59,7 @@ function makeTestAppRoute(
     isDynamic: pattern.includes(":"),
     params: [],
     rootParamNames: [],
+    siblingIntercepts: [],
   };
 }
 
@@ -84,19 +85,15 @@ describe("pagesRouter - route discovery", () => {
     expect(dynamicRoute!.params).toEqual(["id"]);
   });
 
-  it("sorts static routes before dynamic routes", async () => {
+  it("sorts static routes before dynamic routes at the same depth", async () => {
     const routes = await pagesRouter(FIXTURE_DIR);
 
-    const staticRoutes = routes.filter((r) => !r.isDynamic);
-    const dynamicRoutes = routes.filter((r) => r.isDynamic);
+    const aboutIndex = routes.findIndex((route) => route.pattern === "/about");
+    const postIndex = routes.findIndex((route) => route.pattern === "/posts/:id");
 
-    // All static routes should come before dynamic routes
-    const lastStaticIndex = routes.findIndex((r) => r === staticRoutes[staticRoutes.length - 1]);
-    const firstDynamicIndex = routes.findIndex((r) => r === dynamicRoutes[0]);
-
-    if (staticRoutes.length > 0 && dynamicRoutes.length > 0) {
-      expect(lastStaticIndex).toBeLessThan(firstDynamicIndex);
-    }
+    expect(aboutIndex).not.toBe(-1);
+    expect(postIndex).not.toBe(-1);
+    expect(aboutIndex).toBeLessThan(postIndex);
   });
 
   it("ignores _app.tsx and _document.tsx", async () => {
@@ -696,6 +693,39 @@ describe("appRouter - route discovery", () => {
       expect(patterns).toContain("/inbox");
       expect(patterns).not.toContain("/inbox/profile");
       expect(matchAppRoute("/inbox/profile", routes)).toBeNull();
+    });
+  });
+
+  // Ported from Next.js:
+  // test/e2e/app-dir/parallel-routes-leaf-segments/fixtures/no-build-error/app/no-children
+  // https://github.com/vercel/next.js/tree/v16.2.6/test/e2e/app-dir/parallel-routes-leaf-segments/fixtures/no-build-error/app/no-children
+  it("discovers a nested-only slot route for a layout-only parent", async () => {
+    await withTempDir("vinext-app-slot-nested-layout-only-", async (tmpDir) => {
+      const appDir = path.join(tmpDir, "app");
+      await mkdir(path.join(appDir, "inbox", "@modal", "profile"), { recursive: true });
+      await writeFile(
+        path.join(appDir, "inbox", "layout.tsx"),
+        "export default function Layout({ children, modal }) { return children ?? modal }",
+      );
+      await writeFile(path.join(appDir, "inbox", "default.tsx"), EMPTY_PAGE);
+      await writeFile(path.join(appDir, "inbox", "@modal", "profile", "page.tsx"), EMPTY_PAGE);
+
+      invalidateAppRouteCache();
+      const routes = await appRouter(appDir);
+      const match = matchAppRoute("/inbox/profile", routes);
+
+      expect(match).toMatchObject({
+        route: {
+          pagePath: path.join(appDir, "inbox", "default.tsx"),
+          parallelSlots: [
+            expect.objectContaining({
+              name: "modal",
+              pagePath: path.join(appDir, "inbox", "@modal", "profile", "page.tsx"),
+            }),
+          ],
+        },
+        params: {},
+      });
     });
   });
 

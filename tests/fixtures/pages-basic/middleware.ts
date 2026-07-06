@@ -30,6 +30,17 @@ export function middleware(request: NextRequest) {
     return NextResponse.rewrite(new URL("/ssr", request.url));
   }
 
+  // Ported from Next.js: test/e2e/middleware-general/app/middleware-node.js
+  // https://github.com/vercel/next.js/blob/v16.2.6/test/e2e/middleware-general/app/middleware-node.js
+  if (url.pathname === "/middleware-general-ssr") {
+    url.pathname = "/ssr";
+    return NextResponse.rewrite(url);
+  }
+
+  if (url.pathname === "/middleware-general-error-throw" && request.__isData) {
+    throw new Error("middleware data request failure");
+  }
+
   // Rewrite /mw-rewrite-query to /ssr-query — preserves the original
   // request's query params on the rewrite target so getServerSideProps
   // sees them. Middleware preserves query by mutating `request.nextUrl`
@@ -59,6 +70,22 @@ export function middleware(request: NextRequest) {
     const target = request.nextUrl.clone();
     target.pathname = "/ssr-query";
     target.searchParams.set("hello", "from-rewrite");
+    return NextResponse.rewrite(target);
+  }
+
+  // Ported from Next.js: test/e2e/middleware-general/app/middleware.js
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/middleware-general/app/middleware.js
+  if (url.pathname === "/api/edge-search-params") {
+    const target = request.nextUrl.clone();
+    target.searchParams.set("foo", "bar");
+    return NextResponse.rewrite(target);
+  }
+
+  if (url.pathname.startsWith("/edge-api-rewrite/")) {
+    const id = url.pathname.slice("/edge-api-rewrite/".length);
+    const target = request.nextUrl.clone();
+    target.pathname = `/api/edge-users/${id}`;
+    target.searchParams.set("foo", "bar");
     return NextResponse.rewrite(target);
   }
 
@@ -253,6 +280,8 @@ export function middleware(request: NextRequest) {
 
 export const config = {
   matcher: [
+    "/api/edge-search-params",
+    "/edge-api-rewrite/:path*",
     "/((?!api|_next|favicon\\.ico|mw-object-gated).*)",
     {
       source: "/mw-object-gated",

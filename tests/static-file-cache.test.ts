@@ -114,6 +114,15 @@ describe("StaticFileCache", () => {
     expect(entry!.etag).toBe('W/"abc123"');
   });
 
+  it("generates stable weak etag for dot-delimited managed image hashes", async () => {
+    await writeFile(clientDir, "_next/static/media/photo.0123abcd.png", "image bytes");
+
+    const cache = await StaticFileCache.create(clientDir);
+    const entry = cache.lookup("/_next/static/media/photo.0123abcd.png");
+
+    expect(entry!.etag).toBe('W/"0123abcd"');
+  });
+
   it("falls back to mtime etag for non-hashed files", async () => {
     await writeFile(clientDir, "favicon.ico", "icon");
 
@@ -140,6 +149,26 @@ describe("StaticFileCache", () => {
     const entry = cache.lookup("/_next/static/my-library-v2.0.0.js");
 
     expect(entry!.etag).toMatch(/^W\/"\d+-\d+"$/);
+  });
+
+  it("does not treat arbitrary dot suffixes as managed image hashes", async () => {
+    await writeFile(clientDir, "_next/static/media/photo.deadbeefg.png", "image bytes");
+
+    const cache = await StaticFileCache.create(clientDir);
+    const entry = cache.lookup("/_next/static/media/photo.deadbeefg.png");
+
+    expect(entry!.etag).toMatch(/^W\/"\d+-\d+"$/);
+  });
+
+  it("does not trust exact dot-hash suffixes outside managed media", async () => {
+    await writeFile(clientDir, "_next/static/config.deadbeef.json", '{"version":1}');
+
+    const cache = await StaticFileCache.create(clientDir);
+    const entry = cache.lookup("/_next/static/config.deadbeef.json");
+
+    expect(entry!.etag).toMatch(/^W\/"\d+-\d+"$/);
+    expect(entry!.etag).not.toBe('W/"deadbeef"');
+    expect(entry!.original.headers["Cache-Control"]).toBe("public, max-age=31536000, immutable");
   });
 
   // ── Precompressed variants ─────────────────────────────────────
@@ -245,7 +274,7 @@ describe("StaticFileCache", () => {
 
     expect(entry).toBeDefined();
     expect(entry!.original.path).toBe(path.join(clientDir, "about.html"));
-    expect(entry!.original.headers["Content-Type"]).toBe("text/html");
+    expect(entry!.original.headers["Content-Type"]).toBe("text/html; charset=utf-8");
   });
 
   it("resolves /index.html fallback for directory paths", async () => {

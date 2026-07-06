@@ -21,6 +21,7 @@ const APP_INTERCEPTION_SEPARATOR = "\0";
 
 export const APP_ARTIFACT_COMPATIBILITY_KEY = "__artifactCompatibility";
 export const APP_CACHE_ENTRY_REUSE_PROOF_KEY = "__cacheEntryReuseProof";
+export const APP_DYNAMIC_STALE_TIME_KEY = "__dynamicStaleTime";
 export const APP_INTERCEPTION_KEY = "__interception";
 export const APP_INTERCEPTION_CONTEXT_KEY = "__interceptionContext";
 export const APP_LAYOUT_IDS_KEY = "__layoutIds";
@@ -29,6 +30,7 @@ export const APP_RENDER_OBSERVATION_KEY = "__renderObservation";
 export const APP_ROUTE_KEY = "__route";
 export const APP_ROOT_LAYOUT_KEY = "__rootLayout";
 export const APP_SKIPPED_LAYOUT_IDS_KEY = "__skippedLayoutIds";
+export const APP_SOURCE_PAGE_KEY = "__sourcePage";
 export const APP_SLOT_BINDINGS_KEY = "__slotBindings";
 /**
  * Static sibling segment names for the matched route, surfaced so the client
@@ -191,6 +193,7 @@ export type LayoutFlags = Readonly<Record<string, "s" | "d">>;
 type AppElementsMetadata = {
   artifactCompatibility: ArtifactCompatibilityEnvelope;
   cacheEntryReuseProof?: CacheEntryReuseProof;
+  dynamicStaleTimeSeconds?: number;
   interception: AppElementsInterception | null;
   interceptionContext: string | null;
   layoutIds: readonly string[];
@@ -199,6 +202,7 @@ type AppElementsMetadata = {
   rootLayoutTreePath: string | null;
   skippedLayoutIds: readonly string[];
   slotBindings: readonly AppElementsSlotBinding[];
+  sourcePage: string | null;
 };
 
 type AppElementsWireElementKey =
@@ -209,20 +213,24 @@ type AppElementsWireElementKey =
   | { kind: "template"; treePath: string };
 
 type AppElementsWireMetadataInput = {
+  dynamicStaleTimeSeconds?: number;
   interception?: AppElementsInterception | null;
   interceptionContext: string | null;
   layoutIds?: readonly string[];
   routeId: string;
   rootLayoutTreePath: string | null;
   slotBindings?: readonly AppElementsSlotBinding[];
+  sourcePage?: string | null;
 };
 
 type AppElementsWireMetadataEntries = Readonly<{
+  [APP_DYNAMIC_STALE_TIME_KEY]?: number;
   [APP_ROUTE_KEY]: string;
   [APP_INTERCEPTION_KEY]?: AppElementsInterception;
   [APP_INTERCEPTION_CONTEXT_KEY]: string | null;
   [APP_LAYOUT_IDS_KEY]: readonly string[];
   [APP_ROOT_LAYOUT_KEY]: string | null;
+  [APP_SOURCE_PAGE_KEY]?: string;
   [APP_SLOT_BINDINGS_KEY]?: readonly AppElementsSlotBinding[];
 }>;
 
@@ -241,6 +249,7 @@ export type AppOutgoingElements = Readonly<
     | CacheEntryReuseProof
     | AppElementsInterception
     | RenderObservation
+    | number
     | readonly string[]
     | readonly AppElementsSlotBinding[]
   >
@@ -249,6 +258,7 @@ export type AppOutgoingElements = Readonly<
 type AppElementsWireKeys = {
   readonly artifactCompatibility: typeof APP_ARTIFACT_COMPATIBILITY_KEY;
   readonly cacheEntryReuseProof: typeof APP_CACHE_ENTRY_REUSE_PROOF_KEY;
+  readonly dynamicStaleTime: typeof APP_DYNAMIC_STALE_TIME_KEY;
   readonly interception: typeof APP_INTERCEPTION_KEY;
   readonly interceptionContext: typeof APP_INTERCEPTION_CONTEXT_KEY;
   readonly layoutIds: typeof APP_LAYOUT_IDS_KEY;
@@ -258,6 +268,7 @@ type AppElementsWireKeys = {
   readonly route: typeof APP_ROUTE_KEY;
   readonly skippedLayoutIds: typeof APP_SKIPPED_LAYOUT_IDS_KEY;
   readonly slotBindings: typeof APP_SLOT_BINDINGS_KEY;
+  readonly sourcePage: typeof APP_SOURCE_PAGE_KEY;
 };
 
 type AppElementsWireCodec = {
@@ -271,6 +282,7 @@ type AppElementsWireCodec = {
     element: ReactNode | AppElements;
     artifactCompatibility?: ArtifactCompatibilityEnvelope;
     cacheEntryReuseProof?: CacheEntryReuseProof;
+    dynamicStaleTimeSeconds?: number;
     layoutFlags: LayoutFlags;
     renderObservation?: RenderObservation;
     skipDisposition?: ClientReuseManifestSkipDisposition;
@@ -391,6 +403,12 @@ function createAppElementsWireMetadataEntries(
     [APP_INTERCEPTION_CONTEXT_KEY]: input.interceptionContext,
     [APP_LAYOUT_IDS_KEY]: layoutIds,
     [APP_ROOT_LAYOUT_KEY]: input.rootLayoutTreePath,
+    ...(input.dynamicStaleTimeSeconds === undefined
+      ? {}
+      : { [APP_DYNAMIC_STALE_TIME_KEY]: input.dynamicStaleTimeSeconds }),
+    ...(input.sourcePage === null || input.sourcePage === undefined
+      ? {}
+      : { [APP_SOURCE_PAGE_KEY]: input.sourcePage }),
   };
   // Empty slot binding metadata is intentionally omitted. Missing
   // __slotBindings round-trips as [] and means "no route-state proof", so
@@ -632,6 +650,7 @@ export function buildOutgoingAppPayload(input: {
   element: ReactNode | AppElements;
   artifactCompatibility?: ArtifactCompatibilityEnvelope;
   cacheEntryReuseProof?: CacheEntryReuseProof;
+  dynamicStaleTimeSeconds?: number;
   layoutFlags: LayoutFlags;
   renderObservation?: RenderObservation;
   skipDisposition?: ClientReuseManifestSkipDisposition;
@@ -648,6 +667,7 @@ export function buildOutgoingAppPayload(input: {
     | CacheEntryReuseProof
     | AppElementsInterception
     | RenderObservation
+    | number
     | readonly string[]
     | readonly AppElementsSlotBinding[]
   > = {};
@@ -666,6 +686,9 @@ export function buildOutgoingAppPayload(input: {
     input.artifactCompatibility ?? createArtifactCompatibilityEnvelope();
   if (input.cacheEntryReuseProof) {
     payload[APP_CACHE_ENTRY_REUSE_PROOF_KEY] = input.cacheEntryReuseProof;
+  }
+  if (input.dynamicStaleTimeSeconds !== undefined) {
+    payload[APP_DYNAMIC_STALE_TIME_KEY] = input.dynamicStaleTimeSeconds;
   }
   if (input.renderObservation) {
     payload[APP_RENDER_OBSERVATION_KEY] = input.renderObservation;
@@ -696,6 +719,12 @@ function readArtifactCompatibilityMetadata(value: unknown): ArtifactCompatibilit
   // emitted as scaffolding, so bad or future-version values degrade like
   // missing __layoutFlags instead of crashing render paths that do not read it.
   return artifactCompatibility ?? createArtifactCompatibilityEnvelope();
+}
+
+function readSourcePageMetadata(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || !value.startsWith("/")) return null;
+  return value;
 }
 
 function createMissingCacheEntryReuseProof(): CacheEntryReuseProof {
@@ -809,10 +838,19 @@ export function readAppElementsMetadata(
   const cacheEntryReuseProof = parseCacheEntryReuseProofMetadata(
     elements[APP_CACHE_ENTRY_REUSE_PROOF_KEY],
   );
+  const dynamicStaleTime = elements[APP_DYNAMIC_STALE_TIME_KEY];
+  const dynamicStaleTimeSeconds =
+    typeof dynamicStaleTime === "number" &&
+    Number.isFinite(dynamicStaleTime) &&
+    dynamicStaleTime >= 0
+      ? dynamicStaleTime
+      : undefined;
+  const sourcePage = readSourcePageMetadata(elements[APP_SOURCE_PAGE_KEY]);
 
   return {
     artifactCompatibility,
     ...(cacheEntryReuseProof ? { cacheEntryReuseProof } : {}),
+    ...(dynamicStaleTimeSeconds === undefined ? {} : { dynamicStaleTimeSeconds }),
     interception,
     interceptionContext: interceptionContext ?? null,
     layoutIds,
@@ -821,6 +859,7 @@ export function readAppElementsMetadata(
     rootLayoutTreePath,
     skippedLayoutIds,
     slotBindings,
+    sourcePage,
   };
 }
 
@@ -830,6 +869,7 @@ export const AppElementsWire: AppElementsWireCodec = {
   keys: {
     artifactCompatibility: APP_ARTIFACT_COMPATIBILITY_KEY,
     cacheEntryReuseProof: APP_CACHE_ENTRY_REUSE_PROOF_KEY,
+    dynamicStaleTime: APP_DYNAMIC_STALE_TIME_KEY,
     interception: APP_INTERCEPTION_KEY,
     interceptionContext: APP_INTERCEPTION_CONTEXT_KEY,
     layoutIds: APP_LAYOUT_IDS_KEY,
@@ -839,6 +879,7 @@ export const AppElementsWire: AppElementsWireCodec = {
     route: APP_ROUTE_KEY,
     skippedLayoutIds: APP_SKIPPED_LAYOUT_IDS_KEY,
     slotBindings: APP_SLOT_BINDINGS_KEY,
+    sourcePage: APP_SOURCE_PAGE_KEY,
   },
   unmatchedSlotValue: APP_UNMATCHED_SLOT_WIRE_VALUE,
   createMetadataEntries: createAppElementsWireMetadataEntries,
