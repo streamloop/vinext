@@ -655,7 +655,20 @@ export async function handleSsr(
         // Populated before any SSR request runs: at prod-server startup
         // (prod-server.ts) or via build-time bundle injection (index.ts). Left
         // undefined in dev, which naturally disables inline CSS there.
-        const inlineCssManifest = globalThis.__VINEXT_INLINE_CSS__;
+        // `inlineCss: { exclude }` config keeps stylesheet links (cacheable
+        // across navigations) on matching pathname prefixes — e.g. app or
+        // dashboard routes — while everything else inlines.
+        const inlineCssExclude = globalThis.__VINEXT_INLINE_CSS_EXCLUDE__;
+        const inlineCssExcluded =
+          Array.isArray(inlineCssExclude) &&
+          inlineCssExclude.some(
+            (prefix) =>
+              ssrNavigationContext.pathname === prefix ||
+              ssrNavigationContext.pathname.startsWith(
+                prefix.endsWith("/") ? prefix : `${prefix}/`,
+              ),
+          );
+        const inlineCssManifest = inlineCssExcluded ? undefined : globalThis.__VINEXT_INLINE_CSS__;
         const fontStyles = fontData?.styles ?? [];
         const mergeFontStylesIntoInlineCss =
           fontStyles.length > 0 && hasInlineCssManifest(inlineCssManifest);

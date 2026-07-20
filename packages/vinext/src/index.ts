@@ -6410,7 +6410,7 @@ export const loadServerActionClient = ${
         order: "post",
         handler() {
           if (this.environment?.name !== "client") return;
-          if (!hasAppDir || nextConfig?.inlineCss !== true) return;
+          if (!hasAppDir || !nextConfig?.inlineCss) return;
 
           const envConfig = this.environment?.config;
           if (!envConfig) return;

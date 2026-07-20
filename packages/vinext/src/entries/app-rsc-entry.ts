@@ -159,8 +159,11 @@ type AppRouterConfig = {
   reactMaxHeadersLength?: number;
   /** Maximum in-memory cache size in bytes. 0 disables the default memory cache. */
   cacheMaxMemorySize?: number;
-  /** Inline app CSS into production HTML (from experimental.inlineCss). */
-  inlineCss?: boolean;
+  /**
+   * Inline app CSS into production HTML (from experimental.inlineCss).
+   * `{ exclude }` inlines everywhere except pathnames matching a prefix.
+   */
+  inlineCss?: boolean | { exclude: string[] };
   /** Enable standalone route-miss 404 handling (from experimental.globalNotFound). */
   globalNotFound?: boolean;
   /** Enables Next.js Cache Components semantics for App Router document HTML. */
@@ -228,7 +231,13 @@ export function generateRscEntry(
   const expireTime = config?.expireTime ?? DEFAULT_EXPIRE_TIME;
   const reactMaxHeadersLength = config?.reactMaxHeadersLength ?? DEFAULT_REACT_MAX_HEADERS_LENGTH;
   const cacheMaxMemorySize = config?.cacheMaxMemorySize;
-  const inlineCss = config?.inlineCss === true;
+  const inlineCssConfig = config?.inlineCss;
+  const inlineCss =
+    inlineCssConfig === true || (typeof inlineCssConfig === "object" && inlineCssConfig !== null);
+  const inlineCssExclude =
+    typeof inlineCssConfig === "object" && inlineCssConfig !== null
+      ? inlineCssConfig.exclude
+      : undefined;
   const cacheComponents = config?.cacheComponents === true;
   const prefetchInlining = config?.prefetchInlining ?? false;
   const hasServerActions = config?.hasServerActions !== false;
@@ -658,6 +667,11 @@ export const __assetPrefix = ${JSON.stringify(assetPrefix)};
 export const __imageAllowedWidths = ${JSON.stringify(imageAllowedWidths)};
 export const __imageConfig = ${JSON.stringify(imageConfig)};
 export const __inlineCss = ${JSON.stringify(inlineCss)};
+// Pathname prefixes excluded from CSS inlining (vinext extension). Published
+// as a global at entry-module init so the SSR entry — which has the request
+// pathname in scope — can gate the manifest per request without new
+// render-option plumbing.
+globalThis.__VINEXT_INLINE_CSS_EXCLUDE__ = ${JSON.stringify(inlineCssExclude)};
 export const __hasPagesDir = ${JSON.stringify(hasPagesDir)};
 export const getRenderedConcreteUrlPathsForRoute = __getRenderedConcreteUrlPathsForRoute;
 

@@ -235,7 +235,7 @@ const CONFIG_SUPPORT: Record<string, { status: Status; detail?: string }> = {
   "experimental.inlineCss": {
     status: "supported",
     detail:
-      "App Router production HTML inlines stylesheet links as <style> in <head>; next/font CSS is merged into the first inline style",
+      "App Router production HTML inlines stylesheet links as <style> in <head>; next/font CSS is merged into the first inline style. vinext extension: `{ exclude: string[] }` keeps stylesheet links on matching pathname prefixes (e.g. dashboard routes) while inlining everywhere else",
   },
   "experimental.varyParams": {
     status: "partial",

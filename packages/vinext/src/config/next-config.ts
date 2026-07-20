@@ -407,8 +407,14 @@ export type ResolvedNextConfig = {
   transpilePackages: string[];
   /** Packages treated as application code by Turbopack's foreign-code condition. */
   turbopackTranspilePackages: string[];
-  /** Inline app CSS into production HTML (from experimental.inlineCss). */
-  inlineCss: boolean;
+  /**
+   * Inline app CSS into production HTML (from experimental.inlineCss).
+   * vinext extension: `{ exclude: string[] }` enables inlining everywhere
+   * except requests whose pathname matches an exclude prefix — lets a
+   * marketing/landing surface inline critical CSS while app/dashboard routes
+   * keep cacheable stylesheet links.
+   */
+  inlineCss: boolean | { exclude: string[] };
   /** Enable standalone route-miss 404 handling (from experimental.globalNotFound). */
   globalNotFound: boolean;
   /** Parsed body size limit for server actions in bytes (from experimental.serverActions.bodySizeLimit). Defaults to 1MB. */
@@ -1523,7 +1529,17 @@ export async function resolveNextConfig(
   const optimizePackageImports = Array.isArray(rawOptimize)
     ? rawOptimize.filter((x): x is string => typeof x === "string")
     : [];
-  const inlineCss = experimental?.inlineCss === true;
+  const rawInlineCss = experimental?.inlineCss as boolean | { exclude?: unknown } | undefined;
+  const inlineCss: boolean | { exclude: string[] } =
+    rawInlineCss === true
+      ? true
+      : rawInlineCss !== null &&
+          typeof rawInlineCss === "object" &&
+          Array.isArray(rawInlineCss.exclude)
+        ? {
+            exclude: rawInlineCss.exclude.filter((x): x is string => typeof x === "string"),
+          }
+        : false;
   const globalNotFound = experimental?.globalNotFound === true;
   const prefetchInlining = normalizePrefetchInliningConfig(experimental?.prefetchInlining);
 

@@ -270,6 +270,14 @@ declare global {
   var __VINEXT_INLINE_CSS__: Record<string, string> | undefined;
 
   /**
+   * Pathname prefixes excluded from CSS inlining (vinext's
+   * `inlineCss: { exclude }` extension). Set by the generated App Router RSC
+   * entry at module init; read per request by the SSR entry.
+   */
+  // oxlint-disable-next-line no-var
+  var __VINEXT_INLINE_CSS_EXCLUDE__: string[] | undefined;
+
+  /**
    * Current active locale, set on `globalThis` for server-side SSR rendering
    * (Pages Router with i18n).  Mirrors `window.__VINEXT_LOCALE__` for use in
    * environments where `window` is not available (e.g. Cloudflare Workers).
