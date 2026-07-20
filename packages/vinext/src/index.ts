@@ -2616,10 +2616,18 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
             // `assetsDir` (and the matching `assetFileNames`) EXPLICITLY on
             // each environment below so all three agree by construction
             // instead of relying on the leak. When there is no dedicated
-            // client build environment (single-build client output: CLI Pages
+            // client build environment (single-build output: CLI Pages
             // Router), keep it at the top level so that lone build still picks
             // it up — there's no rsc/ssr env to leak into in that case.
-            ...(!isSSR && !hasClientBuildEnvironment ? { assetsDir: clientAssetsDir } : {}),
+            //
+            // This deliberately does NOT exclude `isSSR`. A standalone Pages
+            // Router server build (`build.ssr` set, no injected client env) is
+            // where the font plugin's transform reads `build.assetsDir` to
+            // embed `/<assetsDir>/_vinext_fonts/...` into the emitted CSS and
+            // preload hrefs. Skipping it there left the server build on Vite's
+            // default `assets/` while the companion client build copied the
+            // font files under `_next/static/`, so every Pages font 404'd.
+            ...(!hasClientBuildEnvironment ? { assetsDir: clientAssetsDir } : {}),
             // Single-build client output has no client environment to carry the
             // default, so apply it at the top level. Multi-env builds set it on
             // `environments.client.build` below to avoid changing RSC/SSR asset

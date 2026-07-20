@@ -3597,3 +3597,74 @@ describe("RSC framework package matching", () => {
     expect(isRscFrameworkModule("C:\\app\\node_modules\\react-dom\\server.js")).toBe(true);
   });
 });
+
+describe("standalone SSR build assetsDir (fork)", () => {
+  // Regression guard for the fork's per-environment `assetsDir` patch.
+  //
+  // The fork stops setting a bare top-level `build.assetsDir`, because on a
+  // multi-environment build Vite copies unset `environments.*.build` fields
+  // down from the top level, which would silently give the rsc/ssr envs the
+  // client's `assetsDir` while they still use Vite's default flat
+  // `assetFileNames` — emitting `_next/static/logo-<hash>.svg` from SSR while
+  // the client writes `_next/static/media/logo.<hash8>.svg`. Each environment
+  // therefore sets `assetsDir` explicitly instead.
+  //
+  // A STANDALONE Pages Router server build (`build.ssr` set, no injected
+  // client environment) has no such environment to carry the value, and it is
+  // where the font plugin's transform reads `build.assetsDir` to embed
+  // `/<assetsDir>/_vinext_fonts/...` into the emitted CSS and preload hrefs.
+  // Gating the top-level fallback on `!isSSR` left that build on Vite's
+  // default `assets/` while the companion client build copied the font files
+  // under `_next/static/` — so every Pages Router font 404'd in production.
+  it("keeps the top-level assetsDir on a standalone Pages Router server build", async () => {
+    const vinext = (await import("../packages/vinext/src/index.js")).default;
+    const plugins = vinext();
+    const mainPlugin = plugins.find(
+      (p: any) => p.name === "vinext:config" && typeof p.config === "function",
+    );
+    expect(mainPlugin).toBeDefined();
+
+    const os = await import("node:os");
+    const fsp = await import("node:fs/promises");
+    const path = await import("node:path");
+
+    const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-ssr-assetsdir-"));
+    const rootNodeModules = path.resolve(import.meta.dirname, "../node_modules");
+    await fsp.symlink(rootNodeModules, path.join(tmpDir, "node_modules"), "junction");
+    await fsp.mkdir(path.join(tmpDir, "pages"), { recursive: true });
+    await fsp.writeFile(
+      path.join(tmpDir, "pages", "index.tsx"),
+      `export default function Home() { return <h1>Home</h1>; }`,
+    );
+    await fsp.writeFile(path.join(tmpDir, "next.config.mjs"), `export default {};`);
+
+    try {
+      // Mirrors tests/pages-router-font-google-prod.test.ts: the server half of
+      // the two-call Pages Router build, which sets `build.ssr` and injects no
+      // client environment.
+      const serverResult = await (mainPlugin as any).config(
+        { root: tmpDir, build: { ssr: "virtual:vinext-server-entry" }, plugins: [] },
+        { command: "build" },
+      );
+      // Must match the client build's copy target, not Vite's default "assets".
+      expect(serverResult.build?.assetsDir).toBe("_next/static");
+
+      // The companion client build must resolve to the same directory, or the
+      // embedded font URLs and the copied files diverge again. It passes an
+      // explicit build input (as the real two-call Pages build does), which
+      // suppresses the injected plain-Pages environments and so also carries
+      // `assetsDir` at the top level.
+      const clientResult = await (mainPlugin as any).config(
+        {
+          root: tmpDir,
+          build: { rolldownOptions: { input: "virtual:vinext-client-entry" } },
+          plugins: [],
+        },
+        { command: "build" },
+      );
+      expect(clientResult.build?.assetsDir).toBe(serverResult.build?.assetsDir);
+    } finally {
+      await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }, 15000);
+});
