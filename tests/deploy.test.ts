@@ -51,6 +51,7 @@ import { readPagesRouterEntrySource } from "./worker-entry-source.js";
 import { scanPublicFileRoutes } from "../packages/vinext/src/utils/public-routes.js";
 import { isUnknownRecord } from "../packages/vinext/src/utils/record.js";
 import { computeClientRuntimeMetadata } from "../packages/vinext/src/utils/client-runtime-metadata.js";
+import { toSlash } from "pathslash";
 import {
   buildPagesClientAssetsModule,
   writePagesClientAssetsModuleIfMissing,
@@ -113,6 +114,15 @@ function readVinextPackageExports(): Record<string, unknown> {
     throw new Error("packages/vinext/package.json must define an exports object");
   }
   return parsed.exports;
+}
+
+function readCloudflarePackagePeerDependencies(): Record<string, unknown> {
+  const packageJsonPath = path.resolve("packages/cloudflare/package.json");
+  const parsed: unknown = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8"));
+  if (!isUnknownRecord(parsed) || !isUnknownRecord(parsed.peerDependencies)) {
+    throw new Error("packages/cloudflare/package.json must define peerDependencies");
+  }
+  return parsed.peerDependencies;
 }
 
 function hasPackageExport(exportsMap: Record<string, unknown>, subpath: string): boolean {
@@ -1343,7 +1353,7 @@ describe("readPagesRouterEntrySource", () => {
     // Locale stripping, /api/ prefix check, and ctx forwarding are all inside the owner.
     expect(content).toContain("handleApi:");
     expect(content).toContain('typeof handleApiRoute === "function"');
-    expect(content).toContain("handleApiRoute(req, apiUrl, ctx)");
+    expect(content).toContain("handleApiRoute(req, apiUrl, ctx, new URL(req.url).origin)");
     expect(content).toContain("runPagesRequest(request, deps)");
   });
 
@@ -1411,6 +1421,11 @@ describe("readPagesRouterEntrySource", () => {
       true,
     );
     expect(hasPackageExport(exportsMap, "./internal/utils/project")).toBe(true);
+  });
+
+  it("publishes a vinext peer range that includes matching prereleases", () => {
+    const peerDependencies = readCloudflarePackagePeerDependencies();
+    expect(peerDependencies.vinext).toBe("workspace:^");
   });
 
   it("merges middleware and config headers into responses with correct precedence", () => {
@@ -2910,13 +2925,13 @@ describe("findInNodeModules", () => {
   it("finds a package in the immediate node_modules", () => {
     mkdir(tmpDir, "node_modules/@cloudflare/vite-plugin");
     const result = findInNodeModules(tmpDir, "@cloudflare/vite-plugin");
-    expect(result).toBe(path.join(tmpDir, "node_modules", "@cloudflare", "vite-plugin"));
+    expect(result).toBe(toSlash(path.join(tmpDir, "node_modules", "@cloudflare", "vite-plugin")));
   });
 
   it("finds a binary in node_modules/.bin", () => {
     writeFile(tmpDir, "node_modules/.bin/wrangler", "#!/usr/bin/env node");
     const result = findInNodeModules(tmpDir, ".bin/wrangler");
-    expect(result).toBe(path.join(tmpDir, "node_modules", ".bin", "wrangler"));
+    expect(result).toBe(toSlash(path.join(tmpDir, "node_modules", ".bin", "wrangler")));
   });
 
   it("returns null when not found anywhere", () => {
@@ -2929,7 +2944,7 @@ describe("findInNodeModules", () => {
     fs.mkdirSync(appDir, { recursive: true });
 
     const result = findInNodeModules(appDir, ".bin/wrangler");
-    expect(result).toBe(path.join(tmpDir, "node_modules", ".bin", "wrangler"));
+    expect(result).toBe(toSlash(path.join(tmpDir, "node_modules", ".bin", "wrangler")));
   });
 
   it("prefers the closest node_modules when both app and root have the package", () => {
@@ -2938,7 +2953,7 @@ describe("findInNodeModules", () => {
     mkdir(appDir, "node_modules/@cloudflare/vite-plugin");
 
     const result = findInNodeModules(appDir, "@cloudflare/vite-plugin");
-    expect(result).toBe(path.join(appDir, "node_modules", "@cloudflare", "vite-plugin"));
+    expect(result).toBe(toSlash(path.join(appDir, "node_modules", "@cloudflare", "vite-plugin")));
   });
 });
 

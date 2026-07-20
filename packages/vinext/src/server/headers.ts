@@ -15,6 +15,7 @@ import {
   MIDDLEWARE_SKIP_HEADER,
   VINEXT_PRERENDER_ROUTE_PARAMS_HEADER,
   VINEXT_PRERENDER_SPECULATIVE_HEADER,
+  VINEXT_REVALIDATE_HOST_HEADER,
 } from "../utils/protocol-headers.js";
 
 // ---------------------------------------------------------------------------
@@ -38,6 +39,7 @@ export {
   VINEXT_PRERENDER_ROUTE_PARAMS_HEADER,
   VINEXT_PRERENDER_SECRET_HEADER,
   VINEXT_PRERENDER_SPECULATIVE_HEADER,
+  VINEXT_REVALIDATE_HOST_HEADER,
 } from "../utils/protocol-headers.js";
 
 /** Internal endpoint used to evaluate App Router generateStaticParams exports. */
@@ -89,6 +91,9 @@ export const VINEXT_CLIENT_REUSE_MANIFEST_HEADER = "X-Vinext-Client-Reuse-Manife
  * cheap way to detect the redirect ahead of stream decode.
  */
 export const VINEXT_RSC_REDIRECT_HEADER = "X-Vinext-Rsc-Redirect";
+
+/** History update mode encoded by a streamed RSC redirect. */
+export const VINEXT_RSC_REDIRECT_TYPE_HEADER = "X-Vinext-Rsc-Redirect-Type";
 
 // ---------------------------------------------------------------------------
 // RSC protocol headers
@@ -216,4 +221,5 @@ export const VINEXT_INTERNAL_HEADERS = [
   VINEXT_PRERENDER_ROUTE_PARAMS_HEADER,
   VINEXT_PRERENDER_SPECULATIVE_HEADER,
   VINEXT_PRERENDER_CACHE_LIFE_HEADER,
+  VINEXT_REVALIDATE_HOST_HEADER,
 ];

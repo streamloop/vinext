@@ -36,10 +36,6 @@ import {
 // copies, so the reader sees an empty array even though the loader pushed.
 // Backing every piece of mutable state with a `Symbol.for` slot on
 // globalThis collapses the copies onto a single shared store.
-type _FontGlobal = typeof globalThis & {
-  [k: symbol]: unknown;
-};
-const _g = globalThis as _FontGlobal;
 const _INJECTED_FONTS_KEY = Symbol.for("vinext.font.injectedFonts");
 const _INJECTED_CLASS_RULES_KEY = Symbol.for("vinext.font.injectedClassRules");
 const _INJECTED_VARIABLE_RULES_KEY = Symbol.for("vinext.font.injectedVariableRules");
@@ -49,9 +45,23 @@ const _SSR_FONT_URLS_KEY = Symbol.for("vinext.font.ssrFontUrls");
 const _SSR_FONT_PRELOADS_KEY = Symbol.for("vinext.font.ssrFontPreloads");
 const _SSR_FONT_PRELOAD_HREFS_KEY = Symbol.for("vinext.font.ssrFontPreloadHrefs");
 
-const injectedFonts = ((_g[_INJECTED_FONTS_KEY] as Set<string>) ??= new Set<string>());
+type _FontGlobal = typeof globalThis & {
+  [_INJECTED_FONTS_KEY]?: Set<string>;
+  [_INJECTED_CLASS_RULES_KEY]?: Set<string>;
+  [_INJECTED_VARIABLE_RULES_KEY]?: Set<string>;
+  [_INJECTED_SELF_HOSTED_KEY]?: Set<string>;
+  [_SSR_FONT_STYLES_KEY]?: string[];
+  [_SSR_FONT_URLS_KEY]?: string[];
+  [_SSR_FONT_PRELOADS_KEY]?: Array<{ href: string; type: string }>;
+  [_SSR_FONT_PRELOAD_HREFS_KEY]?: Set<string>;
+};
+const _g = globalThis as _FontGlobal;
 
-export type FontOptions = {
+const injectedFonts = (_g[_INJECTED_FONTS_KEY] ??= new Set<string>());
+
+type CssVariable = `--${string}`;
+
+export type FontOptions<T extends CssVariable | undefined = CssVariable | undefined> = {
   weight?: string | string[];
   style?: string | string[];
   subsets?: string[];
@@ -59,7 +69,7 @@ export type FontOptions = {
   preload?: boolean;
   fallback?: string[];
   adjustFontFallback?: boolean | string;
-  variable?: string;
+  variable?: T;
   axes?: string[];
 };
 
@@ -77,17 +87,18 @@ type InternalGoogleFontRuntimeOptions = {
   fontStyle?: "normal" | "italic";
 };
 
-type FontLoaderOptions = FontOptions & {
-  /**
-   * Internal payload injected by the vinext:google-fonts transform after
-   * metadata validation. Runtime must prefer these values over user options
-   * because they represent the resolved Next-compatible face, including
-   * metadata defaults such as italic-only families.
-   */
-  _vinext?: {
-    font?: InternalGoogleFontRuntimeOptions;
+type FontLoaderOptions<T extends CssVariable | undefined = CssVariable | undefined> =
+  FontOptions<T> & {
+    /**
+     * Internal payload injected by the vinext:google-fonts transform after
+     * metadata validation. Runtime must prefer these values over user options
+     * because they represent the resolved Next-compatible face, including
+     * metadata defaults such as italic-only families.
+     */
+    _vinext?: {
+      font?: InternalGoogleFontRuntimeOptions;
+    };
   };
-};
 
 /**
  * Convert a font family name to a CSS variable name.
@@ -247,7 +258,7 @@ function injectFontStylesheet(url: string): void {
 }
 
 /** Track which className CSS rules have been injected. */
-const injectedClassRules = ((_g[_INJECTED_CLASS_RULES_KEY] as Set<string>) ??= new Set<string>());
+const injectedClassRules = (_g[_INJECTED_CLASS_RULES_KEY] ??= new Set<string>());
 
 /**
  * Inject a CSS rule that maps a className to the exported font style.
@@ -278,8 +289,7 @@ function injectClassNameRule(className: string, fontStyle: FontStyle): void {
 }
 
 /** Track which variable class CSS rules have been injected. */
-const injectedVariableRules = ((_g[_INJECTED_VARIABLE_RULES_KEY] as Set<string>) ??=
-  new Set<string>());
+const injectedVariableRules = (_g[_INJECTED_VARIABLE_RULES_KEY] ??= new Set<string>());
 
 /**
  * Inject a CSS rule that sets a CSS variable on an element.
@@ -318,7 +328,7 @@ function injectVariableClassRule(
 }
 
 // SSR: collect font class CSS for injection in <head>
-const ssrFontStyles = ((_g[_SSR_FONT_STYLES_KEY] as string[]) ??= []);
+const ssrFontStyles = (_g[_SSR_FONT_STYLES_KEY] ??= []);
 
 /**
  * Get collected SSR font class styles (used by the renderer).
@@ -330,7 +340,7 @@ export function getSSRFontStyles(): string[] {
 }
 
 // SSR: collect font URLs to inject in <head>
-const ssrFontUrls = ((_g[_SSR_FONT_URLS_KEY] as string[]) ??= []);
+const ssrFontUrls = (_g[_SSR_FONT_URLS_KEY] ??= []);
 
 /**
  * Get collected SSR font URLs (used by the renderer).
@@ -342,12 +352,8 @@ export function getSSRFontLinks(): string[] {
 }
 
 // SSR: collect font file URLs for <link rel="preload"> injection (self-hosted Google fonts)
-const ssrFontPreloads = ((_g[_SSR_FONT_PRELOADS_KEY] as Array<{
-  href: string;
-  type: string;
-}>) ??= []);
-const ssrFontPreloadHrefs = ((_g[_SSR_FONT_PRELOAD_HREFS_KEY] as Set<string>) ??=
-  new Set<string>());
+const ssrFontPreloads = (_g[_SSR_FONT_PRELOADS_KEY] ??= []);
+const ssrFontPreloadHrefs = (_g[_SSR_FONT_PRELOAD_HREFS_KEY] ??= new Set<string>());
 
 /**
  * Get collected SSR font preload data (used by the renderer).
@@ -374,7 +380,7 @@ function collectFontPreloads(urls: string[]): void {
 }
 
 /** Track injected self-hosted @font-face blocks (deduplicate) */
-const injectedSelfHosted = ((_g[_INJECTED_SELF_HOSTED_KEY] as Set<string>) ??= new Set<string>());
+const injectedSelfHosted = (_g[_INJECTED_SELF_HOSTED_KEY] ??= new Set<string>());
 
 /**
  * Inject self-hosted @font-face CSS (from the build plugin).
@@ -384,7 +390,6 @@ function injectSelfHostedCSS(css: string, preloadUrls: string[] = []): void {
   collectFontPreloads(preloadUrls);
   if (injectedSelfHosted.has(css)) return;
   injectedSelfHosted.add(css);
-
 
   if (typeof document === "undefined") {
     // SSR: add to collected styles
@@ -399,10 +404,17 @@ function injectSelfHostedCSS(css: string, preloadUrls: string[] = []): void {
   document.head.appendChild(style);
 }
 
-export type FontLoader = (options?: FontLoaderOptions) => FontResult;
+type NextFont = Omit<FontResult, "variable"> & { variable?: undefined };
+type NextFontWithVariable = Omit<NextFont, "variable"> & { variable: string };
+
+export type FontLoader = <T extends CssVariable | undefined = undefined>(
+  options?: FontLoaderOptions<T>,
+) => T extends undefined ? NextFont : NextFontWithVariable;
 
 export function createFontLoader(family: string): FontLoader {
-  return function fontLoader(options: FontLoaderOptions = {}): FontResult {
+  return function fontLoader<T extends CssVariable | undefined = undefined>(
+    options: FontLoaderOptions<T> = {},
+  ): T extends undefined ? NextFont : NextFontWithVariable {
     const internal = options._vinext?.font;
     const fallback = options.fallback ?? [];
     // The adjusted fallback family name must match the font-family emitted by
@@ -473,7 +485,7 @@ export function createFontLoader(family: string): FontLoader {
       className,
       style,
       ...(options.variable ? { variable: variableClassName } : {}),
-    };
+    } as T extends undefined ? NextFont : NextFontWithVariable;
   };
 }
 

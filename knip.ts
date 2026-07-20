@@ -102,12 +102,19 @@ export default {
         // imported by the bundled helper modules, not by src/index.ts directly.
         "am-i-vibing",
         "magic-string",
+        // Kept as an explicit package-local Vite+ toolchain dependency.
+        "vite",
       ],
     },
   },
   ignoreWorkspaces: ["examples/**", "tests/fixtures/**", "benchmarks/**"],
   ignoreDependencies: [
-    "@typescript/native-preview",
+    // Imported only by declarations vendored from Next.js. @next/env and
+    // sharp are covered by ambient stubs in @vinext/types; server-only is a
+    // marker import supplied by compatible runtimes.
+    "@next/env",
+    "server-only",
+    "sharp",
 
     // Declared at root package.json but imported from workspace/example code:
     //   @mdx-js/react — no direct imports; retained for MDX runtime resolution.

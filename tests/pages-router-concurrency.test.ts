@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vite-plus/test";
 import { build, type ViteDevServer } from "vite";
 import path from "node:path";
 import http from "node:http";
@@ -104,6 +104,14 @@ describe("Pages Router prod concurrency isolation", () => {
       configFile: false,
       plugins: [vinext()],
       logLevel: "silent",
+      // This isolated build deliberately skips the workspace Vite config;
+      // retain its source alias so fixture imports of exported vinext internals
+      // resolve without requiring a prebuilt package.
+      resolve: {
+        alias: {
+          "vinext/internal": path.resolve(import.meta.dirname, "../packages/vinext/src"),
+        },
+      },
       build: {
         outDir: path.join(outDir, "server"),
         ssr: "virtual:vinext-server-entry",
