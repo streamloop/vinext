@@ -5,6 +5,11 @@
  * Resolves metadata from layouts and pages (pages override layouts).
  */
 import React from "react";
+import type { ViewportLayout } from "@vinext/types/next/upstream/dist/lib/metadata/types/extra-types";
+import type {
+  ResolvedViewport as NextResolvedViewport,
+  Viewport as NextViewport,
+} from "@vinext/types/next/upstream/dist/lib/metadata/types/metadata-interface";
 import { makeThenableParams, type ThenableParamsObserver } from "./thenable-params.js";
 import { isAbsoluteOrProtocolRelativeUrl } from "./url-utils.js";
 
@@ -12,24 +17,8 @@ import { isAbsoluteOrProtocolRelativeUrl } from "./url-utils.js";
 // Viewport types and resolution
 // ---------------------------------------------------------------------------
 
-export type Viewport = {
-  /** Viewport width (default: "device-width") */
-  width?: string | number;
-  /** Viewport height */
-  height?: string | number;
-  /** Initial scale */
-  initialScale?: number;
-  /** Minimum scale */
-  minimumScale?: number;
-  /** Maximum scale */
-  maximumScale?: number;
-  /** Whether user can scale */
-  userScalable?: boolean;
-  /** Theme color — single color or array of { media, color } */
-  themeColor?: string | Array<{ media?: string; color: string }>;
-  /** Color scheme: 'light' | 'dark' | 'light dark' | 'normal' */
-  colorScheme?: string;
-};
+export type Viewport = NextViewport;
+export type ResolvedViewport = NextResolvedViewport;
 
 /**
  * Resolve viewport config from a module. Handles both static `viewport` export
@@ -37,8 +26,9 @@ export type Viewport = {
  */
 export async function resolveModuleViewport(
   mod: Record<string, unknown>,
-  params: Record<string, string | string[]>,
+  params: Record<string, string | string[]> = {},
   searchParams?: Record<string, string | string[]>,
+  parent: Promise<ResolvedViewport> = Promise.resolve(mergeViewport([])),
   searchParamsObserver?: ThenableParamsObserver,
 ): Promise<Viewport | null> {
   if (typeof mod.generateViewport === "function") {
@@ -50,7 +40,7 @@ export async function resolveModuleViewport(
             params: asyncParams,
             searchParams: makeThenableParams(searchParams, searchParamsObserver),
           };
-    return await mod.generateViewport(props);
+    return await mod.generateViewport(props, parent);
   }
   if (mod.viewport && typeof mod.viewport === "object") {
     return mod.viewport as Viewport;
@@ -62,64 +52,120 @@ export async function resolveModuleViewport(
  * Merge viewport configs from multiple sources (layouts + page).
  * Later entries override earlier ones.
  */
-export const DEFAULT_VIEWPORT: Viewport = {
+export const DEFAULT_VIEWPORT: ResolvedViewport = {
   width: "device-width",
   initialScale: 1,
+  themeColor: null,
+  colorScheme: null,
 };
 
-export function mergeViewport(viewportList: Viewport[]): Viewport {
-  const merged: Viewport = { ...DEFAULT_VIEWPORT };
-  for (const vp of viewportList) {
-    Object.assign(merged, vp);
+export function mergeViewport(viewportList: readonly Viewport[]): ResolvedViewport {
+  const merged: ResolvedViewport = { ...DEFAULT_VIEWPORT };
+  for (const viewport of viewportList) {
+    for (const viewportKey in viewport) {
+      const key = viewportKey as keyof Viewport;
+      switch (key) {
+        case "themeColor":
+          merged.themeColor = resolveThemeColor(viewport.themeColor);
+          break;
+        case "colorScheme":
+          merged.colorScheme = viewport.colorScheme || null;
+          break;
+        case "width":
+          merged.width = viewport.width;
+          break;
+        case "height":
+          merged.height = viewport.height;
+          break;
+        case "initialScale":
+          merged.initialScale = viewport.initialScale;
+          break;
+        case "minimumScale":
+          merged.minimumScale = viewport.minimumScale;
+          break;
+        case "maximumScale":
+          merged.maximumScale = viewport.maximumScale;
+          break;
+        case "userScalable":
+          merged.userScalable = viewport.userScalable;
+          break;
+        case "viewportFit":
+          merged.viewportFit = viewport.viewportFit;
+          break;
+        case "interactiveWidget":
+          merged.interactiveWidget = viewport.interactiveWidget;
+          break;
+        default:
+          key satisfies never;
+      }
+    }
   }
   return merged;
 }
+
+const VIEWPORT_META_NAMES = {
+  width: "width",
+  height: "height",
+  initialScale: "initial-scale",
+  minimumScale: "minimum-scale",
+  maximumScale: "maximum-scale",
+  userScalable: "user-scalable",
+  viewportFit: "viewport-fit",
+  interactiveWidget: "interactive-widget",
+} as const satisfies Record<keyof ViewportLayout, string>;
 
 /**
  * React component that renders viewport meta tags into <head>.
  */
 export function ViewportHead({ viewport }: { viewport: Viewport }) {
+  const resolvedViewport = mergeViewport([viewport]);
   const elements: React.ReactElement[] = [];
   let key = 0;
 
   // Build viewport content string
   const parts: string[] = [];
-  if (viewport.width !== undefined) parts.push(`width=${viewport.width}`);
-  if (viewport.height !== undefined) parts.push(`height=${viewport.height}`);
-  if (viewport.initialScale !== undefined) parts.push(`initial-scale=${viewport.initialScale}`);
-  if (viewport.minimumScale !== undefined) parts.push(`minimum-scale=${viewport.minimumScale}`);
-  if (viewport.maximumScale !== undefined) parts.push(`maximum-scale=${viewport.maximumScale}`);
-  if (viewport.userScalable !== undefined)
-    parts.push(`user-scalable=${viewport.userScalable ? "yes" : "no"}`);
+  for (const key of Object.keys(VIEWPORT_META_NAMES) as Array<keyof ViewportLayout>) {
+    const value = resolvedViewport[key];
+    if (value == null) continue;
+    parts.push(
+      `${VIEWPORT_META_NAMES[key]}=${key === "userScalable" ? (value ? "yes" : "no") : value}`,
+    );
+  }
 
   if (parts.length > 0) {
     elements.push(<meta key={key++} name="viewport" content={parts.join(", ")} />);
   }
 
   // Theme color
-  if (viewport.themeColor) {
-    if (typeof viewport.themeColor === "string") {
-      elements.push(<meta key={key++} name="theme-color" content={viewport.themeColor} />);
-    } else if (Array.isArray(viewport.themeColor)) {
-      for (const entry of viewport.themeColor) {
-        elements.push(
-          <meta
-            key={key++}
-            name="theme-color"
-            content={entry.color}
-            {...(entry.media ? { media: entry.media } : {})}
-          />,
-        );
-      }
+  if (resolvedViewport.themeColor) {
+    for (const entry of resolvedViewport.themeColor) {
+      elements.push(
+        <meta
+          key={key++}
+          name="theme-color"
+          content={entry.color}
+          {...(entry.media ? { media: entry.media } : {})}
+        />,
+      );
     }
   }
 
   // Color scheme
-  if (viewport.colorScheme) {
-    elements.push(<meta key={key++} name="color-scheme" content={viewport.colorScheme} />);
+  if (resolvedViewport.colorScheme) {
+    elements.push(<meta key={key++} name="color-scheme" content={resolvedViewport.colorScheme} />);
   }
 
   return <>{elements}</>;
+}
+
+function resolveThemeColor(themeColor: Viewport["themeColor"]): ResolvedViewport["themeColor"] {
+  if (!themeColor) return null;
+  const descriptors = Array.isArray(themeColor) ? themeColor : [themeColor];
+  return descriptors.map((descriptor) =>
+    typeof descriptor === "string"
+      ? { color: descriptor }
+      : { color: descriptor.color, media: descriptor.media },
+  );
 }
 
 // ---------------------------------------------------------------------------

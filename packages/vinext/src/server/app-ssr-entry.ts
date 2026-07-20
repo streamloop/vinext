@@ -261,11 +261,9 @@ function renderFontHtml(
   }
 
   for (const preload of fontData.preloads ?? []) {
-    // Deliberately NOT appendAssetDeploymentIdQuery: the @font-face rules
-    // (inline styles below and built CSS) reference the bare content-hashed
-    // URL, and a preload only matches a font request when the URLs are
-    // byte-identical. Appending ?dpl= here made every preload a wasted
-    // download and re-fetched each font a second time from CSS, later.
+    // Font files are content-hashed immutable assets. Keep the preload URL
+    // byte-identical to the @font-face source so the browser consumes it;
+    // deployment IDs are only needed to cache-bust mutable static assets.
     fontHTML += `<link rel="preload"${nonceAttr} href="${escapeHtmlAttr(preload.href)}" as="font" type="${escapeHtmlAttr(preload.type)}" crossorigin />\n`;
   }
 
