@@ -32,6 +32,7 @@ import {
   closeAfterResponse,
   closeAfterResponseWithBody,
   createRequestContext,
+  preserveFullyBufferedBodyMetadata,
   runWithRequestContext,
 } from "vinext/shims/unified-request-context";
 import { flattenErrorCauses } from "../utils/error-cause.js";
@@ -112,6 +113,7 @@ type RunAppMiddlewareOptions = {
   context: AppRscMiddlewareContext;
   hadBasePath: boolean;
   isDataRequest: boolean;
+  middlewareRequest?: Request;
   request: Request;
 };
 
@@ -146,11 +148,14 @@ function applyMiddlewareContextToResponse(
   const headers = new Headers(response.headers);
   mergeMiddlewareResponseHeaders(headers, middlewareContext.headers);
 
-  return new Response(response.body, {
-    status: middlewareContext.status ?? response.status,
-    statusText: response.statusText,
-    headers,
-  });
+  return preserveFullyBufferedBodyMetadata(
+    response,
+    new Response(response.body, {
+      status: middlewareContext.status ?? response.status,
+      statusText: response.statusText,
+      headers,
+    }),
+  );
 }
 
 type DispatchMatchedPageOptions<TRoute> = {
@@ -249,6 +254,7 @@ type HandleServerActionRequestOptions<TRoute> = {
   middlewareContext: AppRscMiddlewareContext;
   mountedSlotsHeader: string | null;
   request: Request;
+  scriptNonce?: string;
   routeMatch: AppRscRouteMatch<TRoute> | null;
   routePathname: string;
   searchParams: URLSearchParams;
@@ -327,6 +333,10 @@ type CreateAppRscHandlerOptions<TRoute extends AppRscHandlerRoute> = {
   imageConfig?: ImageConfig;
   isDev: boolean;
   loadPrerenderPagesRoutes?: () => Promise<unknown>;
+  matchInterceptRoute?: (
+    pathname: string,
+    sourcePathname: string,
+  ) => AppRscRouteMatch<TRoute> | null;
   matchRoute: (pathname: string) => AppRscRouteMatch<TRoute> | null;
   matchRequestRoute?: (pathname: string) => AppRscRouteMatch<TRoute> | null;
   runMiddleware?: (options: RunAppMiddlewareOptions) => Promise<ApplyAppMiddlewareResult>;
@@ -481,12 +491,11 @@ function requestWithoutRscCacheBustingSearchParam(request: Request): Request {
   if (!hasRscCacheBustingSearchParam(url)) return request;
 
   stripRscCacheBustingSearchParam(url);
-  // Clone when a body is present so the original request stays usable, then
-  // reconstruct via `cloneRequestWithUrl` rather than a bare `new Request` so
-  // the Workers `cf` metadata is preserved (user middleware reads it directly)
-  // and `duplex: "half"` is set for streaming bodies.
-  const source = request.body ? request.clone() : request;
-  return cloneRequestWithUrl(source, url.toString());
+  // URL normalization does not create a second body consumer. Reconstructing
+  // from the request shares/transfers its stream into the replacement request;
+  // App middleware creates the one explicit tee when it genuinely needs an
+  // isolated branch.
+  return cloneRequestWithUrl(request, url.toString());
 }
 
 function requestWithoutRscSuffix(request: Request): Request {
@@ -495,8 +504,7 @@ function requestWithoutRscSuffix(request: Request): Request {
   if (pathname === url.pathname) return request;
 
   url.pathname = pathname;
-  const source = request.body ? request.clone() : request;
-  return cloneRequestWithUrl(source, url.toString());
+  return cloneRequestWithUrl(request, url.toString());
 }
 
 async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
@@ -633,11 +641,25 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     : null;
   if (rscCacheBustingRedirect) return rscCacheBustingRedirect;
 
+  const runMiddleware = isOnDemandRevalidateRequest(
+    request.headers.get(PRERENDER_REVALIDATE_HEADER),
+  )
+    ? undefined
+    : options.runMiddleware;
+  // Branch the exact downstream body owner before creating URL aliases. URL
+  // reconstruction shares a stream; cloning an alias would lock the body still
+  // referenced by `request` and break the subsequent action/route-handler read.
+  const isolatedMiddlewareSource =
+    runMiddleware && request.body && !request.bodyUsed ? request.clone() : null;
+
   // Keep cache-busting validation on the real request above, then hide the
   // internal `_rsc` transport query from userland middleware and post-middleware
   // has/missing matching. This mirrors Next.js' navigation middleware fixture.
   const normalizedUserlandRequest = requestWithoutRscSuffix(request);
   const userlandRequest = requestWithoutRscCacheBustingSearchParam(normalizedUserlandRequest);
+  const isolatedMiddlewareRequest = isolatedMiddlewareSource
+    ? requestWithoutRscCacheBustingSearchParam(requestWithoutRscSuffix(isolatedMiddlewareSource))
+    : undefined;
   const middlewareContext: AppRscMiddlewareContext = {
     headers: null,
     requestHeaders: null,
@@ -645,11 +667,6 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   };
   let didMiddlewareRewrite = false;
   let didMiddlewareRewritePathname = false;
-  const runMiddleware = isOnDemandRevalidateRequest(
-    request.headers.get(PRERENDER_REVALIDATE_HEADER),
-  )
-    ? undefined
-    : options.runMiddleware;
 
   if (runMiddleware) {
     const middlewareResult = await runMiddleware({
@@ -657,9 +674,13 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       context: middlewareContext,
       hadBasePath,
       isDataRequest: isMiddlewareDataRequest,
+      middlewareRequest: isolatedMiddlewareRequest,
       request: userlandRequest,
     });
     if (middlewareResult.kind === "response") {
+      if (request.body && !request.body.locked) {
+        void request.body.cancel().catch(() => {});
+      }
       return applyConfigHeadersToMiddlewareRedirect(middlewareResult.response, {
         basePathState,
         configHeaders: options.configHeaders,
@@ -870,7 +891,22 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   // where the second `setRootParams` call replaces this value before rendering.
   // Out-of-basePath Server Actions resolve those late rewrites above so this
   // match already uses their claimed destination.
-  const preActionMatch = filesystemRouteEligible ? matchCleanPathname() : null;
+  // Interception-only RSC targets promote their source route at this same
+  // boundary so Server Action rerenders receive the same route and params as
+  // the subsequent page dispatch. Document requests remain direct-route-only.
+  const directPreActionMatch = filesystemRouteEligible ? matchCleanPathname() : null;
+  const preActionRoutePathname = cleanPathnameIsRequestPathname
+    ? requestCleanPathname
+    : cleanPathname;
+  const interceptionPreActionMatch =
+    filesystemRouteEligible &&
+    directPreActionMatch === null &&
+    isRscRequest &&
+    interceptionContextHeader !== null
+      ? (options.matchInterceptRoute?.(preActionRoutePathname, interceptionContextHeader) ?? null)
+      : null;
+  const preActionMatch = directPreActionMatch ?? interceptionPreActionMatch;
+  const isInterceptionMatch = interceptionPreActionMatch !== null;
   if (preActionMatch) {
     setRootParams(pickRootParams(preActionMatch.params, preActionMatch.route.rootParamNames));
   }
@@ -945,8 +981,9 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
           middlewareContext,
           mountedSlotsHeader,
           request,
+          scriptNonce,
           routeMatch: preActionMatch,
-          routePathname: cleanPathnameIsRequestPathname ? requestCleanPathname : cleanPathname,
+          routePathname: preActionRoutePathname,
           searchParams: getResolvedSearchParams(),
         })
       : null;
@@ -961,7 +998,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   ): Promise<Response | null> => {
     if (!filesystemRouteEligible) return null;
     const response =
-      match === null || match.route.isDynamic
+      !isInterceptionMatch && (match === null || match.route.isDynamic)
         ? ((await options.renderPagesFallback?.({
             appRouteMatch: match ?? null,
             allowRscDocumentFallback: didMiddlewareRewritePathname,
@@ -990,7 +1027,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     options.clearRequestContext();
     return staticPagesFallbackResponse;
   }
-  if (!resolvedLateRewritesForAction && (!match || match.route.isDynamic)) {
+  if (!isInterceptionMatch && !resolvedLateRewritesForAction && (!match || match.route.isDynamic)) {
     for (const rewrite of options.configRewrites.afterFiles) {
       const afterFilesRewrite = await applyRewrite(
         {

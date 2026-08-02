@@ -9,6 +9,7 @@ import {
   VINEXT_RSC_VARY_HEADER,
 } from "../packages/vinext/src/server/app-rsc-cache-busting.js";
 import { createAppRscHandler } from "../packages/vinext/src/server/app-rsc-handler.js";
+import { createAppRscRouteMatcher } from "../packages/vinext/src/server/app-rsc-route-matching.js";
 import type { AppRouteTreePrefetchRoute } from "../packages/vinext/src/server/app-route-tree-prefetch.js";
 import { createArtifactCompatibilityEnvelope } from "../packages/vinext/src/server/artifact-compatibility.js";
 import {
@@ -36,6 +37,7 @@ type TestRoute = {
   isDynamic: boolean;
   layouts?: readonly unknown[];
   layoutTreePositions?: readonly number[];
+  params?: readonly string[];
   page?: { default?: unknown } | null;
   pattern: string;
   rootParamNames?: readonly string[];
@@ -111,6 +113,7 @@ function createHandler(overrides: Partial<TestHandlerOptions> = {}) {
     i18nConfig: overrides.i18nConfig ?? null,
     imageConfig: overrides.imageConfig,
     isDev: overrides.isDev ?? true,
+    matchInterceptRoute: overrides.matchInterceptRoute,
     matchRoute:
       overrides.matchRoute ??
       ((pathname: string) =>
@@ -548,6 +551,215 @@ describe("createAppRscHandler", () => {
       null,
     );
     expect(defaultOnly.status).toBe(400);
+  });
+
+  it("dispatches an RSC interception target with all dynamic descendant source params", async () => {
+    const sourceRoute = createPageRoute({
+      isDynamic: true,
+      params: ["locale", "tab"],
+      pattern: "/:locale/example/:tab",
+      rootParamNames: ["locale"],
+      routeSegments: ["[locale]", "example", "[tab]"],
+    });
+    const dispatchMatchedPage = vi.fn(async () => new Response("intercepted", { status: 200 }));
+    const renderPagesFallback = vi.fn(async () => new Response("pages", { status: 200 }));
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedPage,
+      matchInterceptRoute(pathname, sourcePathname) {
+        if (pathname !== "/en/intercepted" || sourcePathname !== "/en/example/recent") {
+          return null;
+        }
+        return { route: sourceRoute, params: { locale: "en", tab: "recent" } };
+      },
+      matchRoute: () => null,
+      renderPagesFallback,
+    });
+
+    const headers = createRscRequestHeaders({ interceptionContext: "/en/example/recent" });
+    const rscUrl = await createRscRequestUrl("/docs/en/intercepted", headers);
+    const response = await handler(new Request(`https://example.test${rscUrl}`, { headers }), null);
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("intercepted");
+    expect(renderPagesFallback).not.toHaveBeenCalled();
+    expect(dispatchMatchedPage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cleanPathname: "/en/intercepted",
+        interceptionContext: "/en/example/recent",
+        params: { locale: "en", tab: "recent" },
+        route: sourceRoute,
+      }),
+    );
+  });
+
+  it("does not promote a Route Handler slot owner for interception-only RSC targets", async () => {
+    // A `route.ts` record can retain parallel slots discovered beside it. A
+    // client-controlled interception context may gate the modal rewrite, but
+    // Next.js never dispatches the owning handler as its source route.
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/lib/generate-interception-routes-rewrites.ts
+    const matcher = createAppRscRouteMatcher([
+      {
+        pattern: "/feed",
+        patternParts: ["feed"],
+        __loadRouteHandler: async () => ({}),
+        slots: {
+          modal: {
+            intercepts: [
+              {
+                sourceMatchPattern: "/feed",
+                targetPattern: "/feed/hidden",
+                interceptLayouts: ["layout"],
+                page: "modal-page",
+                params: [],
+              },
+            ],
+          },
+        },
+      },
+    ]);
+    const handlerOwner = createPageRoute({
+      __loadPage: undefined,
+      __loadRouteHandler() {},
+      page: null,
+      pattern: "/feed",
+      routeHandler: { GET: () => new Response("secret handler") },
+      routeSegments: ["feed"],
+    });
+    const dispatchMatchedPage = vi.fn(async () => new Response("page"));
+    const dispatchMatchedRouteHandler = vi.fn(async () => new Response("secret handler"));
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedPage,
+      dispatchMatchedRouteHandler,
+      matchInterceptRoute(pathname, sourcePathname) {
+        const intercept = matcher.findIntercept(pathname, sourcePathname);
+        return intercept ? { route: handlerOwner, params: {} } : null;
+      },
+      matchRoute: (pathname) => (pathname === "/feed" ? { route: handlerOwner, params: {} } : null),
+    });
+
+    // Direct requests still reach the Route Handler.
+    const directResponse = await handler(new Request("https://example.test/docs/feed"), null);
+    expect(await directResponse.text()).toBe("secret handler");
+    expect(dispatchMatchedRouteHandler).toHaveBeenCalledOnce();
+    dispatchMatchedRouteHandler.mockClear();
+
+    // The same handler must not be promoted for a forged interception-only
+    // target whose middleware/routing path was `/feed/hidden`.
+    const headers = createRscRequestHeaders({ interceptionContext: "/feed" });
+    const rscUrl = await createRscRequestUrl("/docs/feed/hidden", headers);
+    const response = await handler(new Request(`https://example.test${rscUrl}`, { headers }), null);
+
+    expect(response.status).toBe(404);
+    expect(dispatchMatchedRouteHandler).not.toHaveBeenCalled();
+    expect(dispatchMatchedPage).not.toHaveBeenCalled();
+  });
+
+  it("uses the request pathname consistently for encoded interception targets", async () => {
+    const sourceRoute = createPageRoute({
+      isDynamic: true,
+      params: ["slug"],
+      pattern: "/feed/:slug",
+      routeSegments: ["feed", "[slug]"],
+    });
+    const dispatchMatchedPage = vi.fn(async () => new Response("intercepted", { status: 200 }));
+    const matchInterceptRoute = vi.fn((pathname: string, sourcePathname: string) => {
+      if (pathname !== "/photos/%5Fhidden" || sourcePathname !== "/feed/a%252Fb") return null;
+      return { route: sourceRoute, params: { slug: "a%2Fb" } };
+    });
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedPage,
+      matchInterceptRoute,
+      matchRoute: () => null,
+    });
+
+    const headers = createRscRequestHeaders({ interceptionContext: "/feed/a%252Fb" });
+    const rscUrl = await createRscRequestUrl("/docs/photos/%5Fhidden", headers);
+    const response = await handler(new Request(`https://example.test${rscUrl}`, { headers }), null);
+
+    expect(response.status).toBe(200);
+    expect(matchInterceptRoute).toHaveBeenCalledWith("/photos/%5Fhidden", "/feed/a%252Fb");
+    expect(dispatchMatchedPage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        interceptionPathname: "/photos/%5Fhidden",
+        params: { slug: "a%2Fb" },
+        route: sourceRoute,
+      }),
+    );
+  });
+
+  it("promotes an interception-only target before server-action dispatch", async () => {
+    const sourceRoute = createPageRoute({
+      isDynamic: true,
+      params: ["locale", "tab"],
+      pattern: "/:locale/example/:tab",
+      rootParamNames: ["locale"],
+      routeSegments: ["[locale]", "example", "[tab]"],
+    });
+    const promotedMatch = {
+      route: sourceRoute,
+      params: { locale: "en", tab: "recent" },
+    };
+    const handleServerActionRequest = vi.fn(
+      async () => new Response("intercepted-action", { status: 200 }),
+    );
+    const handler = createHandler({
+      configHeaders: [],
+      handleServerActionRequest,
+      matchInterceptRoute(pathname, sourcePathname) {
+        if (pathname !== "/en/intercepted" || sourcePathname !== "/en/example/recent") {
+          return null;
+        }
+        return promotedMatch;
+      },
+      matchRoute: () => null,
+    });
+
+    const headers = createRscRequestHeaders({ interceptionContext: "/en/example/recent" });
+    headers.set("next-action", "interception-action");
+    const rscUrl = await createRscRequestUrl("/docs/en/intercepted", headers);
+    const response = await handler(
+      new Request(`https://example.test${rscUrl}`, {
+        headers,
+        method: "POST",
+      }),
+      null,
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe("intercepted-action");
+    expect(handleServerActionRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        actionId: "interception-action",
+        cleanPathname: "/en/intercepted",
+        interceptionContext: "/en/example/recent",
+        routeMatch: promotedMatch,
+      }),
+    );
+  });
+
+  it("keeps interception-only targets unavailable to direct document requests", async () => {
+    const matchInterceptRoute = vi.fn(() => ({ route: createPageRoute(), params: {} }));
+    const dispatchMatchedPage = vi.fn(async () => new Response("intercepted", { status: 200 }));
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedPage,
+      matchInterceptRoute,
+      matchRoute: () => null,
+    });
+
+    const response = await handler(
+      new Request("https://example.test/docs/en/intercepted", {
+        headers: { "x-vinext-interception-context": "/en/example" },
+      }),
+      null,
+    );
+
+    expect(response.status).toBe(404);
+    expect(matchInterceptRoute).not.toHaveBeenCalled();
+    expect(dispatchMatchedPage).not.toHaveBeenCalled();
   });
 
   it("allows independent Next.js blur width and quality exceptions in pure App Router dev", async () => {
@@ -3091,6 +3303,124 @@ describe("createAppRscHandler", () => {
       expect.objectContaining({ actionId: "abc123", cleanPathname: "/about" }),
     );
     expect(dispatchMatchedPage).not.toHaveBeenCalled();
+  });
+
+  it("uses one isolated middleware branch for body-bearing RSC actions", async () => {
+    const rscHeaders = createRscRequestHeaders();
+    rscHeaders.set("content-type", "text/plain");
+    rscHeaders.set("next-action", "abc123");
+    const rscHash = await computeRscCacheBustingSearchParam(rscHeaders);
+    const cloneSpy = vi.spyOn(Request.prototype, "clone");
+    const handleServerActionRequest = vi.fn(async ({ request }: { request: Request }) => {
+      await expect(request.text()).resolves.toBe("streamed-action-body");
+      return new Response("action");
+    });
+    const middleware = vi.fn(async (request: Request) => {
+      await expect(request.text()).resolves.toBe("streamed-action-body");
+      return new Response(null, {
+        headers: { "x-middleware-next": "1" },
+      });
+    });
+    const handler = createHandler({
+      configHeaders: [],
+      handleServerActionRequest,
+      middlewareModule: {
+        default: middleware,
+      },
+    });
+
+    try {
+      const response = await handler(
+        new Request(`https://example.test/docs/about.rsc?_rsc=${rscHash}`, {
+          body: "streamed-action-body",
+          headers: rscHeaders,
+          method: "POST",
+        }),
+        null,
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("action");
+      expect(middleware).toHaveBeenCalledOnce();
+      expect(handleServerActionRequest).toHaveBeenCalledOnce();
+      // URL/query/header normalization shares the downstream body owner. The
+      // only tee is the real middleware/downstream boundary, and middleware's
+      // branch is transferred into NextRequest rather than abandoned.
+      expect(cloneSpy).toHaveBeenCalledTimes(1);
+      expect((cloneSpy.mock.results[0]!.value as Request).bodyUsed).toBe(true);
+    } finally {
+      cloneSpy.mockRestore();
+    }
+  });
+
+  it("does not tee body-bearing RSC actions when middleware is absent", async () => {
+    const rscHeaders = createRscRequestHeaders();
+    rscHeaders.set("content-type", "text/plain");
+    rscHeaders.set("next-action", "abc123");
+    const rscHash = await computeRscCacheBustingSearchParam(rscHeaders);
+    const cloneSpy = vi.spyOn(Request.prototype, "clone");
+    const handleServerActionRequest = vi.fn(async ({ request }: { request: Request }) => {
+      await expect(request.text()).resolves.toBe("streamed-action-body");
+      return new Response("action");
+    });
+    const handler = createHandler({ configHeaders: [], handleServerActionRequest });
+
+    try {
+      const response = await handler(
+        new Request(`https://example.test/docs/about.rsc?_rsc=${rscHash}`, {
+          body: "streamed-action-body",
+          headers: rscHeaders,
+          method: "POST",
+        }),
+        null,
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("action");
+      expect(cloneSpy).not.toHaveBeenCalled();
+    } finally {
+      cloneSpy.mockRestore();
+    }
+  });
+
+  it("cancels the isolated RSC body branch when middleware does not match", async () => {
+    const rscHeaders = createRscRequestHeaders();
+    rscHeaders.set("content-type", "text/plain");
+    rscHeaders.set("next-action", "abc123");
+    const rscHash = await computeRscCacheBustingSearchParam(rscHeaders);
+    const cloneSpy = vi.spyOn(Request.prototype, "clone");
+    const middleware = vi.fn(() => new Response("unexpected"));
+    const handleServerActionRequest = vi.fn(async ({ request }: { request: Request }) => {
+      await expect(request.text()).resolves.toBe("streamed-action-body");
+      return new Response("action");
+    });
+    const handler = createHandler({
+      configHeaders: [],
+      handleServerActionRequest,
+      middlewareModule: {
+        config: { matcher: "/middleware-only" },
+        default: middleware,
+      },
+    });
+
+    try {
+      const response = await handler(
+        new Request(`https://example.test/docs/about.rsc?_rsc=${rscHash}`, {
+          body: "streamed-action-body",
+          headers: rscHeaders,
+          method: "POST",
+        }),
+        null,
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("action");
+      expect(middleware).not.toHaveBeenCalled();
+      expect(cloneSpy).toHaveBeenCalledTimes(1);
+      expect((cloneSpy.mock.results[0]!.value as Request).bodyUsed).toBe(true);
+    } finally {
+      cloneSpy.mockRestore();
+    }
   });
 
   it("accepts the vinext action header name for server actions", async () => {

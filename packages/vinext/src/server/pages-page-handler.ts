@@ -23,6 +23,7 @@ import {
   PAGES_PREVIEW_CACHE_CONTROL,
   type PagesPreviewState,
 } from "./pages-preview.js";
+import { hasUserDocumentGetInitialProps } from "./document-initial-head.js";
 import { resolvePagesPageData } from "./pages-page-data.js";
 import type { PagesPageModule } from "./pages-page-data.js";
 import { resolvePagesPageMethodResponse } from "./pages-page-method.js";
@@ -194,6 +195,7 @@ type VinextConfigSubset = {
   htmlLimitedBots?: string;
   clientTraceMetadata?: readonly string[];
   disableOptimizedLoading: boolean;
+  crossOrigin?: string;
 };
 
 export function shouldEmitPagesClientTraceMetadata(
@@ -269,8 +271,15 @@ export type CreatePagesPageHandlerOptions = {
   getFontPreloads: () => Array<{ href: string; type: string }>;
   /** `renderToReadableStream` from `react-dom/server.edge`. */
   renderToReadableStream: (element: ReactNode) => Promise<ReadableStream<Uint8Array>>;
-  /** Render a second ISR pass to a string (wraps renderToReadableStream). */
-  renderIsrPassToStringAsync: (element: ReactNode) => Promise<string>;
+  /**
+   * Render a second ISR pass to a string (wraps renderToReadableStream).
+   * `onHeadReady` runs inside the pass's head scope, after the render and
+   * before the scope unwinds, so callers can read the collected `<head>`.
+   */
+  renderIsrPassToStringAsync: (
+    element: ReactNode,
+    onHeadReady?: () => Promise<void>,
+  ) => Promise<string>;
   /** `safeJsonStringify` from `vinext/html`. */
   safeJsonStringify: (value: unknown) => string;
   /** `sanitizeDestination` from the config-matchers module. */
@@ -823,6 +832,21 @@ export function createPagesPageHandler(
           asPath: routerAsPath,
           resolvedUrl: pagesResolvedUrl,
           renderIsrPassToStringAsync,
+          // Regeneration re-renders the page but reuses the cached shell, so
+          // the refreshed `next/head` output has to be read out of the render
+          // pass explicitly.
+          //
+          // Skipped when `_document` overrides `getInitialProps`: those apps
+          // resolve their head through `runDocumentRenderPage`, which supplies
+          // a real `renderPage` plus the request context (`req`/`res`/
+          // pathname/query/asPath) that regeneration cannot reproduce without
+          // running the whole document pipeline again. Collecting a head
+          // without them would swap a complete cached head for a degraded one,
+          // so those entries keep serving the cached head as before.
+          collectIsrHeadHTML:
+            getSSRHeadHTML && !hasUserDocumentGetInitialProps(DocumentComponent)
+              ? getSSRHeadHTML
+              : undefined,
           route: { isDynamic: route.isDynamic },
           routePattern,
           routeUrl: renderRouteUrl,
@@ -1005,6 +1029,7 @@ export function createPagesPageHandler(
           basePath: vinextConfig.basePath,
           assetPrefix: vinextConfig.assetPrefix,
           deploymentId: process.env.__VINEXT_DEPLOYMENT_ID || process.env.NEXT_DEPLOYMENT_ID,
+          crossOrigin: vinextConfig.crossOrigin,
         });
 
         let pageResponse = await renderPagesPageResponse({
@@ -1058,6 +1083,8 @@ export function createPagesPageHandler(
           routeUrl: renderRouteUrl,
           safeJsonStringify,
           scriptNonce,
+          crossOrigin: vinextConfig.crossOrigin,
+          disableOptimizedLoading: vinextConfig.disableOptimizedLoading,
           statusCode: renderStatusCode,
           nextData: serializedPagesNextData,
           userAgent: request.headers.get("user-agent") ?? undefined,

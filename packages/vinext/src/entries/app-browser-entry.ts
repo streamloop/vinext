@@ -3,6 +3,7 @@ import type {
   VinextLinkPrefetchRoute,
   VinextPagesLinkPrefetchRoute,
 } from "../client/vinext-next-data.js";
+import { toClientRewrites } from "../client/client-rewrites.js";
 import type { AppRoute } from "../routing/app-router.js";
 import { patternsStructurallyEquivalent, type RouteManifest } from "../routing/app-route-graph.js";
 import type { NextRewrite } from "../config/next-config.js";
@@ -27,6 +28,7 @@ export function generateBrowserEntry(
   const entryPath = resolveRuntimeEntryModule("app-browser-entry");
   const navigationRuntimePath = resolveClientRuntimeModule("navigation-runtime");
   const prefetchRoutes = toLinkPrefetchRoutes(routes);
+  const clientRewrites = toClientRewrites(rewrites);
 
   return `import { registerNavigationRuntimeBootstrap } from ${JSON.stringify(navigationRuntimePath)};
 
@@ -36,7 +38,7 @@ window.__VINEXT_LINK_PREFETCH_ROUTES__ = ${JSON.stringify(prefetchRoutes)};
 // entry must also expose the Pages manifest (the Pages client entry does
 // the same — whichever entry runs first emits both globals).
 window.__VINEXT_PAGES_LINK_PREFETCH_ROUTES__ = ${JSON.stringify(pagesPrefetchRoutes)};
-window.__VINEXT_CLIENT_REWRITES__ = ${JSON.stringify(rewrites)};
+window.__VINEXT_CLIENT_REWRITES__ = ${JSON.stringify(clientRewrites)};
 registerNavigationRuntimeBootstrap({
     routeManifest: ${buildRouteManifestExpression(routeManifest)}
 });
@@ -81,7 +83,11 @@ function interceptTargetsRoute(interceptTargetPattern: string, route: AppRoute):
 function hasLoadingBoundary(route: AppRoute, hasSiblingInterceptLoading: boolean): boolean {
   return (
     route.loadingPath !== null ||
-    (route.loadingPaths?.length ?? 0) > 0 ||
+    (route.loadingPaths?.some((_, index) => (route.loadingTreePositions?.[index] ?? 0) > 0) ??
+      false) ||
+    // Position 0 is already shared only for the main route tree. For a parallel
+    // slot or intercepted subtree it is that subtree's local root and must
+    // still be advertised as a loading shell.
     route.parallelSlots.some(
       (slot) =>
         slot.loadingPath !== null ||

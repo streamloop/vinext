@@ -49,7 +49,7 @@ import {
   getRequestContext,
   runWithUnifiedStateMutation,
 } from "./unified-request-context.js";
-import { markDynamicUsage } from "./headers.js";
+import { isDraftModeEnabled, markDynamicUsage } from "./headers.js";
 import { trackPprFallbackShellCacheTask } from "./ppr-fallback-shell.js";
 import { isMarkedAppPagePropsObject } from "./internal/app-page-props-cache-key.js";
 
@@ -429,6 +429,12 @@ export function clearPrivateCache(): void {
 
 type RegisterCachedFunctionOptions = {
   /**
+   * Whether the original function declaration accepts a second argument.
+   * Function.length cannot represent default or rest parameters, so the
+   * transform records this separately for metadata parent resolution.
+   */
+  acceptsSecondArgument?: boolean;
+  /**
    * Internal transform metadata for file-level `"use cache"` default exports
    * in App Router `page.*` files. Page components receive framework-owned
    * `{ params, searchParams }` props. React may copy that props object before
@@ -530,9 +536,11 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
         return result;
       }
 
-      // In dev mode, always execute fresh — skip shared cache lookup/storage.
-      // This ensures HMR changes are reflected immediately.
-      if (isDev) {
+      // Draft mode joins dev in skipping shared cache lookup/storage: the key
+      // covers function id, build seed and arguments but not draft state, so a
+      // preview request would otherwise seed unpublished content into an entry
+      // later served to public requests. Mirrors Next.js's `isDraftMode` guard.
+      if (isDev || isDraftModeEnabled()) {
         return executeWithContext(fn, args, cacheVariant);
       }
 
@@ -640,6 +648,9 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
           cacheControl: {
             revalidate: revalidateSeconds,
             expire: effectiveLife.expire,
+            // Persisted so a later hit re-registers the same claim; otherwise
+            // the enclosing render's minimum depends on cache temperature.
+            stale: effectiveLife.stale,
           },
         });
       } catch {
@@ -665,11 +676,17 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (cachedFn as any)[USE_CACHE_FUNCTION_SYMBOL] = true;
 
+  if (options.acceptsSecondArgument !== undefined) {
+    Reflect.set(cachedFn, USE_CACHE_ACCEPTS_SECOND_ARGUMENT_SYMBOL, options.acceptsSecondArgument);
+  }
+
   return cachedFn;
 }
 
 /** @internal Symbol used to identify "use cache" wrapper functions. */
 const USE_CACHE_FUNCTION_SYMBOL = Symbol.for("vinext.useCacheFunction");
+/** @internal Symbol carrying transform-derived cached function argument metadata. */
+const USE_CACHE_ACCEPTS_SECOND_ARGUMENT_SYMBOL = Symbol.for("vinext.useCacheAcceptsSecondArgument");
 
 function throwPrivateUseCacheInsidePublicUseCacheError(): never {
   const error = new Error(
@@ -682,12 +699,39 @@ function throwPrivateUseCacheInsidePublicUseCacheError(): never {
 
 function recordRequestScopedCacheControl(cacheControl: CacheControlMetadata | undefined): void {
   if (cacheControl === undefined) return;
-  _setRequestScopedCacheLife({
-    // `false` is an indefinite lifetime and therefore does not constrain an
-    // enclosing cache scope's finite revalidation window.
+  // A hit must contribute the same claim its producing execution did — both to
+  // the request scope and, when nested, to the enclosing cache scope (like the
+  // MISS path's `parentCtx.lifeConfigs.push`); otherwise the inner claim
+  // vanishes once the outer entry goes warm.
+  const life: CacheLifeConfig = {
+    // `false` is an indefinite lifetime and does not constrain the enclosing
+    // scope's finite revalidation window.
     revalidate: cacheControl.revalidate === false ? undefined : cacheControl.revalidate,
     expire: cacheControl.expire,
-  });
+    stale: cacheControl.stale,
+  };
+  const parentCtx = cacheContextStorage.getStore();
+  parentCtx?.lifeConfigs.push(life);
+
+  // A warm nested HIT must preserve the same dynamic-cache validation as the
+  // MISS that produced it. The persisted cache-control fields already contain
+  // the values Next.js checks at the cache read site, so derive the signal
+  // from them instead of extending the stored payload. Capture the current
+  // inner-cache call site while it is still on the stack; the enclosing scope
+  // later applies its explicit cacheLife suppression exactly as on a MISS.
+  if (
+    parentCtx &&
+    parentCtx.variant !== "private" &&
+    (cacheControl.revalidate === 0 ||
+      (cacheControl.expire !== undefined && cacheControl.expire < DYNAMIC_EXPIRE))
+  ) {
+    const error = new NestedDynamicUseCacheError();
+    if (typeof Error.captureStackTrace === "function") {
+      Error.captureStackTrace(error, recordRequestScopedCacheControl);
+    }
+    parentCtx.dynamicNestedCacheError ??= error;
+  }
+  _setRequestScopedCacheLife(life);
 }
 
 function recordRequestScopedCacheLife(cacheLife: CacheLifeConfig): void {

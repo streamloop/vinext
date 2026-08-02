@@ -838,14 +838,49 @@ describe("app page head resolution", () => {
     expect(seen).toEqual([{ owner: "root" }, { owner: "root", team: "alpha" }]);
   });
 
-  // Regression: a `generateMetadata` that does not declare the `parent`
-  // argument must NOT receive it. Matches Next.js, which omits the parent
-  // argument for cached `generateMetadata` functions that don't use it
-  // (resolve-metadata.ts `getResult` / `useCacheFunctionInfo.usedArgs[1]`).
-  // Passing the parent into a `'use cache'` function feeds it to the cache-key
-  // encoder (encodeReply), which throws on non-serializable values such as a
-  // `URL` `metadataBase` ("URL objects are not supported").
-  it("omits the parent argument for generateMetadata that does not declare it", async () => {
+  // Extends Next.js's generateMetadata parent-resolution coverage:
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/metadata/app/dynamic/%5Bslug%5D/page.tsx
+  it("passes the parent to regular generateMetadata with default and rest parameters", async () => {
+    const fallbackMetadata = { description: "Fallback description" };
+    const receivedArgCounts: number[] = [];
+    const withDefault = async function (
+      _props: unknown,
+      parent = Promise.resolve(fallbackMetadata),
+    ) {
+      receivedArgCounts.push(arguments.length);
+      return { title: String((await parent).description) };
+    };
+    const withRest = async function (...args: [unknown, Promise<Record<string, unknown>>?]) {
+      receivedArgCounts.push(args.length);
+      const parent = args[1] ?? Promise.resolve(fallbackMetadata);
+      return { title: String((await parent).description) };
+    };
+    const titles: unknown[] = [];
+
+    for (const generateMetadata of [withDefault, withRest]) {
+      const result = await resolveAppPageHead<Record<string, unknown>>({
+        layoutModules: [{ metadata: { description: "Root description" } }],
+        layoutTreePositions: [0],
+        metadataRoutes: [],
+        pageModule: { generateMetadata },
+        params: {},
+        routePath: "/",
+        routeSegments: [],
+      });
+      titles.push(result.metadata?.title);
+    }
+
+    expect(withDefault.length).toBe(1);
+    expect(withRest.length).toBe(0);
+    expect(receivedArgCounts).toEqual([2, 2]);
+    expect(titles).toEqual(["Root description", "Root description"]);
+  });
+
+  // Regression: a cached `generateMetadata` that does not declare the
+  // `parent` argument must NOT receive it. Passing the parent into the cache
+  // wrapper feeds it to the cache-key encoder, which throws on non-serializable
+  // values such as a `URL` `metadataBase` ("URL objects are not supported").
+  it("omits the parent argument for cached generateMetadata that does not declare it", async () => {
     const receivedArgCounts: number[] = [];
     const rootLayout = {
       metadata: {
@@ -853,19 +888,20 @@ describe("app page head resolution", () => {
         title: "Root",
       },
     };
-    const page = {
-      // Arity 0 — declares no `parent` parameter.
-      generateMetadata: async function () {
-        receivedArgCounts.push(arguments.length);
-        return { title: "Page" };
-      },
+    const generateMetadata = async function () {
+      receivedArgCounts.push(arguments.length);
+      return { title: "Page" };
     };
+    Object.assign(generateMetadata, {
+      [Symbol.for("vinext.useCacheFunction")]: true,
+      [Symbol.for("vinext.useCacheAcceptsSecondArgument")]: false,
+    });
 
     const result = await resolveAppPageHead<Record<string, unknown>>({
       layoutModules: [rootLayout],
       layoutTreePositions: [0],
       metadataRoutes: [],
-      pageModule: page,
+      pageModule: { generateMetadata },
       params: {},
       routePath: "/",
       routeSegments: [],
@@ -879,7 +915,7 @@ describe("app page head resolution", () => {
     expect(result.metadata?.title).toBe("Page");
   });
 
-  it("still passes the parent argument to generateMetadata that declares it", async () => {
+  it("passes the parent argument to cached generateMetadata that declares it", async () => {
     const receivedArgCounts: number[] = [];
     const rootLayout = {
       metadata: {
@@ -887,20 +923,23 @@ describe("app page head resolution", () => {
         description: "Root description",
       },
     };
-    const page = {
-      // Arity 2 — declares `parent`, so it must receive it.
-      generateMetadata: async function (_props: unknown, parent: Promise<Record<string, unknown>>) {
-        receivedArgCounts.push(arguments.length);
-        const parentMetadata = await parent;
-        return { title: String(parentMetadata.description) };
-      },
+    const generateMetadata = async function (
+      _props: unknown,
+      parent: Promise<Record<string, unknown>>,
+    ) {
+      receivedArgCounts.push(arguments.length);
+      const parentMetadata = await parent;
+      return { title: String(parentMetadata.description) };
     };
+    Object.assign(generateMetadata, {
+      [Symbol.for("vinext.useCacheFunction")]: true,
+    });
 
     const result = await resolveAppPageHead<Record<string, unknown>>({
       layoutModules: [rootLayout],
       layoutTreePositions: [0],
       metadataRoutes: [],
-      pageModule: page,
+      pageModule: { generateMetadata },
       params: {},
       routePath: "/",
       routeSegments: [],
@@ -908,6 +947,48 @@ describe("app page head resolution", () => {
 
     expect(receivedArgCounts).toEqual([2]);
     expect(result.metadata?.title).toBe("Root description");
+  });
+
+  // Extends Next.js's cached generateMetadata parent-argument coverage:
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/use-cache/use-cache.test.ts
+  it("passes the parent to cached generateMetadata with default and rest parameters", async () => {
+    const fallbackMetadata = { description: "Fallback description" };
+    const receivedArgCounts: number[] = [];
+    const withDefault = async function (
+      _props: unknown,
+      parent = Promise.resolve(fallbackMetadata),
+    ) {
+      receivedArgCounts.push(arguments.length);
+      return { title: String((await parent).description) };
+    };
+    const withRest = async function (...args: [unknown, Promise<Record<string, unknown>>?]) {
+      receivedArgCounts.push(args.length);
+      const parent = args[1] ?? Promise.resolve(fallbackMetadata);
+      return { title: String((await parent).description) };
+    };
+    const titles: unknown[] = [];
+
+    for (const generateMetadata of [withDefault, withRest]) {
+      Object.assign(generateMetadata, {
+        [Symbol.for("vinext.useCacheFunction")]: true,
+        [Symbol.for("vinext.useCacheAcceptsSecondArgument")]: true,
+      });
+      const result = await resolveAppPageHead<Record<string, unknown>>({
+        layoutModules: [{ metadata: { description: "Root description" } }],
+        layoutTreePositions: [0],
+        metadataRoutes: [],
+        pageModule: { generateMetadata },
+        params: {},
+        routePath: "/",
+        routeSegments: [],
+      });
+      titles.push(result.metadata?.title);
+    }
+
+    expect(withDefault.length).toBe(1);
+    expect(withRest.length).toBe(0);
+    expect(receivedArgCounts).toEqual([2, 2]);
+    expect(titles).toEqual(["Root description", "Root description"]);
   });
 
   it("keeps primary page title handling independent from active parallel route metadata", async () => {

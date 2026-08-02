@@ -254,6 +254,7 @@ class PagesResponseStream extends Writable {
   private controller: ReadableStreamDefaultController | null = null;
   private readonly bufferedChunks: Buffer[] = [];
   private streamEnded = false;
+  private pendingWrite: ((error?: Error | null) => void) | null = null;
 
   constructor(
     private readonly resolveResponse: (value: Response) => void,
@@ -287,7 +288,7 @@ class PagesResponseStream extends Writable {
     this.resStatusCode = code;
     if (headers) {
       for (const [key, value] of Object.entries(headers)) {
-        this.setHeaderValue(key, value, { replaceSetCookie: false });
+        this.setHeaderValue(key, value, { replaceSetCookie: true });
       }
     }
     return this as PagesReqResResponse;
@@ -405,7 +406,23 @@ class PagesResponseStream extends Writable {
       this.bufferedChunks.push(buffer);
     }
     this.resolveOnce();
-    callback();
+    // Propagate consumer backpressure to the Node source: while the response
+    // body's queue is full, hold the write callback until the consumer pulls.
+    // A held callback makes `write()` return false, which pauses any piped
+    // source (e.g. a proxied upstream) instead of queueing chunks without
+    // bound. `end(data)` writes can park here too because Node sets
+    // writableEnded after _write returns; the adapter's first body pull
+    // releases them, and the completed response remains on the buffered path.
+    if (
+      this.controller &&
+      !this.streamEnded &&
+      !this.writableEnded &&
+      (this.controller.desiredSize ?? 1) <= 0
+    ) {
+      this.pendingWrite = callback;
+    } else {
+      callback();
+    }
   }
 
   override _final(callback: (error?: Error | null) => void): void {
@@ -423,6 +440,9 @@ class PagesResponseStream extends Writable {
 
   override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
     this.streamEnded = true;
+    // A write parked for backpressure would otherwise never complete; release
+    // it so piped sources unwind instead of waiting on a dead stream.
+    this.releasePendingWrite(error);
     if (!this.resolved) {
       if (error) {
         this.resolved = true;
@@ -451,18 +471,23 @@ class PagesResponseStream extends Writable {
     options: { replaceSetCookie: boolean },
   ): void {
     if (name.toLowerCase() === "set-cookie") {
+      // getHeader() exposes this array like Node's ServerResponse. Snapshot it
+      // before replacement so passing that live value back does not clear it.
+      const values = Array.isArray(value) ? value.map(String) : [String(value)];
       if (options.replaceSetCookie) {
         this.setCookieHeaders.length = 0;
       }
-      if (Array.isArray(value)) {
-        this.setCookieHeaders.push(...value.map(String));
-      } else {
-        this.setCookieHeaders.push(String(value));
-      }
+      this.setCookieHeaders.push(...values);
       return;
     }
 
     this.resHeaders[name.toLowerCase()] = Array.isArray(value) ? value.join(", ") : value;
+  }
+
+  private releasePendingWrite(error?: Error | null): void {
+    const callback = this.pendingWrite;
+    this.pendingWrite = null;
+    callback?.(error);
   }
 
   private resolveOnce(): void {
@@ -498,6 +523,9 @@ class PagesResponseStream extends Writable {
           }
         }
       },
+      pull: () => {
+        this.releasePendingWrite();
+      },
       cancel: (reason) => {
         this.bufferedChunks.length = 0;
         this.destroy(reason instanceof Error ? reason : new Error("Response body cancelled"));
@@ -506,6 +534,26 @@ class PagesResponseStream extends Writable {
 
     this.resolveResponse(new Response(stream, { status: this.resStatusCode, headers }));
   }
+}
+
+type ResponseWithVinextStreamedApiBody = Response & {
+  __vinextStreamedApiResponse?: boolean;
+};
+
+/**
+ * Marks a Pages API Response whose body was still being written when the
+ * handler settled (streaming/piping), so Node adapters forward it as a stream.
+ * Buffering a live stream would defer delivery until the source closes and
+ * hold the whole body in memory. Complete bodies (`res.json`, `res.send`,
+ * `res.end(data)`) are not marked and keep the buffered path, which preserves
+ * Content-Length.
+ */
+export function markVinextStreamedApiResponse(response: Response): void {
+  (response as ResponseWithVinextStreamedApiBody).__vinextStreamedApiResponse = true;
+}
+
+export function isVinextStreamedApiResponse(response: Response): boolean {
+  return (response as ResponseWithVinextStreamedApiBody).__vinextStreamedApiResponse === true;
 }
 
 export function createPagesReqRes(options: CreatePagesReqResOptions): CreatePagesReqResResult {

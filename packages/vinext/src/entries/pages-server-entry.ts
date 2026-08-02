@@ -45,6 +45,7 @@ export async function generateServerEntry(
   fileMatcher: ReturnType<typeof createValidFileMatcher>,
   middlewarePath: string | null,
   instrumentationPath: string | null,
+  publicFiles: string[] = [],
 ): Promise<string> {
   const pageRoutes = await pagesRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher);
   const apiRoutes = await apiRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher);
@@ -130,6 +131,7 @@ export async function generateServerEntry(
     // (the default), page scripts are emitted with `defer` in <head>. See
     // `.nextjs-ref/packages/next/src/pages/_document.tsx` getScripts().
     disableOptimizedLoading: nextConfig?.disableOptimizedLoading === true,
+    crossOrigin: nextConfig?.crossOrigin,
     clientTraceMetadata: nextConfig?.clientTraceMetadata,
     images: {
       deviceSizes: nextConfig?.images?.deviceSizes,
@@ -283,7 +285,7 @@ async function _renderToStringAsync(element) {
   return new Response(stream).text();
 }
 
-async function _renderIsrPassToStringAsync(element) {
+async function _renderIsrPassToStringAsync(element, onHeadReady) {
   // The cache-fill render is a second render pass for the same request.
   // Reset render-scoped state so it cannot leak from the streamed response
   // render or affect async work that is still draining from that stream.
@@ -292,7 +294,17 @@ async function _renderIsrPassToStringAsync(element) {
   return await runWithServerInsertedHTMLState(() =>
     runWithHeadState(() =>
       _runWithCacheState(() =>
-        runWithPrivateCache(() => runWithFetchCache(async () => _renderToStringAsync(element))),
+        runWithPrivateCache(() =>
+          runWithFetchCache(async () => {
+            const html = await _renderToStringAsync(element);
+            // next/head tags are collected as a side effect of the render
+            // above and live in this ALS scope only, so a caller that wants
+            // the regenerated head has to read it here — after the render,
+            // before the scope unwinds.
+            await onHeadReady?.();
+            return html;
+          }),
+        ),
       ),
     ),
   );
@@ -308,6 +320,7 @@ ${errorImportCode}
 export const pageRoutes = [
 ${pageRouteEntries.join(",\n")}
 ];
+export const publicFiles = new Set(${JSON.stringify(publicFiles)});
 const _pageRouteTrie = _buildRouteTrie(pageRoutes);
 const _errorPageRoute = {
   pattern: "/_error",
@@ -380,6 +393,7 @@ const _renderPage = __createPagesPageHandler({
     htmlLimitedBots: vinextConfig.htmlLimitedBots,
     clientTraceMetadata: vinextConfig.clientTraceMetadata,
     disableOptimizedLoading: vinextConfig.disableOptimizedLoading,
+    crossOrigin: vinextConfig.crossOrigin,
   },
   buildId,
   hasMiddleware,
@@ -467,11 +481,12 @@ export async function renderPage(request, url, manifest, ctx, middlewareHeaders,
 
 
 
-export async function handleApiRoute(request, url, ctx, trustedRevalidateOrigin) {
+export async function handleApiRoute(request, url, ctx, trustedRevalidateOrigin, edgeRuntime = "worker") {
   __registerConfiguredCacheAdapters();
   const match = matchRoute(url, apiRoutes);
   return __handlePagesApiRoute({
     ctx,
+    edgeRuntime,
     match,
     nextConfig: vinextConfig,
     request,

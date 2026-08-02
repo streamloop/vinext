@@ -436,7 +436,7 @@ import { clearAppRequestContext as __clearRequestContext, setAppNavigationContex
 
 __configureMemoryCacheHandler({ cacheMaxMemorySize: ${JSON.stringify(cacheMaxMemorySize)} });
 import { createAppPrerenderStaticParamsResolver as __createAppPrerenderStaticParamsResolver } from ${JSON.stringify(appPrerenderStaticParamsPath)};
-import { ensureAppRouteModulesLoaded as __ensureRouteLoaded } from ${JSON.stringify(appRouteModuleLoaderPath)};
+import { ensureAppRouteModulesLoaded as __ensureRouteLoaded, loadAppInterceptPage as __loadAppInterceptPage } from ${JSON.stringify(appRouteModuleLoaderPath)};
 import {
   getRenderedConcreteUrlPathsForRoute as __getRenderedConcreteUrlPathsForRoute,
   initPregeneratedPathsFromGlobals as __initPregeneratedPathsFromGlobals,
@@ -639,7 +639,7 @@ function findIntercept(pathname, sourcePathname = null) {
   return __routeMatcher.findIntercept(pathname, sourcePathname);
 }
 
-async function buildPageElements(route, params, routePath, pageRequest, layoutParamAccess, displayPathname = routePath) {
+async function buildPageElements(route, params, routePath, pageRequest, layoutParamAccess, displayPathname = routePath, scriptNonce) {
   // Hydrate lazy page/route-handler modules before any synchronous read.
   await __ensureRouteLoaded(route);
   return __buildPageElements({
@@ -658,6 +658,7 @@ async function buildPageElements(route, params, routePath, pageRequest, layoutPa
     basePath: __basePath,
     trailingSlash: __trailingSlash,
     htmlLimitedBots: __htmlLimitedBots,
+    scriptNonce,
   });
 }
 
@@ -832,7 +833,7 @@ export default createAppRscHandler({
           observePageSearchParamsAccess: buildOptions?.observePageSearchParamsAccess === true,
           serveStreamingMetadata: buildOptions?.serveStreamingMetadata,
           isProduction: process.env.NODE_ENV === "production",
-        }, layoutParamAccess, displayPathname);
+        }, layoutParamAccess, displayPathname, scriptNonce);
       },
       clientReuseManifest,
       cleanPathname,
@@ -910,12 +911,11 @@ export default createAppRscHandler({
         // The intercepting-route page module is lazy (page: null + __pageLoader).
         // Resolve it before probing so buildAppPageProbes inspects the real page
         // component for dynamic bailout — matching the render path, which also
-        // awaits __pageLoader (resolveAppPageInterceptState). Without this the
-        // intercept probe branch silently inspects an undefined component and
-        // never observes the page's searchParams/headers access.
-        if (__probeIntercept && __probeIntercept.__pageLoader && __probeIntercept.page == null) {
-          __probeIntercept.page = await __probeIntercept.__pageLoader();
-        }
+        // hydrates it (resolveAppPageInterceptState). Without this the intercept
+        // probe branch silently inspects an undefined component and never
+        // observes the page's searchParams/headers access. Shared loader, so
+        // the import is isolated from the request context here too.
+        if (__probeIntercept) await __loadAppInterceptPage(__probeIntercept);
         return Promise.all(__buildAppPageProbes({
           route,
           pageComponent: PageComponent,
@@ -1082,6 +1082,7 @@ export default createAppRscHandler({
     middlewareContext,
     mountedSlotsHeader,
     request,
+    scriptNonce,
     routeMatch,
     routePathname,
     searchParams,
@@ -1124,7 +1125,7 @@ export default createAppRscHandler({
           renderMode: actionRenderMode,
           observeMetadataSearchParamsAccess: observeMetadataSearchParamsAccess === true,
           observePageSearchParamsAccess: observePageSearchParamsAccess === true,
-        });
+        }, undefined, actionCleanPathname, scriptNonce);
       },
       cleanPathname,
       clearRequestContext() {
@@ -1193,6 +1194,7 @@ export default createAppRscHandler({
       setNavigationContext,
       toInterceptOpts(intercept) {
         return {
+          interceptGraphId: intercept.interceptionGraphId,
           interceptionContext,
           interceptLayouts: intercept.interceptLayouts,
           interceptLayoutSegments: intercept.interceptLayoutSegments,
@@ -1204,6 +1206,8 @@ export default createAppRscHandler({
           interceptSlotKey: intercept.slotKey,
           interceptSourceMatchedUrl: interceptionContext,
           interceptSourcePageSegments: intercept.sourcePageSegments,
+          interceptTargetPatternParts: intercept.targetPatternParts,
+          interceptTargetRouteGraphId: intercept.targetRouteGraphId,
           interceptPage: intercept.page,
           interceptParams: intercept.matchedParams,
         };
@@ -1230,9 +1234,22 @@ export default createAppRscHandler({
   }
   matchRoute,
   matchRequestRoute,
+  matchInterceptRoute(pathname, sourcePathname) {
+    const intercept = findIntercept(pathname, sourcePathname);
+    if (!intercept) return null;
+    const route = routes[intercept.sourceRouteIndex];
+    if (!route) return null;
+    const params = Object.create(null);
+    for (const name of route.params) {
+      if (Object.prototype.hasOwnProperty.call(intercept.sourceMatchedParams, name)) {
+        params[name] = intercept.sourceMatchedParams[name];
+      }
+    }
+    return { route, params };
+  },
   ${
     middlewarePath
-      ? `runMiddleware({ cleanPathname, context, hadBasePath, isDataRequest, request }) {
+      ? `runMiddleware({ cleanPathname, context, hadBasePath, isDataRequest, middlewareRequest, request }) {
     return __applyAppMiddleware({
       basePath: __basePath,
       cleanPathname,
@@ -1242,6 +1259,7 @@ export default createAppRscHandler({
       i18nConfig: __i18nConfig,
       isDataRequest,
       isProxy: ${JSON.stringify(isProxyFile(middlewarePath))},
+      middlewareRequest,
       module: middlewareModule,
       request,
       trailingSlash: __trailingSlash,

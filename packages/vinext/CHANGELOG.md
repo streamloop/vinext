@@ -1,5 +1,96 @@
 # vinext
 
+## 1.0.0-beta.4
+
+### Bug Fixes
+
+#### App Router
+
+- install default not-found boundary (#2670)
+- scope dynamic params by segment (#2228)
+- honor client cache stale times (#2449)
+- resolve interception-only RSC targets (#2256)
+- preserve hash query navigation semantics (#2669)
+- reconcile streamed metadata icons (#2320)
+- align prefetch server protocol (#2318)
+
+#### Pages
+
+- preserve live Set-Cookie header arrays (#2689)
+- normalize decoded edge responses (#2668)
+- propagate Document script security props (#2044)
+
+#### Misc
+
+- **Pages Router:** load custom \_app/\_document via resolved file paths in dev (#2692)
+- **CSS:** load Sass partials from paths containing tildes (#2691)
+- honor build --mode dotenv files (#2523)
+- **Build:** normalize jsx-in-js module ids on Windows (#2687)
+- **RSC:** handle Windows paths in client reference dedup (#2686)
+- **Cache:** preserve prerendered page cache tags (#709)
+
+### Performance
+
+- **App Router:** serialize streamed metadata once (#2675)
+
+### Contributors
+
+- @james-elicx
+- @MaxtuneLee
+- @WilliamK112
+
+## 1.0.0-beta.3
+
+### Features
+
+- **Metadata:** support viewport fields and parent resolution (#2644)
+
+### Bug Fixes
+
+#### Metadata
+
+- add meta's 2024 crawler UAs to the html-limited bot list (#2666)
+- pass parent to cached resolvers with default or rest p… (#2660)
+- pass parent to regular metadata resolvers (#2646)
+
+#### Shims
+
+- preserve basePath config in NextURL clones (#2647)
+- preserve response cookie metadata (#2635)
+- reject invalid NextResponse JSON bodies (#2634)
+
+#### Misc
+
+- **App:** log RSC render errors on the dev-server terminal (#2667)
+- **Router:** replace stale optimistic layouts across dynamic params (#2609)
+- **Link:** interpolate Pages Router dynamic hrefs (#2657)
+- **Init:** complete an existing Cloudflare config instead of only adding to it (#2653)
+- **i18n:** align Accept-Language locale selection (#2648)
+- **Fonts:** keep immutable font assets query-free (#2605)
+- **Font Google:** share SSR collection state via globalThis (#2607)
+- **Pages:** isolate on-demand revalidation requests (#2495)
+- **Server:** defer after callbacks until response close (#2649)
+- **App Router:** stream nested loading boundaries (#2641)
+- honor custom TypeScript config path (#2633)
+- **Headers:** retain mutable cookie metadata (#2636)
+- **Build:** support package validation on Windows (#2638)
+
+### Performance
+
+- **Build:** cache repeated compatibility transforms (#2578)
+- **Build:** split react-dom/server into its own client chunk (#2604)
+
+### Contributors
+
+- @akim136
+- @blitss
+- @Boyeep
+- @james-elicx
+- @MrIago
+- @NathanDrake2406
+- @piffie
+- @ponharu
+
 ## 1.0.0-beta.2
 
 ### Features

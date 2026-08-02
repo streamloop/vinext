@@ -11,7 +11,7 @@ import type {
   UserConfig,
   ViteDevServer,
 } from "vite";
-import { createLogger, loadEnv, parseAst, transformWithOxc } from "vite";
+import { createLogger, parseAst, transformWithOxc } from "vite";
 import {
   pagesRouter,
   apiRouter,
@@ -83,6 +83,7 @@ import {
   type NextConfigInput,
   type ResolvedNextConfig,
 } from "./config/next-config.js";
+import { loadDotenv } from "./config/dotenv.js";
 import { mergeServerExternalPackages } from "./config/server-external-packages.js";
 
 import { findMiddlewareFile, isProxyFile, runMiddleware } from "./server/middleware.js";
@@ -242,6 +243,8 @@ import { createWasmModuleImportPlugin } from "./plugins/wasm-module-import.js";
 import { getTypeofWindowReplacement, replaceTypeofWindow } from "./plugins/typeof-window.js";
 import { hasMdxFiles } from "./utils/mdx-scan.js";
 import { scanPublicFileRoutes } from "./utils/public-routes.js";
+import { publicFilePathVariants } from "./utils/public-file-path.js";
+import { methodNotAllowedResponse } from "./server/http-error-responses.js";
 import type { Options as VitePluginReactOptions } from "@vitejs/plugin-react";
 import MagicString from "magic-string";
 import path, { toSlash } from "pathslash";
@@ -252,6 +255,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { getPagesPreviewModeId } from "./server/pages-preview.js";
 import commonjs from "vite-plugin-commonjs";
 import { createIgnoreDynamicRequestsPlugin } from "./plugins/ignore-dynamic-requests.js";
+import { createTransformCache } from "./plugins/transform-cache.js";
 import { stripJsExtension, stripViteModuleQuery } from "./utils/path.js";
 import {
   assertSupportedViteVersion,
@@ -293,6 +297,108 @@ const ANSI_ESCAPE_RE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
 installSocketErrorBackstop();
 
 type ASTNode = ReturnType<typeof parseAst>["body"][number]["parent"];
+
+type UseCacheAstNode = Record<string, unknown> & { type: string };
+
+function isUseCacheAstNode(value: unknown): value is UseCacheAstNode {
+  return (
+    typeof value === "object" && value !== null && typeof Reflect.get(value, "type") === "string"
+  );
+}
+
+function hasInlineUseCacheDirective(node: UseCacheAstNode): boolean {
+  const body =
+    isUseCacheAstNode(node.body) && node.body.type === "BlockStatement" ? node.body : null;
+  if (!body || !Array.isArray(body.body)) return false;
+
+  return body.body.some((statement) => {
+    if (!isUseCacheAstNode(statement) || statement.type !== "ExpressionStatement") return false;
+    const expression = isUseCacheAstNode(statement.expression) ? statement.expression : null;
+    return (
+      expression?.type === "Literal" &&
+      typeof expression.value === "string" &&
+      /^use cache(:\s*\w+)?$/.test(expression.value)
+    );
+  });
+}
+
+function functionAcceptsSecondArgument(node: UseCacheAstNode): boolean {
+  const params = Array.isArray(node.params) ? node.params : [];
+  if (params.length >= 2) return true;
+  return params.some((param) => isUseCacheAstNode(param) && param.type === "RestElement");
+}
+
+function collectInlineUseCacheSecondArgumentUsage(value: unknown): boolean[] {
+  const usage: boolean[] = [];
+
+  function walk(node: unknown): void {
+    if (Array.isArray(node)) {
+      for (const child of node) walk(child);
+      return;
+    }
+    if (!isUseCacheAstNode(node)) return;
+
+    if (
+      (node.type === "FunctionDeclaration" ||
+        node.type === "FunctionExpression" ||
+        node.type === "ArrowFunctionExpression") &&
+      hasInlineUseCacheDirective(node)
+    ) {
+      usage.push(functionAcceptsSecondArgument(node));
+    }
+
+    for (const [key, child] of Object.entries(node)) {
+      if (key === "type" || key === "start" || key === "end" || key === "loc" || key === "parent") {
+        continue;
+      }
+      walk(child);
+    }
+  }
+
+  walk(value);
+  return usage;
+}
+
+function collectFileUseCacheSecondArgumentUsage(body: unknown[]): Map<string, boolean> {
+  const localFunctions = new Map<string, boolean>();
+
+  function collectDeclaration(value: unknown): void {
+    if (!isUseCacheAstNode(value)) return;
+    if (value.type === "FunctionDeclaration") {
+      const id = isUseCacheAstNode(value.id) ? value.id : null;
+      if (id?.type === "Identifier" && typeof id.name === "string") {
+        localFunctions.set(id.name, functionAcceptsSecondArgument(value));
+      }
+      return;
+    }
+    if (value.type !== "VariableDeclaration" || !Array.isArray(value.declarations)) return;
+
+    for (const declaration of value.declarations) {
+      if (!isUseCacheAstNode(declaration) || declaration.type !== "VariableDeclarator") continue;
+      const id = isUseCacheAstNode(declaration.id) ? declaration.id : null;
+      const init = isUseCacheAstNode(declaration.init) ? declaration.init : null;
+      if (
+        id?.type === "Identifier" &&
+        typeof id.name === "string" &&
+        init &&
+        (init.type === "FunctionExpression" || init.type === "ArrowFunctionExpression")
+      ) {
+        localFunctions.set(id.name, functionAcceptsSecondArgument(init));
+      }
+    }
+  }
+
+  for (const statement of body) {
+    if (!isUseCacheAstNode(statement)) continue;
+    collectDeclaration(
+      statement.type === "ExportNamedDeclaration" || statement.type === "ExportDefaultDeclaration"
+        ? statement.declaration
+        : statement,
+    );
+  }
+
+  return localFunctions;
+}
 
 function isInsideDirectory(dir: string, filePath: string): boolean {
   const relativePath = path.relative(dir, filePath);
@@ -1355,6 +1461,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   let pagesOptimizeEntries: string[] = [];
   const pagesClientAssetsOutputDirs = new Set<string>();
   let pagesClientAssetsModule: string | null = null;
+  // Dev-only public route inventory. Vite's watcher keeps this synchronized,
+  // so request handling can use O(1) membership checks without filesystem I/O.
+  // Production builds leave it null and scan the configured public directory
+  // once while generating the RSC entry.
+  let devPublicFileRoutes: Set<string> | null = null;
   let rscCompatibilityId: string | undefined;
   let draftModeSecret = getPagesPreviewModeId();
   let previewBuildCredentials: PreviewBuildCredentials | undefined;
@@ -1412,13 +1523,18 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
    * Generate the virtual SSR server entry module.
    * This is the entry point for `vite build --ssr`.
    */
-  async function generateServerEntry(): Promise<string> {
+  async function generateServerEntry(configuredPublicDir: string | false): Promise<string> {
+    const publicFiles =
+      isServeCommand && devPublicFileRoutes
+        ? [...devPublicFileRoutes].sort()
+        : scanPublicFileRoutes(root, configuredPublicDir === "" ? false : configuredPublicDir);
     return _generateServerEntry(
       pagesDir,
       nextConfig,
       fileMatcher,
       middlewarePath,
       instrumentationPath,
+      publicFiles,
     );
   }
 
@@ -1693,6 +1809,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
     },
   };
 
+  const cachedTypeofWindowTransform = createTransformCache<
+    ReturnType<typeof getTypeofWindowReplacement>,
+    ReturnType<typeof replaceTypeofWindow>
+  >();
+
   const plugins: PluginOption[] = [
     // Resolve tsconfig paths/baseUrl aliases so real-world Next.js repos
     // that use @/*, #/*, or baseUrl imports work out of the box.
@@ -1782,7 +1903,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
       transform: {
         filter: { id: /\.m?js(?:\?.*)?$/ },
         async handler(code: string, id: string) {
-          const cleanId = id.split("?")[0];
+          const cleanId = toSlash(stripViteModuleQuery(id));
 
           // vinext's published runtime is already compiled by tsdown. Workspace
           // symlinks resolve these files outside node_modules, so skip them
@@ -1876,23 +1997,19 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         // Next.js loads .env files before evaluating next.config.js, so
         // env vars are available in config, server-side code, and as
         // NEXT_PUBLIC_* defines for the client bundle.
-        // Pass '' as prefix to load ALL vars, not just VITE_-prefixed ones.
         const mode = env?.mode ?? "development";
-        const envDir = config.envDir ?? root;
-        const dotenvVars = loadEnv(mode, envDir, "");
-        for (const [key, value] of Object.entries(dotenvVars)) {
-          if (process.env[key] === undefined) {
-            process.env[key] = value;
-          }
+        if (config.envDir !== false) {
+          const envDir = config.envDir ?? root;
+          loadDotenv({ root: envDir, mode });
         }
         // Align NODE_ENV with Next.js semantics: build/preview -> production,
         // development server -> development. Next.js unconditionally forces
         // NODE_ENV during build/dev, so we do the same.
         let resolvedNodeEnv: string;
-        if (mode === "test") {
-          resolvedNodeEnv = "test";
-        } else if (env?.command === "build" || env?.isPreview === true) {
+        if (env?.command === "build" || env?.isPreview === true) {
           resolvedNodeEnv = "production";
+        } else if (mode === "test") {
+          resolvedNodeEnv = "test";
         } else {
           resolvedNodeEnv = "development";
         }
@@ -2135,6 +2252,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         defines["process.env.__NEXT_APP_NAV_FAIL_HANDLING"] = JSON.stringify(
           nextConfig.appNavFailHandling,
         );
+        defines["process.env.__NEXT_TEST_MODE"] = JSON.stringify(
+          process.env.__NEXT_TEST_MODE ?? false,
+        );
         // Expose experimental.scrollRestoration to the Pages Router client.
         // Next.js defines this from config.experimental.scrollRestoration in
         // packages/next/src/build/define-env.ts.
@@ -2160,7 +2280,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           const deviceSizes = nextConfig.images?.deviceSizes ?? [
             640, 750, 828, 1080, 1200, 1920, 2048, 3840,
           ];
-          const imageSizes = nextConfig.images?.imageSizes ?? [16, 32, 48, 64, 96, 128, 256, 384];
+          const imageSizes = nextConfig.images?.imageSizes ?? DEFAULT_IMAGE_SIZES;
           defines["process.env.__VINEXT_IMAGE_DEVICE_SIZES"] = JSON.stringify(
             JSON.stringify(deviceSizes),
           );
@@ -3677,7 +3797,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           }
           // Pages Router virtual modules
           if (id === RESOLVED_SERVER_ENTRY) {
-            return await generateServerEntry();
+            return await generateServerEntry(
+              this.environment.config.publicDir === "" ? false : this.environment.config.publicDir,
+            );
           }
           if (id === RESOLVED_CLIENT_ENTRY) {
             return await generateClientEntry();
@@ -3775,7 +3897,15 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   contentSecurityPolicy: nextConfig?.images?.contentSecurityPolicy,
                 },
                 hasPagesDir,
-                publicFiles: scanPublicFileRoutes(root),
+                publicFiles:
+                  isServeCommand && devPublicFileRoutes
+                    ? [...devPublicFileRoutes].sort()
+                    : scanPublicFileRoutes(
+                        root,
+                        this.environment.config.publicDir === ""
+                          ? false
+                          : this.environment.config.publicDir,
+                      ),
                 globalNotFoundPath,
                 draftModeSecret,
               },
@@ -4479,7 +4609,46 @@ export const loadServerActionClient = ${
           socket.on("error", () => {});
         });
 
+        const configuredPublicDir =
+          server.config.publicDir === "" ? false : (server.config.publicDir as string | false);
+        const devPublicDir =
+          configuredPublicDir === false
+            ? null
+            : path.resolve(toSlash(server.config.root), toSlash(configuredPublicDir));
+        devPublicFileRoutes = new Set(scanPublicFileRoutes(root, configuredPublicDir));
+        const publicRoutesForFile = (filePath: string): string[] | null => {
+          if (devPublicDir === null) return null;
+          const cleanPath = toSlash(stripViteModuleQuery(filePath));
+          const relativePath = path.relative(devPublicDir, cleanPath);
+          if (
+            relativePath === "" ||
+            relativePath.startsWith("../") ||
+            path.isAbsolute(relativePath)
+          ) {
+            return null;
+          }
+          return publicFilePathVariants(`/${relativePath}`);
+        };
+        const updatePublicFileRoute = (filePath: string, present: boolean): void => {
+          const routes = publicRoutesForFile(filePath);
+          if (routes === null || devPublicFileRoutes === null) return;
+          let changed = false;
+          for (const route of routes) {
+            const routeChanged = present
+              ? !devPublicFileRoutes.has(route)
+              : devPublicFileRoutes.has(route);
+            if (!routeChanged) continue;
+            changed = true;
+            if (present) devPublicFileRoutes.add(route);
+            else devPublicFileRoutes.delete(route);
+          }
+          if (!changed) return;
+          if (hasAppDir) invalidateRscEntryModule();
+          if (hasCloudflarePlugin && hasPagesDir && !hasAppDir) invalidatePagesServerEntry();
+        };
+
         server.watcher.on("add", (filePath: string) => {
+          updatePublicFileRoute(filePath, true);
           let routeChanged = false;
           const pagesAppChanged = isPagesAppFile(filePath);
           const pagesAssetGraphScriptChanged = isPotentialPagesAssetGraphScript(filePath);
@@ -4521,6 +4690,7 @@ export const loadServerActionClient = ${
           }
         });
         server.watcher.on("unlink", (filePath: string) => {
+          updatePublicFileRoute(filePath, false);
           let routeChanged = false;
           const pagesAppChanged = isPagesAppFile(filePath);
           const pagesAssetGraphScriptChanged = isPotentialPagesAssetGraphScript(filePath);
@@ -4552,6 +4722,35 @@ export const loadServerActionClient = ${
           }
         });
 
+        type DevPagesMiddleware = (
+          req: import("node:http").IncomingMessage,
+          res: import("node:http").ServerResponse,
+          next: (error?: unknown) => void,
+        ) => Promise<void>;
+        let handlePagesMiddleware: DevPagesMiddleware | null = null;
+        const isExistingDevPublicFile = (requestPathname: string): boolean =>
+          devPublicFileRoutes?.has(requestPathname) === true;
+        const isUnsupportedDevPublicRequest = (
+          req: import("node:http").IncomingMessage,
+          pathnameState: "pre-base" | "post-base" = "pre-base",
+        ): boolean => {
+          if (req.method === "GET" || req.method === "HEAD") return false;
+          let pathname: string;
+          try {
+            pathname = normalizePathnameForRouteMatchStrict(
+              new URL(req.url ?? "/", "http://vinext.invalid").pathname,
+            );
+          } catch {
+            return false;
+          }
+          const basePath = nextConfig?.basePath ?? "";
+          if (pathnameState === "pre-base" && basePath) {
+            if (!hasBasePath(pathname, basePath)) return false;
+            pathname = stripBasePath(pathname, basePath);
+          }
+          return isExistingDevPublicFile(pathname);
+        };
+
         // ── Dev request origin check ─────────────────────────────────────
         // Registered directly (not in the returned function) so it runs
         // BEFORE Vite's built-in middleware. This ensures all requests
@@ -4577,6 +4776,16 @@ export const loadServerActionClient = ${
           next();
         });
 
+        // Vite serves public files for every method. Intercept only mutations
+        // to known public files before Vite's internals, then run the canonical
+        // Pages pipeline so config/middleware ordering and headers are retained.
+        server.middlewares.use((req, res, next) => {
+          if (!hasPagesDir || !handlePagesMiddleware || !isUnsupportedDevPublicRequest(req)) {
+            return next();
+          }
+          void handlePagesMiddleware(req, res, next);
+        });
+
         installDevStackSourcemapMiddleware(server);
 
         // Return a function to register middleware AFTER Vite's built-in middleware
@@ -4591,6 +4800,34 @@ export const loadServerActionClient = ${
               (handle): handle is import("vite").Connect.NextHandleFunction =>
                 typeof handle === "function",
             );
+
+          // The patched Vite sirv middleware serves public files for every
+          // method. In App-only and Cloudflare dev projects, let mutations pass
+          // through to the framework request handler. App Router applies the
+          // canonical middleware -> beforeFiles -> filesystem ordering; the
+          // Cloudflare plugin delegates to the Worker/miniflare request path.
+          if ((hasAppDir && !hasPagesDir) || hasCloudflarePlugin) {
+            const publicMiddlewareEntry = server.middlewares.stack.find(
+              ({ handle }) =>
+                typeof handle === "function" && handle.name === "viteServePublicMiddleware",
+            );
+            const viteServePublic = publicMiddlewareEntry?.handle as
+              | import("vite").Connect.NextHandleFunction
+              | undefined;
+            if (publicMiddlewareEntry && viteServePublic) {
+              const vinextServePublicMiddleware: import("vite").Connect.NextHandleFunction = (
+                req,
+                res,
+                next,
+              ) => {
+                // Vite's base middleware runs before its public middleware,
+                // so req.url may already have had nextConfig.basePath removed.
+                if (isUnsupportedDevPublicRequest(req, "post-base")) return next();
+                return viteServePublic(req, res, next);
+              };
+              publicMiddlewareEntry.handle = vinextServePublicMiddleware;
+            }
+          }
 
           const serveRewrittenViteFilesystemRoute = async (
             req: import("node:http").IncomingMessage,
@@ -4806,7 +5043,7 @@ export const loadServerActionClient = ${
             });
           }
 
-          const handlePagesMiddleware = async (
+          handlePagesMiddleware = async (
             req: import("node:http").IncomingMessage,
             res: import("node:http").ServerResponse,
             next: (err?: unknown) => void,
@@ -5113,6 +5350,8 @@ export const loadServerActionClient = ${
                 }),
               );
               const isFilePathRequest = pathname.includes(".") && !pathname.endsWith(".html");
+              const isExistingPublicMutation =
+                req.method !== "GET" && req.method !== "HEAD" && isExistingDevPublicFile(pathname);
               let filePathMatchesPagesRoute = false;
               const requestHostname = getUrlHostname(requestOrigin);
               if (isFilePathRequest && !filePathMatchesRewrite) {
@@ -5137,7 +5376,12 @@ export const loadServerActionClient = ${
                   matchRoute(pageRouteUrl, pageRoutes) !== null ||
                   matchRoute(apiRouteUrl, apiRoutes) !== null;
               }
-              if (isFilePathRequest && !filePathMatchesRewrite && !filePathMatchesPagesRoute) {
+              if (
+                isFilePathRequest &&
+                !filePathMatchesRewrite &&
+                !filePathMatchesPagesRoute &&
+                !isExistingPublicMutation
+              ) {
                 return next();
               }
 
@@ -5343,14 +5587,19 @@ export const loadServerActionClient = ${
                   return proxyExternalRequest(reqWithBody, externalUrl);
                 },
                 serveFilesystemRoute: async (requestPathname, stagedHeaders, phase) => {
+                  const isRetrievalMethod = req.method === "GET" || req.method === "HEAD";
                   if (
-                    phase === "direct" ||
-                    (req.method !== "GET" && req.method !== "HEAD") ||
+                    (phase === "direct" && isRetrievalMethod) ||
                     requestPathname === "/" ||
                     requestPathname === "/api" ||
                     requestPathname.startsWith("/api/")
                   ) {
                     return false;
+                  }
+                  if (!isRetrievalMethod) {
+                    return isExistingDevPublicFile(requestPathname)
+                      ? methodNotAllowedResponse("GET, HEAD")
+                      : false;
                   }
                   return serveRewrittenViteFilesystemRoute(
                     req,
@@ -5505,6 +5754,7 @@ export const loadServerActionClient = ${
                       nextConfig?.htmlLimitedBots,
                       nextConfig?.reactStrictMode === true,
                       nextConfig?.expireTime,
+                      nextConfig?.crossOrigin,
                     ),
                   };
                 }
@@ -5530,7 +5780,7 @@ export const loadServerActionClient = ${
           };
 
           server.middlewares.use((req, res, next) => {
-            void handlePagesMiddleware(req, res, next);
+            void handlePagesMiddleware!(req, res, next);
           });
         };
       },
@@ -5702,7 +5952,11 @@ export const loadServerActionClient = ${
           }
           const cacheDir = `${toSlash(this.environment.config.cacheDir).replace(/\/$/, "")}/`;
           if (toSlash(id).startsWith(cacheDir)) return null;
-          return replaceTypeofWindow(code, getTypeofWindowReplacement(this.environment), id);
+
+          const replacement = getTypeofWindowReplacement(this.environment);
+          return cachedTypeofWindowTransform(id, code, replacement, () =>
+            replaceTypeofWindow(code, replacement, id),
+          );
         },
       },
     },
@@ -6096,60 +6350,13 @@ export const loadServerActionClient = ${
               node.expression.value.startsWith("use cache"),
           );
 
-          // Check for function-level "use cache" directives by walking function bodies.
-          // Accepts any function-like node: FunctionDeclaration/Expression, ArrowFunctionExpression,
-          // or MethodDefinition. MethodDefinition stores its FunctionExpression in `.value`, not
-          // `.body`, so we unwrap it here rather than at each call site to keep the callee safe.
-          function nodeHasInlineCacheDirective(node: ASTNode): boolean {
-            if (!node || typeof node !== "object") return false;
-            // MethodDefinition wraps its FunctionExpression in .value; unwrap to reach .body.
-            const fn = node.type === "MethodDefinition" ? node.value : node;
-            // fn.body is a BlockStatement node ({type:"BlockStatement", body:Statement[]}), not
-            // a raw array. Unwrap it. Arrow functions with expression bodies have a non-array
-            // .body — the BlockStatement check handles that case (body.body would be undefined).
-            const stmts: ASTNode[] | null =
-              // oxlint-disable-next-line typescript/no-explicit-any
-              (fn as any)?.body?.type === "BlockStatement" ? (fn as any).body.body : null;
-            if (Array.isArray(stmts)) {
-              for (const stmt of stmts) {
-                if (
-                  stmt?.type === "ExpressionStatement" &&
-                  stmt.expression?.type === "Literal" &&
-                  typeof stmt.expression?.value === "string" &&
-                  /^use cache(:\s*\w+)?$/.test(stmt.expression.value)
-                ) {
-                  return true;
-                }
-              }
-            }
-            return false;
-          }
-          function astHasInlineCache(nodes: ASTNode[]): boolean {
-            for (const node of nodes) {
-              if (!node || typeof node !== "object") continue;
-              if (
-                (node.type === "FunctionDeclaration" ||
-                  node.type === "FunctionExpression" ||
-                  node.type === "ArrowFunctionExpression" ||
-                  node.type === "MethodDefinition") &&
-                nodeHasInlineCacheDirective(node)
-              ) {
-                return true;
-              }
-              // Walk into variable declarations, export declarations, etc.
-              for (const key of Object.keys(node)) {
-                if (key === "type" || key === "start" || key === "end" || key === "loc") continue;
-                const child = node[key as keyof typeof node] as ASTNode;
-                if (Array.isArray(child) && child.some((c) => c && typeof c === "object")) {
-                  if (astHasInlineCache(child)) return true;
-                } else if (child && typeof child === "object" && child.type) {
-                  if (astHasInlineCache([child])) return true;
-                }
-              }
-            }
-            return false;
-          }
-          const hasInlineCache = !cacheDirective && astHasInlineCache(ast.body);
+          // Keep the declaration shape because Function.length drops default and
+          // rest parameters. Next.js's cache transform likewise records declared
+          // arguments so metadata resolution can decide whether to pass `parent`.
+          const inlineCacheSecondArgumentUsage = cacheDirective
+            ? []
+            : collectInlineUseCacheSecondArgumentUsage(ast.body);
+          const hasInlineCache = inlineCacheSecondArgumentUsage.length > 0;
 
           if (!cacheDirective && !hasInlineCache) return null;
 
@@ -6192,11 +6399,22 @@ export const loadServerActionClient = ${
             const runtimeModuleUrl = pathToFileURL(
               resolveShimModulePath(shimsDir, "cache-runtime"),
             ).href;
+            const secondArgumentUsage = collectFileUseCacheSecondArgumentUsage(ast.body);
             const result = transformWrapExport(code, ast, {
               runtime: (value: string, name: string) => {
-                const pageOptions =
-                  name === "default" && isAppPageModule ? `, { appPageDefaultExport: true }` : "";
-                return `(await import(${JSON.stringify(runtimeModuleUrl)})).registerCachedFunction(${value}, ${JSON.stringify(id + ":" + name)}, ${JSON.stringify(variant)}${pageOptions})`;
+                const runtimeOptions: string[] = [];
+                // A local declaration gives us its exact parameter shape. For
+                // opaque exports (for example `export { fn } from "./impl"`),
+                // match Next.js's unknown-signature behavior and conservatively
+                // treat every argument as used.
+                const acceptsSecondArgument = secondArgumentUsage.get(value) ?? true;
+                runtimeOptions.push(`acceptsSecondArgument: ${acceptsSecondArgument}`);
+                if (name === "default" && isAppPageModule) {
+                  runtimeOptions.push("appPageDefaultExport: true");
+                }
+                const optionsArgument =
+                  runtimeOptions.length > 0 ? `, { ${runtimeOptions.join(", ")} }` : "";
+                return `(await import(${JSON.stringify(runtimeModuleUrl)})).registerCachedFunction(${value}, ${JSON.stringify(id + ":" + name)}, ${JSON.stringify(variant)}${optionsArgument})`;
               },
               rejectNonAsyncFunction: false,
               filter: (name: string, meta: { isFunction?: boolean }) => {
@@ -6247,6 +6465,7 @@ export const loadServerActionClient = ${
             ).href;
 
             try {
+              let transformedFunctionIndex = 0;
               const result = transformHoistInlineDirective(code, ast, {
                 directive: /^use cache(:\s*\w+)?$/,
                 runtime: (value: string, name: string, meta: { directiveMatch: string[] }) => {
@@ -6255,7 +6474,13 @@ export const loadServerActionClient = ${
                     directiveMatch === "use cache"
                       ? ""
                       : directiveMatch.replace("use cache:", "").trim();
-                  return `(await import(${JSON.stringify(runtimeModuleUrl2)})).registerCachedFunction(${value}, ${JSON.stringify(id + ":" + name)}, ${JSON.stringify(variant)})`;
+                  const acceptsSecondArgument =
+                    inlineCacheSecondArgumentUsage[transformedFunctionIndex++];
+                  const optionsArgument =
+                    acceptsSecondArgument === undefined
+                      ? ""
+                      : `, { acceptsSecondArgument: ${acceptsSecondArgument} }`;
+                  return `(await import(${JSON.stringify(runtimeModuleUrl2)})).registerCachedFunction(${value}, ${JSON.stringify(id + ":" + name)}, ${JSON.stringify(variant)}${optionsArgument})`;
                 },
                 rejectNonAsyncFunction: false,
               });
