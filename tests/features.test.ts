@@ -3422,6 +3422,45 @@ describe("createAppPageRouteBodyMetadata (body-placement canonical)", () => {
     ({ renderToStaticMarkup } = await import("react-dom/server"));
   });
 
+  it("body placement: embeds the head-hoist script so streamed metadata reaches document.head", () => {
+    const node = createAppPageRouteBodyMetadata(
+      { title: "Streamed", description: "streamed description" },
+      "/streamed",
+      "body",
+      false,
+    );
+    const html = renderToStaticMarkup(node as React.ReactElement);
+    // The raw-HTML body placement is invisible to React, so a parser-inserted
+    // script must hoist title/meta/link into <head> (and dedupe same-key tags)
+    // the moment the streamed segment arrives — Lighthouse/rendered-DOM SEO
+    // reads document.head, not the hidden body div.
+    // Assert on the SELECTORS the hoist keys off, not on the script's exact
+    // source text: it is generated from `hoistStreamedMetadata.toString()`, so
+    // the bundler owns quoting and whitespace.
+    expect(html).toContain("appendChild");
+    expect(html).toMatch(/title/);
+    expect(html).toContain("meta[name=");
+    expect(html).toMatch(/link\[rel=.{1,2}canonical/);
+    // Script must come AFTER the metadata markup it hoists.
+    expect(html.indexOf("streamed description")).toBeLessThan(html.indexOf("appendChild"));
+  });
+
+  it("body placement: marks the container so a client navigation can drain it", () => {
+    const node = createAppPageRouteBodyMetadata(
+      { title: "Streamed", description: "streamed description" },
+      "/streamed",
+      "body",
+      false,
+    );
+    const html = renderToStaticMarkup(node as React.ReactElement);
+    // On a client navigation React inserts this markup through innerHTML, and
+    // the spec never executes a script inserted that way — the browser entry
+    // has to find the container by attribute and hoist it explicitly, or the
+    // document keeps the PREVIOUS page's <title>.
+    expect(html).toContain("data-vinext-streamed-metadata");
+    expect(html).toContain("[data-vinext-streamed-metadata]");
+  });
+
   it("body placement: applies trailingSlash to canonical href in the streamed body branch", () => {
     const node = createAppPageRouteBodyMetadata(
       {
@@ -3502,12 +3541,15 @@ describe("createAppPageRouteBodyMetadata (body-placement canonical)", () => {
     expect(html).toMatch(
       /<link data-vinext-streamed-icon="[^"]+" rel="mask-icon" href="\/mask\.svg">/,
     );
-    expect(html).toContain(
-      `document.querySelectorAll('body link[rel="icon"], body link[rel="apple-touch-icon"]').forEach(el => document.head.appendChild(el))`,
-    );
-    expect(html).toContain(`const a='data-vinext-streamed-icon'`);
-    expect(html).toContain(`.sort((l,r)=>o(l)-o(r)).forEach(el=>document.head.appendChild(el))`);
-    expect(html).toMatch(/<script>document\.querySelectorAll[\s\S]*<\/script><\/div>$/);
+    expect(html).toContain("body link[rel=");
+    expect(html).toContain("data-vinext-streamed-icon");
+    // Ordering pass, asserted by behavior rather than by the generated
+    // script's exact source (see the note on the hoist test above).
+    expect(html).toContain("sort(");
+    expect(html).toContain("lastIndexOf");
+    // The hoist script is the LAST child of the container, so at parse time it
+    // runs only after every tag it moves has been inserted.
+    expect(html).toMatch(/<script>[\s\S]*document\.querySelectorAll[\s\S]*<\/script><\/div>$/);
   });
 
   it("body placement: serializes icon-bearing metadata once", () => {
@@ -3539,7 +3581,7 @@ describe("createAppPageRouteBodyMetadata (body-placement canonical)", () => {
     const node = createAppPageRouteBodyMetadata({ title: "Streamed title" }, "/metadata", "body");
     const html = renderToStaticMarkup(node as React.ReactElement);
 
-    expect(html).toContain("document.querySelectorAll('body link");
+    expect(html).toContain("body link[rel=");
   });
 
   it("body placement: applies the request nonce to the parser-time icon script", () => {

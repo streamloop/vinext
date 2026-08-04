@@ -34,6 +34,10 @@ import {
 import { BfcacheSegmentBoundary, Children, ParallelSlot, Slot } from "vinext/shims/slot";
 import { StreamedIconsInsertion } from "vinext/shims/streamed-icons";
 import { createInlineScriptTag, escapeHtmlAttr } from "./html.js";
+import {
+  HOIST_STREAMED_METADATA_SCRIPT,
+  STREAMED_METADATA_CONTAINER_ATTR,
+} from "vinext/shims/hoist-streamed-metadata";
 import type { AppPageParams } from "./app-page-boundary.js";
 import type { AppLayoutParamAccessTracker } from "./app-layout-param-observation.js";
 import type { ThenableParamsObserver } from "vinext/shims/thenable-params";
@@ -715,8 +719,6 @@ function createStreamedIconKey(pathname: string, metadataHtml: string): string {
 
 const STREAMED_ICON_KEY_PLACEHOLDER = "vinext-pending-streamed-icon-key";
 
-const REINSERT_STREAMED_ICONS_SCRIPT = `document.querySelectorAll('body link[rel="icon"], body link[rel="apple-touch-icon"]').forEach(el => document.head.appendChild(el));const a='data-vinext-streamed-icon',o=el=>{const m=el.getAttribute(a),i=m.lastIndexOf(':');return Number(m.slice(i+1))};[...document.querySelectorAll('link['+a+']')].sort((l,r)=>o(l)-o(r)).forEach(el=>document.head.appendChild(el))`;
-
 export function createAppPageRouteBodyMetadata(
   metadata: Metadata | null,
   pathname: string,
@@ -738,12 +740,17 @@ export function createAppPageRouteBodyMetadata(
       )
     : renderedMetadataHtml;
   const parserInsertedMetadataHtml =
-    metadataHtml + createInlineScriptTag(REINSERT_STREAMED_ICONS_SCRIPT, scriptNonce);
+    metadataHtml + createInlineScriptTag(HOIST_STREAMED_METADATA_SCRIPT, scriptNonce);
   return (
     <>
       <div
         hidden
         suppressHydrationWarning
+        // The attribute is how `hoistStreamedMetadata` finds containers that
+        // still need draining — including on client navigation, where the
+        // inline script below is inserted via innerHTML and therefore never
+        // runs.
+        {...{ [STREAMED_METADATA_CONTAINER_ATTR]: "" }}
         dangerouslySetInnerHTML={{
           __html: parserInsertedMetadataHtml,
         }}

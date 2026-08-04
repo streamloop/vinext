@@ -192,6 +192,10 @@ import {
 import { stripRscCompletionMetadataResponse } from "./rsc-completion-metadata.js";
 import { removeStylesheetLinksCoveredByInlineCss } from "./app-inline-css-client.js";
 import {
+  hoistStreamedMetadata,
+  STREAMED_METADATA_CONTAINER_ATTR,
+} from "vinext/shims/hoist-streamed-metadata";
+import {
   navigationPlanner,
   type NavigationReuseFacts,
   type VisitedResponseCacheCandidateFacts,
@@ -270,6 +274,39 @@ const historyController = new AppBrowserHistoryController({
     return { bfcacheIds: routerState.bfcacheIds, previousNextUrl: routerState.previousNextUrl };
   },
 });
+
+/**
+ * Streamed metadata whose Suspense boundary resolves AFTER the navigation
+ * commit arrives as a later DOM insertion, so the commit-time
+ * `hoistStreamedMetadata()` call has nothing to drain yet. On a document load
+ * the parser-inserted script inside the container handles it, but a container
+ * inserted through React's `innerHTML` during a client navigation carries an
+ * inert script — the spec never executes a script inserted that way — so this
+ * observer is the only thing that moves those tags into `<head>`.
+ *
+ * Cheap by construction: the callback only runs when a subtree is added, and
+ * bails unless the addition actually contains a metadata container.
+ */
+function watchForStreamedMetadata(): void {
+  if (typeof MutationObserver !== "function" || !document.body) return;
+
+  const selector = `[${STREAMED_METADATA_CONTAINER_ATTR}]`;
+  const observer = new MutationObserver((records) => {
+    for (const record of records) {
+      for (const node of record.addedNodes) {
+        if (!(node instanceof Element)) continue;
+        if (node.matches(selector) || node.querySelector(selector)) {
+          hoistStreamedMetadata();
+          return;
+        }
+      }
+    }
+  });
+
+  observer.observe(document.body, { childList: true, subtree: true });
+}
+
+watchForStreamedMetadata();
 
 const browserNavigationController = createAppBrowserNavigationController({
   basePath: __basePath,
@@ -1112,6 +1149,12 @@ function BrowserRoot({
     const nextMountedSlotsHeader = getMountedSlotIdsHeader(stateRef.current.elements);
     setMountedSlotsHeader(nextMountedSlotsHeader);
     removeStylesheetLinksCoveredByInlineCss();
+    // Streamed metadata that was already in the committed tree: drain it
+    // before paint so the title never flashes the previous page's value.
+    // Metadata that resolves LATER (its Suspense boundary is still pending at
+    // commit) is caught by the observer installed in
+    // `watchForStreamedMetadata`.
+    hoistStreamedMetadata();
     if (previousMountedSlotsHeader === nextMountedSlotsHeader) {
       return;
     }
